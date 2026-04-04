@@ -1,0 +1,10 @@
+__pycache__/frontend.cpython-314.pyc
+__pycache__/main.cpython-313.pyc
+.DS_Store
+__pycache__/test_scan_updates.cpython-313-pytest-7.4.4.pyc
+ai/__pycache__/connector.cpython-313.pyc
+ai/__pycache__/connector.cpython-314.pyc
+ai/__pycache__/prompts.cpython-313.pyc
+ai/__pycache__/prompts.cpython-314.pyc
+backend.log
+kmn_cyberseek.db
