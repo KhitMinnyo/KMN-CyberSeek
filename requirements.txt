@@ -1,0 +1,59 @@
+# KMN-CyberSeek Requirements
+# Compatible with Python 3.10+ and M2 Mac (ARM64/Apple Silicon)
+# Using flexible version ranges to avoid dependency conflicts
+# ~= means compatible release (same major.minor, any patch)
+# >= means minimum version, no upper bound (allows newer compatible versions)
+
+# IMPORTANT: Installation order matters due to packaging dependency conflicts
+# 1. First install: pip install packaging==23.2
+# 2. Then install: pip install wheel==0.45.0 setuptools
+# 3. Finally: pip install -r requirements.txt
+
+# Build tools (install first to avoid conflicts)
+packaging==23.2  # Pinned to avoid conflict between streamlit and wheel
+wheel==0.45.0    # Version compatible with packaging<24
+
+# FastAPI backend dependencies
+fastapi~=0.104.0  # Compatible with 0.104.x
+uvicorn[standard]>=0.24.0,<1.0.0
+pydantic>=2.9.0  # Compatible with 2.5.x
+pydantic-settings>=2.5.0  # Compatible with 2.1.x
+sqlalchemy>=2.0.23  # SQLAlchemy 2.x is stable
+aiosqlite>=0.19.0,<1.0.0
+
+# Streamlit frontend dependencies
+streamlit>=1.28.1  # Streamlit 1.x is stable
+streamlit-option-menu>=0.3.6
+streamlit-autorefresh>=1.0.1
+
+# AI/LLM integration
+openai>=1.6.1  # OpenAI 1.x is stable
+requests>=2.31.0
+httpx>=0.25.2,<1.0.0
+
+# Security tools integration
+python-nmap>=0.7.1
+paramiko>=3.4.0,<4.0.0
+cryptography>=41.0.7  # May require Rust compiler on M2 Mac
+
+# Development and utilities
+python-dotenv>=1.0.0
+jinja2>=3.1.2
+rich>=13.7.0
+loguru>=0.7.2
+typer>=0.9.0
+
+# Testing (optional dependencies)
+pytest>=7.4.3,<8.0.0  # Pytest 8+ may have breaking changes
+pytest-asyncio>=0.21.1
+
+# Installation notes for M2 Mac (ARM64):
+# 1. Ensure you have Xcode Command Line Tools: xcode-select --install
+# 2. For cryptography, you may need Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# 3. Some packages may need to be compiled; use: pip install --no-binary :all: <package> if needed
+# 4. For urllib3/OpenSSL warning: This is harmless but can be ignored
+
+# Installation commands (run in order):
+# pip install --upgrade pip
+# pip install packaging==23.2 wheel==0.45.0 setuptools
+# pip install -r requirements.txt

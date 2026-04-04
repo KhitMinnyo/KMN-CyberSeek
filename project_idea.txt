@@ -1,0 +1,62 @@
+Project Name: KMN-CyberSeek
+Concept: AI-Driven Autonomous Red Team Operator
+Base Vision: A superior alternative to PentestGPT with full automation, integrated execution, and a modern web dashboard.
+
+1. Core Objective
+Build an autonomous hacking framework that doesn't just suggest attacks (like PentestGPT) but actually executes them. It should take a target IP/Domain, perform reconnaissance, reason using LLMs (DeepSeek), and execute subsequent exploitation steps automatically or with human-in-the-loop approval.
+Prefer DeepSeek API keys for KMN-CyberSeek project.
+
+2. System Architecture
+Backend: Python (FastAPI) as the central orchestrator.
+
+AI Engine: Hybrid LLM Connector. Support for Local Ollama (DeepSeek-v2/v3) for privacy, and DeepSeek API for high performance.
+
+Frontend: Streamlit or React-based Web Dashboard for real-time operation monitoring.
+
+Execution Environment: Kali Linux (Docker/VM) containing standard tools (Nmap, Metasploit, Impacket, etc.).
+
+3. Key Features (The "Better than PentestGPT" factors)
+Zero-Copy Execution: The system runs terminal commands directly and feeds the output back to the AI without user manual input.
+
+Context-Aware Reasoning: The AI maintains a "Knowledge Base" of the target (e.g., open ports, service versions, discovered credentials).
+
+Self-Healing Attacks: If a command fails, the AI analyzes the error and tries a different flags or a different attack vector.
+
+Web Dashboard:
+
+Target input field.
+
+Real-time terminal output logs.
+
+AI "Thought Process" display.
+
+"Approve/Deny" buttons for sensitive exploits.
+
+4. Technical Workflow
+Recon: Trigger Nmap through Python subprocess.
+
+Analyze: Send Nmap output to DeepSeek with a specialized Red Team System Prompt.
+
+Plan: AI generates a JSON response containing: reasoning, suggested_command, and risk_level.
+
+Execute: If approved, the system runs the command.
+
+Iterate: Capture new data (e.g., a new service found on a non-standard port) and repeat the cycle until the goal (Root/Domain Admin) is reached.
+
+5. Operational Integrity:
+- Use a local SQLite database to store all session data, discovered hosts, and credentials.
+- Implement a 'Thought-Action-Observation' loop (ReAct pattern) for the AI.
+- Ensure the Web UI reflects the current 'Kill Chain' stage of the target.
+
+6. Future Integration (Roadmap)
+KMN-Training-Win Integration: Specifically tuned to exploit Active Directory environments.
+
+LLM Security: Capable of testing other AI implementations for Prompt Injection.
+
+Data Exfiltration: Automated stealthy data extraction techniques.
+
+Remark
+"The system must maintain a Session State (SQLite/JSON). AI should refer to previous scan results and discovered credentials before deciding the next action."
+"Introduce an Action Approval Workflow. High-risk commands (e.g., Exploits, Brute-force) require a 'Confirm' click from the Web UI, while low-risk commands (e.g., Nmap, Directory listing) can be set to Full-Auto."
+"Automatic Evidence Collection. Every successful command and its output must be logged as evidence for the final report generation."
+
