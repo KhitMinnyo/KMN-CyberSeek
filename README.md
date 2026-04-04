@@ -87,7 +87,7 @@ KMN-CyberSeek Architecture:
 └───────────────┘     └──────────────┘     └──────────────┘
 ```
 
-## ✨ Key Features (Better than PentestGPT)
+## ✨ Key Features 
 
 ### 🚀 Zero-Copy Execution
 - System runs terminal commands directly
@@ -261,12 +261,7 @@ KMN-CyberSeek/
 - Auto-refresh every 5 seconds
 - Real-time WebSocket updates
 
-## 🛠️ Development
 
-### Running Tests
-```bash
-pytest tests/
-```
 
 ### Code Structure
 ```python
@@ -312,7 +307,7 @@ pytest tests/
 - [x] Command approval workflow
 
 ### Phase 2 (Next)
-- [ ] Active Directory integration (KMN-Training-Win)
+- [ ] Active Directory Exploitation & Automation
 - [ ] Metasploit automation
 - [ ] Advanced evidence collection
 - [ ] PDF report generation
