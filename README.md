@@ -131,8 +131,10 @@ git clone https://github.com/KhitMinnyo/KMN-CyberSeek.git
 cd KMN-CyberSeek
 ```
 
-### Step 2: Install Dependencies
+### Step 2: Install Dependencies in Virual environment
 ```bash
+python3 -m venv venv # Creating Virtual Environment
+source venv/bin/activate # Activating virtual environment
 pip install -r requirements.txt
 ```
 
