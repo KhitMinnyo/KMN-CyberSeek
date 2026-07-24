@@ -8,20 +8,23 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import sys
 from dotenv import load_dotenv, set_key
 load_dotenv()
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
 import uvicorn
 
 from ai.connector import KMN_AI_Connector
 from core.orchestrator import Orchestrator
 from core.scanner import Scanner
+from core.validators import is_valid_target
 
 # Configure logging
 logging.basicConfig(
@@ -30,6 +33,25 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+
+# --- API authentication -----------------------------------------------------
+# This API can execute arbitrary shell commands on behalf of a session
+# (/api/execute, the AI auto-execute loop). It must never be reachable without
+# a shared secret, even on a "trusted" local network. Auto-generate and persist
+# a token on first run so the operator doesn't have to set one up manually.
+API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN")
+if not API_AUTH_TOKEN:
+    API_AUTH_TOKEN = secrets.token_urlsafe(32)
+    _env_path = os.path.join(os.getcwd(), ".env")
+    if not os.path.exists(_env_path):
+        open(_env_path, "w").close()
+    set_key(_env_path, "API_AUTH_TOKEN", API_AUTH_TOKEN)
+    logger.warning(
+        "No API_AUTH_TOKEN found - generated a new one and saved it to .env. "
+        "The Streamlit frontend reads it from the same .env file automatically."
+    )
+
+_OPEN_PATHS = {"/", "/health", "/api/docs", "/api/redoc", "/api/openapi.json"}
 
 app = FastAPI(
     title="KMN-CyberSeek API",
@@ -47,6 +69,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def enforce_api_key(request: Request, call_next):
+    """Require X-API-Key on every /api/* route. CORS alone does NOT stop
+    direct (non-browser) requests, so this is the real access control."""
+    path = request.url.path
+    if path in _OPEN_PATHS or not path.startswith("/api/"):
+        return await call_next(request)
+
+    supplied = request.headers.get("x-api-key", "")
+    if not supplied or not secrets.compare_digest(supplied, API_AUTH_TOKEN):
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid X-API-Key header"})
+
+    return await call_next(request)
 
 # Global instances
 ai_provider = os.getenv("AI_PROVIDER")
@@ -75,6 +112,23 @@ class TargetRequest(BaseModel):
     session_name: Optional[str] = Field(None, description="Custom session name")
     auto_approve: bool = Field(False, description="Auto-approve low/medium risk commands")
     max_auto_depth: int = Field(5, description="Maximum consecutive auto-executed commands")
+    authorization_confirmed: bool = Field(
+        ..., description="Must be true: operator confirms they own this target or have explicit permission to test it"
+    )
+
+    @field_validator("ip")
+    @classmethod
+    def _validate_ip(cls, v: str) -> str:
+        if not is_valid_target(v):
+            raise ValueError("Target must be a valid IP address or hostname (no spaces or special characters)")
+        return v
+
+    @field_validator("domain")
+    @classmethod
+    def _validate_domain(cls, v: Optional[str]) -> Optional[str]:
+        if v and not is_valid_target(v):
+            raise ValueError("Domain must be a valid hostname (no spaces or special characters)")
+        return v
 
 class CommandRequest(BaseModel):
     """Command execution request."""
@@ -90,9 +144,10 @@ class ApprovalRequest(BaseModel):
 
 class AISettings(BaseModel):
     """AI settings update model."""
-    provider: str
+    provider: str  # "Local (Ollama)" or "DeepSeek API"
     api_key: str = ""
-    model_name: str = ""
+    model_name: str = ""  # Ollama model tag OR DeepSeek model name, depending on provider
+    ollama_url: str = ""
 
 # API Endpoints
 @app.get("/")
@@ -116,23 +171,30 @@ async def start_session(target_request: TargetRequest):
     """Start a new penetration testing session."""
     try:
         logger.info(f"Starting new session for target: {target_request.ip}")
-        
+
         # Initialize session
         session_id = orchestrator.create_session(
             target_ip=target_request.ip,
             target_domain=target_request.domain,
-            session_name=target_request.session_name
+            session_name=target_request.session_name,
+            auto_approve=target_request.auto_approve,
+            max_auto_depth=target_request.max_auto_depth,
+            authorization_confirmed=target_request.authorization_confirmed
         )
-        
+
         # Start initial reconnaissance
         asyncio.create_task(orchestrator.start_reconnaissance(session_id))
-        
+
         return {
             "session_id": session_id,
             "target": target_request.ip,
             "status": "initialized",
             "message": "Session created and reconnaissance started"
         }
+    except ValueError as e:
+        # Validation / authorization / scope errors -> 400, not 500
+        logger.warning(f"Rejected session start for target {target_request.ip}: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to start session: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -246,27 +308,53 @@ async def resume_session(session_id: str):
 
 @app.post("/api/settings/ai")
 async def update_ai_settings(settings: AISettings):
-    """Update AI settings and reload connector."""
+    """Update AI settings (persisted to .env, works even if .env starts empty) and
+    reload the connector. Supports exactly two providers: DeepSeek API and local
+    Ollama (any model you've pulled, e.g. deepseek-r1:8b or a security-tuned model
+    like DeepHat/DeepHat-V1-7B)."""
     env_path = os.path.join(os.getcwd(), '.env')
     if not os.path.exists(env_path):
         open(env_path, 'w').close()
-    
+
     # Map the UI provider string to backend provider code
-    provider_code = "api" if "API" in settings.provider else "local"
-    
-    # Update .env file
+    provider_code = "api" if "DeepSeek" in settings.provider else "local"
     set_key(env_path, "AI_PROVIDER", provider_code)
-    if "DeepSeek" in settings.provider:
-        set_key(env_path, "DEEPSEEK_API_KEY", settings.api_key)
-    elif "OpenAI" in settings.provider:
-        set_key(env_path, "OPENAI_API_KEY", settings.api_key)
-    
+
+    local_model = None
+    ollama_url = None
+    api_model = None
+
+    if provider_code == "api":
+        if settings.api_key:
+            set_key(env_path, "DEEPSEEK_API_KEY", settings.api_key)
+        if settings.model_name:
+            set_key(env_path, "DEEPSEEK_MODEL", settings.model_name)
+            api_model = settings.model_name
+    else:
+        if settings.model_name:
+            set_key(env_path, "OLLAMA_MODEL", settings.model_name)
+            local_model = settings.model_name
+        if settings.ollama_url:
+            set_key(env_path, "OLLAMA_URL", settings.ollama_url)
+            ollama_url = settings.ollama_url
+
     # Re-initialize the global AI connector with new settings
     global ai_connector, orchestrator
-    ai_connector = KMN_AI_Connector(provider=provider_code, api_key=settings.api_key)
+    ai_connector = KMN_AI_Connector(
+        provider=provider_code,
+        api_key=settings.api_key or None,
+        local_model=local_model,
+        ollama_url=ollama_url,
+        api_model=api_model
+    )
     orchestrator.ai_connector = ai_connector
-    
-    return {"status": "success", "message": "AI settings updated and connector reloaded"}
+
+    return {
+        "status": "success",
+        "message": "AI settings updated and connector reloaded",
+        "provider": provider_code,
+        "model": ai_connector.local_model if provider_code == "local" else ai_connector.api_model
+    }
 
 @app.post("/api/execute")
 async def execute_command(command_request: CommandRequest):
@@ -351,6 +439,12 @@ async def approve_command(approval_request: ApprovalRequest):
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time communication."""
+    # HTTP middleware doesn't run for WS upgrades, so check the token explicitly.
+    token = websocket.query_params.get("token", "")
+    if not token or not secrets.compare_digest(token, API_AUTH_TOKEN):
+        await websocket.close(code=1008)  # policy violation
+        return
+
     await websocket.accept()
     active_connections.append(websocket)
     
@@ -373,14 +467,22 @@ async def websocket_endpoint(websocket: WebSocket):
 
 def start_operation():
     """Start the FastAPI server."""
+    # Default to localhost-only. This API can execute shell commands, so binding
+    # to 0.0.0.0 exposes that to the whole network - only do so deliberately via
+    # BACKEND_HOST in .env, and keep API_AUTH_TOKEN secret if you do.
+    host = os.getenv("BACKEND_HOST", "127.0.0.1")
+    port = int(os.getenv("BACKEND_PORT", "8000"))
+
     logger.info("Starting KMN-CyberSeek backend server...")
-    logger.info(f"API Documentation: http://localhost:8000/api/docs")
+    logger.info(f"API Documentation: http://localhost:{port}/api/docs")
     logger.info(f"Streamlit Frontend: http://localhost:8501")
-    
+    if host != "127.0.0.1" and host != "localhost":
+        logger.warning(f"BACKEND_HOST={host} - the API is reachable beyond localhost. Ensure API_AUTH_TOKEN stays secret.")
+
     uvicorn.run(
         app,
-        host="0.0.0.0",
-        port=8000,
+        host=host,
+        port=port,
         log_level="info"
     )
 

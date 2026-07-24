@@ -7,12 +7,31 @@ import asyncio
 import json
 import logging
 import re
+import shlex
 import subprocess
 from typing import Dict, List, Optional
 
 import nmap  # python-nmap
 
+from core.validators import is_valid_target
+
 logger = logging.getLogger(__name__)
+
+
+def _invalid_target_result(target: str, extra_fields: Optional[Dict] = None) -> Dict:
+    """Build a standard failure response for a target that fails validation,
+    instead of ever letting it reach a shell command string."""
+    logger.error(f"Rejected invalid/unsafe target: {target!r}")
+    result = {
+        "target": target,
+        "success": False,
+        "error": "Invalid target: must be a plain IP address or hostname (no shell metacharacters).",
+        "raw_output": "",
+        "parsed_results": {},
+    }
+    if extra_fields:
+        result.update(extra_fields)
+    return result
 
 
 class Scanner:
@@ -34,7 +53,10 @@ class Scanner:
             Dictionary with scan results
         """
         logger.info(f"Starting Nmap scan on {target} (type: {scan_type})")
-        
+
+        if not is_valid_target(target):
+            return _invalid_target_result(target)
+
         # Define scan profiles (updated with Windows ports and vulnerabilities)
         scan_profiles = {
             "quick": "-T4 -F",  # Fast scan, only top 100 ports
@@ -51,17 +73,18 @@ class Scanner:
             loop = asyncio.get_event_loop()
             
             # Use subprocess for better control and async execution
-            cmd = f"nmap {scan_options} {target}"
-            
+            # target is validated above; shlex.quote is defense-in-depth against injection.
+            cmd = f"nmap {scan_options} {shlex.quote(target)}"
+
             process = await asyncio.create_subprocess_shell(
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd="/tmp"
             )
-            
+
             stdout, stderr = await process.communicate()
-            
+
             if process.returncode != 0:
                 logger.error(f"Nmap scan failed: {stderr.decode()}")
                 return {
@@ -267,10 +290,13 @@ class Scanner:
             Vulnerability scan results
         """
         logger.info(f"Starting vulnerability scan on {target}")
-        
+
+        if not is_valid_target(target):
+            return _invalid_target_result(target, {"vulnerabilities": []})
+
         try:
             # Use Nmap with vulnerability scripts
-            cmd = f"nmap -sV --script vuln {target}"
+            cmd = f"nmap -sV --script vuln {shlex.quote(target)}"
             
             process = await asyncio.create_subprocess_shell(
                 cmd,
@@ -411,18 +437,30 @@ class Scanner:
         Returns:
             Port status information
         """
+        if not is_valid_target(target):
+            return _invalid_target_result(target, {"port": port})
+
+        if not isinstance(port, int) or not (0 < port < 65536):
+            logger.error(f"Rejected invalid port: {port!r}")
+            return {
+                "target": target,
+                "port": port,
+                "success": False,
+                "error": "Invalid port: must be an integer between 1 and 65535."
+            }
+
         try:
-            cmd = f"nmap -p {port} {target}"
-            
+            cmd = f"nmap -p {port} {shlex.quote(target)}"
+
             process = await asyncio.create_subprocess_shell(
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd="/tmp"
             )
-            
+
             stdout, stderr = await process.communicate()
-            
+
             if process.returncode != 0:
                 return {
                     "target": target,
