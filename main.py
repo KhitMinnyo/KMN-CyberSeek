@@ -149,6 +149,10 @@ class AISettings(BaseModel):
     model_name: str = ""  # Ollama model tag OR DeepSeek model name, depending on provider
     ollama_url: str = ""
 
+class VulnersSettings(BaseModel):
+    """Vulners API key update model (optional CVE enrichment - see core/cve_lookup.py)."""
+    api_key: str = ""
+
 # API Endpoints
 @app.get("/")
 async def root():
@@ -260,6 +264,21 @@ async def get_pending_commands(session_id: str):
     }
 
 
+@app.get("/api/sessions/{session_id}/vulnerabilities")
+async def get_vulnerabilities(session_id: str):
+    """Get all recorded vulnerability findings for a session (structured, from
+    the vulnerabilities table - see core/orchestrator.py add_vulnerability())."""
+    if not orchestrator.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    vulnerabilities = orchestrator.get_vulnerabilities(session_id)
+    return {
+        "session_id": session_id,
+        "vulnerabilities": vulnerabilities,
+        "count": len(vulnerabilities)
+    }
+
+
 @app.post("/api/sessions/{session_id}/start")
 async def start_session_scan(session_id: str):
     """Start initial reconnaissance scan for a session."""
@@ -354,6 +373,26 @@ async def update_ai_settings(settings: AISettings):
         "message": "AI settings updated and connector reloaded",
         "provider": provider_code,
         "model": ai_connector.local_model if provider_code == "local" else ai_connector.api_model
+    }
+
+@app.post("/api/settings/vulners")
+async def update_vulners_settings(settings: VulnersSettings):
+    """Save the Vulners API key used for optional CVE enrichment (core/cve_lookup.py).
+    Purely additive - if left blank, vulnerability findings still come from Nmap's
+    NSE vuln scripts, just without CVE/CVSS enrichment."""
+    env_path = os.path.join(os.getcwd(), '.env')
+    if not os.path.exists(env_path):
+        open(env_path, 'w').close()
+
+    set_key(env_path, "VULNERS_API_KEY", settings.api_key)
+    # cve_lookup reads the env var fresh on every lookup call, so no reload needed -
+    # but refresh the process's own env in case it was loaded once at startup.
+    os.environ["VULNERS_API_KEY"] = settings.api_key
+
+    return {
+        "status": "success",
+        "message": "Vulners API key saved" if settings.api_key else "Vulners API key cleared (CVE enrichment disabled)",
+        "configured": bool(settings.api_key)
     }
 
 @app.post("/api/execute")

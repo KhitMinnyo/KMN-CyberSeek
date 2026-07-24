@@ -17,6 +17,8 @@ from core.validators import is_valid_target
 
 logger = logging.getLogger(__name__)
 
+_CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
+
 
 def _invalid_target_result(target: str, extra_fields: Optional[Dict] = None) -> Dict:
     """Build a standard failure response for a target that fails validation,
@@ -279,24 +281,29 @@ class Scanner:
         
         return await self.perform_nmap_scan(target, options)
     
-    async def perform_vulnerability_scan(self, target: str) -> Dict:
+    async def perform_vulnerability_scan(self, target: str, ports: Optional[List[int]] = None) -> Dict:
         """
-        Perform basic vulnerability scan using Nmap scripts.
-        
+        Perform basic vulnerability scan using Nmap's 'vuln' NSE script category.
+
         Args:
             target: IP address or domain
-        
+            ports: Optional list of specific ports to target (e.g. the open ports
+                already found during recon). Scanning only known-open ports is much
+                faster than re-scanning the default/full range. If omitted, Nmap's
+                own default port selection is used.
+
         Returns:
             Vulnerability scan results
         """
-        logger.info(f"Starting vulnerability scan on {target}")
+        logger.info(f"Starting vulnerability scan on {target}" + (f" (ports: {ports})" if ports else ""))
 
         if not is_valid_target(target):
             return _invalid_target_result(target, {"vulnerabilities": []})
 
         try:
-            # Use Nmap with vulnerability scripts
-            cmd = f"nmap -sV --script vuln {shlex.quote(target)}"
+            # Use Nmap with vulnerability scripts, scoped to known-open ports if given
+            port_flag = f"-p {','.join(str(int(p)) for p in ports)} " if ports else ""
+            cmd = f"nmap -sV {port_flag}--script vuln {shlex.quote(target)}"
             
             process = await asyncio.create_subprocess_shell(
                 cmd,
@@ -364,7 +371,8 @@ class Scanner:
                             "description": "",
                             "risk": "unknown",
                             "ports": [],
-                            "references": []
+                            "references": [],
+                            "cve_ids": []
                         }
                     elif current_vuln:
                         # Add details to current vulnerability
@@ -379,14 +387,25 @@ class Scanner:
                             pass  # Skip references line
                         elif vuln_line.startswith('http'):
                             current_vuln["references"].append(vuln_line)
-            
+
+                        # NSE vuln scripts often name the finding after its CVE (e.g.
+                        # "CVE-2021-41773") or list CVEs in the description/refs - capture
+                        # any that appear anywhere in this finding's text so far.
+                        found_cves = _CVE_ID_RE.findall(
+                            current_vuln["name"] + " " + vuln_line
+                        )
+                        for cve in found_cves:
+                            cve_upper = cve.upper()
+                            if cve_upper not in current_vuln["cve_ids"]:
+                                current_vuln["cve_ids"].append(cve_upper)
+
             # Add the last vulnerability if exists
             if current_vuln:
                 vulnerabilities.append(current_vuln)
-                
+
         except Exception as e:
             logger.error(f"Failed to parse vulnerability output: {e}")
-        
+
         return vulnerabilities
     
     def _extract_risk_level(self, state_line: str) -> str:
