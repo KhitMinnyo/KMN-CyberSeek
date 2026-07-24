@@ -299,6 +299,29 @@ def resume_session(session_id: str):
     return None
 
 
+def start_threat_intel_research(topic: str):
+    """Kick off AI-directed open-web research for a topic."""
+    try:
+        response = api_session.post(f"{API_BASE}/threat-intel/research", json={"topic": topic}, timeout=15)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        logger.error(f"Failed to start threat-intel research: {e}")
+    return None
+
+
+def get_threat_intel(topic: str = None):
+    """Get cached threat-intel findings, optionally filtered by topic."""
+    try:
+        params = {"topic": topic} if topic else {}
+        response = api_session.get(f"{API_BASE}/threat-intel", params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json().get("findings", [])
+    except Exception as e:
+        logger.error(f"Failed to get threat intel: {e}")
+    return []
+
+
 def main():
     """Main Streamlit application."""
     
@@ -324,8 +347,8 @@ def main():
         # Navigation menu
         selected = option_menu(
             menu_title="Navigation",
-            options=["Dashboard", "New Session", "Active Sessions", "Command Console", "Settings"],
-            icons=["speedometer2", "plus-circle", "list-task", "terminal", "gear"],
+            options=["Dashboard", "New Session", "Active Sessions", "Command Console", "Threat Intel", "Settings"],
+            icons=["speedometer2", "plus-circle", "list-task", "terminal", "search", "gear"],
             menu_icon="cast",
             default_index=0,
             styles={
@@ -386,6 +409,8 @@ def main():
             show_active_sessions()
         elif selected == "Command Console":
             show_command_console()
+        elif selected == "Threat Intel":
+            show_threat_intel()
         elif selected == "Settings":
             show_settings()
 
@@ -1438,6 +1463,76 @@ def show_command_console():
                 st.code("ffuf -w /usr/share/wordlists/dirb/common.txt -u http://{target}/FUZZ", language="bash")
             elif template == "SQL Injection Test":
                 st.code("sqlmap -u 'http://{target}/page.php?id=1' --batch", language="bash")
+
+
+def show_threat_intel():
+    """Threat Intel page - AI-directed open-web vulnerability research (core/threat_intel.py).
+    Builds a shared local reference cache that future pentest sessions automatically
+    cross-reference against (see core/orchestrator.py _run_vulnerability_analysis)."""
+    st.markdown("<h1 class='main-header'>🔬 Threat Intel</h1>", unsafe_allow_html=True)
+
+    if not check_backend_health():
+        st.error("Backend is not available. Please start the FastAPI server.")
+        return
+
+    st.warning(
+        "⚠️ **Unverified by design.** The AI searches the open web (no domain restriction) and "
+        "extracts vulnerability info with another AI call. Pages can be wrong, outdated, or "
+        "deliberately misleading (SEO spam, prompt-injection attempts). Treat every result below "
+        "as a lead to verify, not a confirmed fact - cross-check against Vulners/NVD/CISA KEV before "
+        "acting on it. This research runs independently of any live session and never issues shell "
+        "commands on its own."
+    )
+
+    with st.form("threat_intel_research_form"):
+        topic = st.text_input(
+            "Topic to research",
+            placeholder="e.g. Apache httpd, WordPress plugins, latest critical CVEs 2026",
+            help="The AI will search the web for this topic and extract any CVE/vulnerability info it finds."
+        )
+        submitted = st.form_submit_button("🔎 Research", type="primary")
+        if submitted:
+            if not topic.strip():
+                st.error("Enter a topic first.")
+            else:
+                result = start_threat_intel_research(topic.strip())
+                if result:
+                    st.success(f"Research started for '{topic}'. This runs in the background - results appear below in a moment (page auto-refreshes every 5s).")
+                else:
+                    st.error("Failed to start research. Check backend logs.")
+
+    st.markdown("---")
+    st.markdown("### 📚 Cached Findings")
+
+    filter_topic = st.text_input("Filter by topic (optional)", key="ti_filter", placeholder="e.g. apache")
+    findings = get_threat_intel(filter_topic.strip() if filter_topic else None)
+
+    if not findings:
+        st.info("No cached findings yet. Research a topic above to get started.")
+        return
+
+    st.caption(f"{len(findings)} cached finding(s)")
+
+    for f in findings:
+        cve_label = ", ".join(f.get("cve_ids") or []) or "No CVE ID extracted"
+        with st.expander(f"🕸️ {f.get('title', 'Untitled')} — {cve_label}"):
+            st.markdown(f"""
+            <div class='command-card'>
+                <strong>⚠️ Status:</strong> Unverified (web research)<br>
+                <strong>Topic:</strong> {f.get('topic', 'N/A')}<br>
+                <strong>CVE(s):</strong> {cve_label}<br>
+                <strong>Affected Software:</strong> {f.get('affected_software') or 'Not specified'}<br>
+                <strong>Severity (as reported):</strong> {f.get('severity') or 'Not specified'}<br>
+                <strong>Discovered:</strong> {f.get('discovered_at', 'Unknown')}
+            </div>
+            """, unsafe_allow_html=True)
+
+            if f.get("description"):
+                st.markdown("**Description:**")
+                st.write(f["description"])
+
+            if f.get("source_url"):
+                st.markdown(f"**Source:** [{f['source_url']}]({f['source_url']})")
 
 
 def show_settings():
