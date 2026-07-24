@@ -216,6 +216,7 @@ def get_session_details(session_id: str):
                 "commands_executed": session_report.get("commands_executed", []),
                 "ai_decisions": session_report.get("ai_decisions", []),
                 "evidence": session_report.get("evidence", []),
+                "vulnerabilities": session_report.get("vulnerabilities", []),
                 "credentials": session_report.get("credentials", []),
                 "summary": summary,
                 "discovered_hosts_count": summary.get("total_hosts", len(session_report.get("discovered_hosts", []))),
@@ -738,21 +739,26 @@ def display_session_details(session_details: Dict):
     st.markdown("---")
     
     # Session tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "🔍 Scan Results", "🤖 AI Decisions", "⚡ Commands", "📁 Evidence"])
-    
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["📊 Overview", "🔍 Scan Results", "🛡️ Vulnerabilities", "🤖 AI Decisions", "⚡ Commands", "📁 Evidence"]
+    )
+
     with tab1:
         show_session_overview(session_details)
-    
+
     with tab2:
         show_scan_results(session_details)
-    
+
     with tab3:
-        show_ai_decisions(session_details)
-    
+        show_vulnerabilities(session_details)
+
     with tab4:
-        show_commands(session_details)
-    
+        show_ai_decisions(session_details)
+
     with tab5:
+        show_commands(session_details)
+
+    with tab6:
         show_evidence(session_details)
 
 
@@ -914,6 +920,69 @@ def show_scan_results(session_details: Dict):
                     Risk: <strong>{risk.upper()}</strong>
                 </div>
                 """, unsafe_allow_html=True)
+
+
+def show_vulnerabilities(session_details: Dict):
+    """Show structured vulnerability findings (Nmap NSE vuln scripts + optional
+    Vulners CVE enrichment - see core/orchestrator.py _run_vulnerability_analysis)."""
+    vulnerabilities = session_details.get("vulnerabilities", [])
+
+    if not vulnerabilities:
+        st.info(
+            "No vulnerability findings yet. These are populated automatically after the "
+            "initial scan completes (Nmap vuln scripts, plus CVE lookups if a Vulners API "
+            "key is configured in Settings)."
+        )
+        return
+
+    high = [v for v in vulnerabilities if v.get("risk_level") == "high"]
+    medium = [v for v in vulnerabilities if v.get("risk_level") == "medium"]
+    low = [v for v in vulnerabilities if v.get("risk_level") == "low"]
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Findings", len(vulnerabilities))
+    with col2:
+        st.metric("High Risk", len(high))
+    with col3:
+        st.metric("Medium Risk", len(medium))
+    with col4:
+        st.metric("Low Risk", len(low))
+
+    st.markdown("---")
+
+    # Highest risk first
+    risk_order = {"high": 0, "medium": 1, "low": 2, "unknown": 3}
+    sorted_vulns = sorted(vulnerabilities, key=lambda v: risk_order.get(v.get("risk_level"), 3))
+
+    for v in sorted_vulns:
+        risk = v.get("risk_level", "unknown")
+        risk_class = f"{risk}-risk" if risk in ("high", "medium", "low") else ""
+        cve_ids = v.get("cve_ids") or []
+        cve_label = ", ".join(cve_ids) if cve_ids else "No CVE assigned"
+        location = f"{v.get('host', '?')}:{v.get('port')}" if v.get("port") else v.get("host", "?")
+
+        with st.expander(f"{'🔴' if risk=='high' else '🟠' if risk=='medium' else '🟢'} {v.get('name', 'Unnamed finding')} — {cve_label}"):
+            st.markdown(f"""
+            <div class='command-card {risk_class}'>
+                <strong>Location:</strong> {location} ({v.get('service') or 'unknown service'} {v.get('service_version') or ''})<br>
+                <strong>Risk:</strong> {risk.upper()}{f" (CVSS {v['cvss_score']})" if v.get('cvss_score') is not None else ""}<br>
+                <strong>CVE(s):</strong> {cve_label}<br>
+                <strong>Source:</strong> {v.get('source_tool', 'unknown')}<br>
+                <strong>Status:</strong> {v.get('status', 'confirmed')}<br>
+                <strong>Discovered:</strong> {v.get('discovered_at', 'Unknown')}
+            </div>
+            """, unsafe_allow_html=True)
+
+            if v.get("description"):
+                st.markdown("**Description:**")
+                st.write(v["description"])
+
+            refs = v.get("reference_urls") or []
+            if refs:
+                st.markdown("**References:**")
+                for url in refs:
+                    st.markdown(f"- {url}")
 
 
 def show_ai_decisions(session_details: Dict):
@@ -1534,6 +1603,28 @@ def show_settings():
             st.text_input("Current API Key", value=current_token, type="password", disabled=True)
         else:
             st.warning("No API_AUTH_TOKEN found yet - start the backend once to generate it.")
+
+        st.markdown("#### Vulnerability Intelligence (optional)")
+        st.caption(
+            "Adds CVE/CVSS enrichment to scan findings via the [Vulners](https://vulners.com) API, "
+            "on top of Nmap's built-in vuln scripts. Leave blank to skip - findings still work "
+            "without it, just without CVE matching. Get a key at vulners.com/api-keys."
+        )
+        env_path_vulners = os.path.join(os.getcwd(), '.env')
+        env_vars_vulners = dotenv_values(env_path_vulners) if os.path.exists(env_path_vulners) else {}
+        current_vulners_key = env_vars_vulners.get("VULNERS_API_KEY", "")
+        vulners_key_input = st.text_input(
+            "Vulners API Key", value=current_vulners_key, type="password", key="vulners_api_key_input"
+        )
+        if st.button("💾 Save Vulners API Key"):
+            try:
+                resp = api_session.post(f"{API_BASE}/settings/vulners", json={"api_key": vulners_key_input})
+                if resp.status_code == 200:
+                    st.success(resp.json().get("message", "Saved."))
+                else:
+                    st.error(f"Failed to save: {resp.text}")
+            except Exception as e:
+                st.error(f"Connection error: {e}")
 
         st.markdown("#### Access Control")
         enable_auth = st.checkbox("Enable authentication", value=False)
