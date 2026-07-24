@@ -33,13 +33,22 @@ class AIResponse(BaseModel):
 class KMN_AI_Connector:
     """Hybrid AI connector supporting local Ollama and DeepSeek API."""
     
-    def __init__(self, provider: str = None, api_key: Optional[str] = None):
+    def __init__(self, provider: str = None, api_key: Optional[str] = None,
+                 local_model: Optional[str] = None, ollama_url: Optional[str] = None,
+                 api_model: Optional[str] = None):
         """
         Initialize AI connector.
-        
+
         Args:
             provider: "local" for Ollama, "api" for DeepSeek API. If None, auto-detects based on API key.
             api_key: API key for DeepSeek API (optional, will check env vars if not provided)
+            local_model: Ollama model tag to use, e.g. "deepseek-r1:8b" or a security-tuned
+                model like "DeepHat/DeepHat-V1-7B". Falls back to OLLAMA_MODEL env var,
+                then a built-in default. Any model you've `ollama pull`ed works here.
+            ollama_url: Base URL of the Ollama server, e.g. "http://localhost:11434".
+                Falls back to OLLAMA_URL env var, then localhost default.
+            api_model: DeepSeek API model name, e.g. "deepseek-chat" or "deepseek-coder".
+                Falls back to DEEPSEEK_MODEL env var, then a built-in default.
         """
         # Load environment variables fresh
         load_dotenv(override=True)
@@ -74,7 +83,7 @@ class KMN_AI_Connector:
         
         if is_valid_api_key:
             self.provider = "api"
-            logger.info(f"Valid API Key found: {self.api_key[:10]}... Forcing AI provider to: API")
+            logger.info("Valid API key found. Forcing AI provider to: API")
         else:
             # Only use local if explicitly requested AND no valid API key exists
             self.provider = provider or os.getenv("AI_PROVIDER", "local")
@@ -85,13 +94,17 @@ class KMN_AI_Connector:
             # Clear API key if it's invalid/placeholder
             self.api_key = None
         
-        # URLs for different providers
-        self.ollama_url = "http://localhost:11434/api/generate"
+        # URLs for different providers - explicit args win, then env vars, then defaults.
+        ollama_base = (ollama_url or os.getenv("OLLAMA_URL") or "http://localhost:11434").strip().rstrip("/")
+        if ollama_base.endswith("/api/generate"):
+            ollama_base = ollama_base[: -len("/api/generate")].rstrip("/")
+        self.ollama_url = f"{ollama_base}/api/generate"
         self.deepseek_api_url = "https://api.deepseek.com/chat/completions"
-        
-        # Default models
-        self.local_model = "deepseek-r1:8b"  # or "deepseek-v2:latest"
-        self.api_model = "deepseek-chat"
+
+        # Default models - configurable so any Ollama model (e.g. a security-tuned model
+        # like DeepHat/DeepHat-V1-7B) can be used without code changes.
+        self.local_model = local_model or os.getenv("OLLAMA_MODEL") or "deepseek-r1:8b"
+        self.api_model = api_model or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
         
         # Session history for context
         self.session_history: Dict[str, List[Dict]] = {}
@@ -235,18 +248,23 @@ Important: Your response must be valid JSON only, no additional text."""
     
     def ask_ai(self, prompt: str, session_id: Optional[str] = None) -> AIResponse:
         """
-        Synchronous wrapper for AI queries.
+        Synchronous wrapper for AI queries. NOTE: this cannot be called from
+        inside a running event loop (e.g. FastAPI async handlers) - use
+        'await ask_ai_async(...)' there instead. This wrapper is kept for
+        standalone/CLI/test usage only.
         """
         if self.provider == "api":
-            # For async API calls, we need to run in event loop
             import asyncio
             try:
-                loop = asyncio.get_event_loop()
+                asyncio.get_running_loop()
             except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            
-            return loop.run_until_complete(self.ask_ai_api(prompt, session_id))
+                # No loop running in this thread - safe to drive one to completion.
+                return asyncio.run(self.ask_ai_api(prompt, session_id))
+            else:
+                raise RuntimeError(
+                    "KMN_AI_Connector.ask_ai() is synchronous and cannot be called from "
+                    "inside a running event loop. Use 'await ask_ai_async(...)' instead."
+                )
         else:
             # Local provider
             return self.ask_ai_local(prompt, session_id)

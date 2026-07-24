@@ -18,8 +18,9 @@ fastapi~=0.104.0  # Compatible with 0.104.x
 uvicorn[standard]>=0.24.0,<1.0.0
 pydantic>=2.9.0  # Compatible with 2.5.x
 pydantic-settings>=2.5.0  # Compatible with 2.1.x
-sqlalchemy>=2.0.23  # SQLAlchemy 2.x is stable
-aiosqlite>=0.19.0,<1.0.0
+# NOTE: sessions are persisted with the stdlib sqlite3 module (core/orchestrator.py).
+# sqlalchemy/aiosqlite were listed here but never imported anywhere - removed to
+# keep the install surface honest. Re-add if/when the DB layer is migrated to async.
 
 # Streamlit frontend dependencies
 streamlit>=1.28.1  # Streamlit 1.x is stable

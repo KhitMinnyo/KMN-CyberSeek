@@ -25,6 +25,25 @@ logger = logging.getLogger(__name__)
 BACKEND_URL = "http://localhost:8000"
 API_BASE = f"{BACKEND_URL}/api"
 
+
+def _load_api_token() -> str:
+    """Read the shared API_AUTH_TOKEN from .env (the backend generates and
+    persists it there on first run). Re-read on every call since Streamlit
+    re-executes this module on each rerun, so it self-heals once the backend
+    has written the token."""
+    env_path = os.path.join(os.getcwd(), ".env")
+    if os.path.exists(env_path):
+        token = dotenv_values(env_path).get("API_AUTH_TOKEN")
+        if token:
+            return token
+    return os.getenv("API_AUTH_TOKEN", "")
+
+
+# Shared session so every backend request automatically carries the API key.
+# The backend rejects any /api/* request without a matching X-API-Key header.
+api_session = requests.Session()
+api_session.headers.update({"X-API-Key": _load_api_token()})
+
 # Session selectbox callback functions
 def sync_sidebar():
     st.session_state.selected_session = st.session_state.sidebar_select
@@ -134,7 +153,7 @@ if 'force_nav_to_active' not in st.session_state:
 def check_backend_health():
     """Check if backend is available."""
     try:
-        response = requests.get(f"{BACKEND_URL}/health", timeout=5)
+        response = api_session.get(f"{BACKEND_URL}/health", timeout=5)
         return response.status_code == 200
     except:
         return False
@@ -143,7 +162,7 @@ def check_backend_health():
 def get_sessions():
     """Get list of active sessions from backend."""
     try:
-        response = requests.get(f"{API_BASE}/sessions", timeout=5)
+        response = api_session.get(f"{API_BASE}/sessions", timeout=5)
         if response.status_code == 200:
             return response.json().get("sessions", [])
     except Exception as e:
@@ -151,29 +170,39 @@ def get_sessions():
     return []
 
 
-def start_session(target_ip: str, target_domain: str = "", session_name: str = "", 
-                 auto_approve: bool = False, max_auto_depth: int = 5):
-    """Start a new session."""
+def start_session(target_ip: str, target_domain: str = "", session_name: str = "",
+                 auto_approve: bool = False, max_auto_depth: int = 5,
+                 authorization_confirmed: bool = False):
+    """Start a new session. Returns the parsed response on success, or a dict
+    with an "error" key (never raises) so callers can surface the real reason
+    a session was rejected (e.g. invalid target, scope, missing authorization)."""
     try:
         payload = {
             "ip": target_ip,
             "domain": target_domain if target_domain else None,
             "session_name": session_name if session_name else None,
             "auto_approve": auto_approve,
-            "max_auto_depth": max_auto_depth
+            "max_auto_depth": max_auto_depth,
+            "authorization_confirmed": authorization_confirmed
         }
-        response = requests.post(f"{API_BASE}/start", json=payload, timeout=30)
+        response = api_session.post(f"{API_BASE}/start", json=payload, timeout=30)
         if response.status_code == 200:
             return response.json()
+        try:
+            detail = response.json().get("detail", response.text)
+        except Exception:
+            detail = response.text
+        logger.error(f"Failed to start session: {response.status_code} {detail}")
+        return {"error": detail}
     except Exception as e:
         logger.error(f"Failed to start session: {e}")
-    return None
+        return {"error": str(e)}
 
 
 def get_session_details(session_id: str):
     """Get details of a specific session."""
     try:
-        response = requests.get(f"{API_BASE}/sessions/{session_id}", timeout=5)
+        response = api_session.get(f"{API_BASE}/sessions/{session_id}", timeout=5)
         if response.status_code == 200:
             session_report = response.json()
             session_data = session_report.get("session", {})
@@ -202,7 +231,7 @@ def get_session_details(session_id: str):
 def get_pending_commands(session_id: str):
     """Get pending commands for a specific session."""
     try:
-        response = requests.get(f"{API_BASE}/sessions/{session_id}/pending_commands", timeout=5)
+        response = api_session.get(f"{API_BASE}/sessions/{session_id}/pending_commands", timeout=5)
         if response.status_code == 200:
             return response.json().get("pending_commands", [])
     except Exception as e:
@@ -218,7 +247,7 @@ def execute_command(session_id: str, command: str, auto_approve: bool = False):
             "command": command,
             "auto_approve": auto_approve
         }
-        response = requests.post(f"{API_BASE}/execute", json=payload, timeout=30)
+        response = api_session.post(f"{API_BASE}/execute", json=payload, timeout=30)
         if response.status_code == 200:
             return response.json()
     except Exception as e:
@@ -234,7 +263,7 @@ def approve_command(session_id: str, command_id: str):
             "command_id": command_id,
             "approve": True
         }
-        response = requests.post(f"{API_BASE}/approve", json=payload, timeout=30)
+        response = api_session.post(f"{API_BASE}/approve", json=payload, timeout=30)
         if response.status_code == 200:
             return response.json()
     except Exception as e:
@@ -250,7 +279,7 @@ def deny_command(session_id: str, command_id: str):
             "command_id": command_id,
             "approve": False
         }
-        response = requests.post(f"{API_BASE}/approve", json=payload, timeout=30)
+        response = api_session.post(f"{API_BASE}/approve", json=payload, timeout=30)
         if response.status_code == 200:
             return response.json()
     except Exception as e:
@@ -261,7 +290,7 @@ def deny_command(session_id: str, command_id: str):
 def resume_session(session_id: str):
     """Manually resume AI analysis for a session."""
     try:
-        response = requests.post(f"{API_BASE}/sessions/{session_id}/resume", timeout=30)
+        response = api_session.post(f"{API_BASE}/sessions/{session_id}/resume", timeout=30)
         if response.status_code == 200:
             return response.json()
     except Exception as e:
@@ -574,9 +603,17 @@ def show_new_session():
                     value=False,
                     help="Record detailed logs for debugging and analysis"
                 )
-        
+
+        st.markdown("<h3 class='sub-header'>✅ Authorization</h3>", unsafe_allow_html=True)
+        authorization_confirmed = st.checkbox(
+            "I confirm I own this target or have explicit written authorization to test it, "
+            "and I accept responsibility for this engagement.",
+            value=False,
+            help="Required. KMN-CyberSeek will actively scan and may attempt exploitation against this target."
+        )
+
         st.markdown("---")
-        
+
         # Submit button
         submit_col1, submit_col2, submit_col3 = st.columns([1, 2, 1])
         with submit_col2:
@@ -590,12 +627,21 @@ def show_new_session():
             if not target_ip:
                 st.error("Please enter a target IP address or domain.")
                 return
-            
+            if not authorization_confirmed:
+                st.error("You must confirm authorization to test this target before starting a session.")
+                return
+
             # Show loading spinner
             with st.spinner("Creating new session and starting reconnaissance..."):
-                result = start_session(target_ip, target_domain, session_name)
-                
-                if result:
+                result = start_session(
+                    target_ip, target_domain, session_name,
+                    auto_approve=auto_approval,
+                    authorization_confirmed=authorization_confirmed
+                )
+
+                if result and result.get("error"):
+                    st.error(f"Failed to create session: {result['error']}")
+                elif result:
                     st.success(f"✅ Session created successfully!")
                     st.balloons()
                     
@@ -740,21 +786,21 @@ def show_session_overview(session_details: Dict):
 
     if status == "initialized":
         if st.button("🚀 Start Initial Scan", type="primary", use_container_width=True):
-            requests.post(f"{API_BASE}/sessions/{session_id}/start")
+            api_session.post(f"{API_BASE}/sessions/{session_id}/start")
             st.rerun()
     elif status in ["scanning", "analyzing", "executing"]:
         st.button(f"⏳ {status.title()} in progress...", disabled=True, use_container_width=True)
     else:
         # Only show resume for ready, error, completed
         if st.button("▶️ Force AI Analysis / Resume", type="primary", use_container_width=True):
-            requests.post(f"{API_BASE}/sessions/{session_id}/resume")
+            api_session.post(f"{API_BASE}/sessions/{session_id}/resume")
             st.success("Waking up AI...")
             time.sleep(1)
             st.rerun()
-    
+
     # Add delete button next to Stop Session
     if st.button("🗑️ Delete This Session", type="primary", use_container_width=True):
-        response = requests.delete(f"{API_BASE}/sessions/{session_id}")
+        response = api_session.delete(f"{API_BASE}/sessions/{session_id}")
         if response.status_code == 200:
             st.session_state.selected_session = None
             st.success("Session deleted successfully!")
@@ -1355,62 +1401,63 @@ def show_settings():
     
     with tab2:
         st.markdown("### 🤖 AI Configuration")
-        
-        # Read current settings from .env
+        st.caption(
+            "These settings write directly to .env on the backend (created automatically if it "
+            "doesn't exist yet) - no manual file editing needed."
+        )
+
+        # Read current settings from .env (works fine if the file is empty/missing - all fields
+        # just fall back to defaults below)
         env_path = os.path.join(os.getcwd(), '.env')
         env_vars = dotenv_values(env_path) if os.path.exists(env_path) else {}
-        
+
         current_provider = env_vars.get("AI_PROVIDER", "local")
         current_ds_key = env_vars.get("DEEPSEEK_API_KEY", "")
-        current_oa_key = env_vars.get("OPENAI_API_KEY", "")
-        
-        # Determine default index
-        default_index = 0
-        if current_provider == "api":
-            if current_oa_key and not current_ds_key:
-                default_index = 2  # OpenAI API
-            else:
-                default_index = 1  # DeepSeek API
-                
+        current_ds_model = env_vars.get("DEEPSEEK_MODEL", "deepseek-chat")
+        current_ollama_url = env_vars.get("OLLAMA_URL", "http://localhost:11434")
+        current_ollama_model = env_vars.get("OLLAMA_MODEL", "deepseek-r1:8b")
+
         ai_provider = st.selectbox(
             "AI Provider",
-            ["Local (Ollama)", "DeepSeek API", "OpenAI API", "Azure OpenAI"],
-            index=default_index
+            ["Local (Ollama)", "DeepSeek API"],
+            index=1 if current_provider == "api" else 0,
+            help="Local (Ollama) keeps everything on your machine. DeepSeek API is faster but sends data to DeepSeek's servers."
         )
-        
+
         if ai_provider == "Local (Ollama)":
-            ollama_url = st.text_input("Ollama URL", "http://localhost:11434")
-            model_name = st.text_input("Model Name", "deepseek-coder:latest")
-            
+            ollama_url = st.text_input("Ollama URL", value=current_ollama_url)
+            model_name = st.text_input(
+                "Model Name",
+                value=current_ollama_model,
+                help=(
+                    "Any model you've pulled with `ollama pull <name>`. Examples: "
+                    "deepseek-r1:8b, deepseek-coder-v2, or a security-tuned model like "
+                    "DeepHat/DeepHat-V1-7B (ollama pull DeepHat/DeepHat-V1-7B)."
+                )
+            )
+            st.caption(
+                "Security-focused local models worth trying: **DeepHat/DeepHat-V1-7B** "
+                "(offensive/defensive security fine-tune) or plain **deepseek-r1:8b**."
+            )
+
             col1, col2 = st.columns(2)
             with col1:
                 temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
             with col2:
                 max_tokens = st.number_input("Max Tokens", 100, 10000, 2000)
-        
-        elif ai_provider == "DeepSeek API":
+
+        else:  # DeepSeek API
             # Automatically populate the key if it exists in .env
             api_key = st.text_input("API Key", value=current_ds_key, type="password")
-            model_name = st.selectbox("Model", ["deepseek-chat", "deepseek-coder"])
-            
+            model_name = st.text_input(
+                "Model",
+                value=current_ds_model,
+                help="e.g. deepseek-chat or deepseek-coder"
+            )
+            ollama_url = ""  # not applicable for this provider
+
             st.info("DeepSeek API provides high-performance AI with specialized security knowledge.")
-        
-        elif ai_provider == "OpenAI API":
-            # Automatically populate the key if it exists in .env
-            api_key = st.text_input("API Key", value=current_oa_key, type="password")
-            model_name = st.selectbox("Model", ["gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"])
-            
-            st.info("OpenAI API provides advanced AI capabilities with strong security context.")
-        
-        elif ai_provider == "Azure OpenAI":
-            # Azure OpenAI requires different configuration
-            azure_endpoint = st.text_input("Azure Endpoint", placeholder="https://<your-resource>.openai.azure.com/")
-            api_key = st.text_input("API Key", type="password")
-            deployment_name = st.text_input("Deployment Name", placeholder="gpt-4")
-            api_version = st.text_input("API Version", value="2024-02-01")
-            
-            st.info("Azure OpenAI provides enterprise-grade AI with enhanced security and compliance.")
-        
+
         # AI behavior settings
         st.markdown("### 🧠 AI Behavior")
         
@@ -1436,32 +1483,20 @@ def show_settings():
         
         if st.button("💾 Save AI Settings", type="primary"):
             with st.spinner("Saving configuration..."):
-                # Prepare payload based on selected provider
-                api_key_value = ""
-                model_name_value = ""
-                
-                # Get api_key if it exists (only for DeepSeek API)
-                if "DeepSeek" in ai_provider:
-                    try:
-                        api_key_value = api_key
-                    except NameError:
-                        api_key_value = ""
-                
-                # Get model_name if it exists
-                try:
-                    model_name_value = model_name
-                except NameError:
-                    model_name_value = ""
-                
                 payload = {
                     "provider": ai_provider,
-                    "api_key": api_key_value,
-                    "model_name": model_name_value
+                    "api_key": api_key if ai_provider == "DeepSeek API" else "",
+                    "model_name": model_name,
+                    "ollama_url": ollama_url
                 }
                 try:
-                    response = requests.post(f"{API_BASE}/settings/ai", json=payload)
+                    response = api_session.post(f"{API_BASE}/settings/ai", json=payload)
                     if response.status_code == 200:
-                        st.success("AI settings saved successfully! The AI engine is now connected.")
+                        info = response.json()
+                        st.success(
+                            f"AI settings saved! Now using **{info.get('provider', payload['provider'])}** "
+                            f"with model **{info.get('model', model_name)}**."
+                        )
                         time.sleep(1)
                         st.rerun()
                     else:
@@ -1489,6 +1524,17 @@ def show_settings():
             auto_cleanup = st.checkbox("Auto-cleanup old sessions", value=True)
             cleanup_days = st.number_input("Cleanup after (days)", 1, 365, 30)
         
+        st.markdown("#### API Authentication")
+        st.caption(
+            "The backend API requires this key on every request (auto-generated on first run, "
+            "stored in .env as API_AUTH_TOKEN). You'll need it if you call the API directly (e.g. curl)."
+        )
+        current_token = _load_api_token()
+        if current_token:
+            st.text_input("Current API Key", value=current_token, type="password", disabled=True)
+        else:
+            st.warning("No API_AUTH_TOKEN found yet - start the backend once to generate it.")
+
         st.markdown("#### Access Control")
         enable_auth = st.checkbox("Enable authentication", value=False)
         
@@ -1544,7 +1590,7 @@ def show_settings():
         st.subheader("Danger Zone")
         st.warning("These actions cannot be undone.")
         if st.button("🗑️ Clear ALL Sessions and Data", type="primary"):
-            response = requests.delete(f"{API_BASE}/sessions")
+            response = api_session.delete(f"{API_BASE}/sessions")
             if response.status_code == 200:
                 st.session_state.selected_session = None
                 st.success("All database records cleared!")
