@@ -287,6 +287,89 @@ Important: Your response must be valid JSON only, no additional text."""
                     lambda: self.ask_ai_local(prompt, session_id)
                 )
     
+    async def ask_raw_async(self, system_prompt: str, user_prompt: str) -> Optional[Any]:
+        """
+        Query the AI with a fully custom system+user prompt and return raw parsed
+        JSON - no AIResponse schema enforced (no reasoning/suggested_command/etc
+        required). For non-pentest-reasoning tasks like structured data extraction
+        (e.g. core/threat_intel.py), kept deliberately separate from
+        ai/prompts.py SYSTEM_PROMPT so extraction tasks can never smuggle a
+        suggested_command into the live exploitation loop.
+
+        Returns None on any failure (invalid JSON, network error, etc) - never raises.
+        """
+        try:
+            if self.provider == "api":
+                return await self._ask_raw_api(system_prompt, user_prompt)
+            else:
+                import asyncio
+                from concurrent.futures import ThreadPoolExecutor
+
+                loop = asyncio.get_event_loop()
+                with ThreadPoolExecutor() as executor:
+                    return await loop.run_in_executor(
+                        executor, lambda: self._ask_raw_local(system_prompt, user_prompt)
+                    )
+        except Exception as e:
+            logger.warning(f"ask_raw_async failed (non-fatal): {e}")
+            return None
+
+    async def _ask_raw_api(self, system_prompt: str, user_prompt: str) -> Optional[Any]:
+        if not self.api_key:
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        payload = {
+            "model": self.api_model,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": 2000,
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(self.deepseek_api_url, json=payload, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+            text = result['choices'][0]['message']['content']
+            return self._extract_json(text)
+
+    def _ask_raw_local(self, system_prompt: str, user_prompt: str) -> Optional[Any]:
+        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        payload = {
+            "model": self.local_model,
+            "prompt": full_prompt,
+            "stream": False,
+            "options": {"temperature": 0.3}
+        }
+        response = requests.post(self.ollama_url, json=payload, timeout=60)
+        response.raise_for_status()
+        result = response.json()
+        text = result.get('response', '')
+        return self._extract_json(text)
+
+    @staticmethod
+    def _extract_json(text: str) -> Optional[Any]:
+        """Best-effort JSON extraction from a raw model response: strips markdown
+        code fences and grabs the first {...} or [...] block."""
+        import re
+        text = text.strip()
+        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.MULTILINE).strip()
+        match = re.search(r'(\[.*\]|\{.*\})', text, re.DOTALL)
+        if match:
+            text = match.group(1)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            logger.warning(f"ask_raw_async: failed to parse JSON from model response: {text[:200]}")
+            return None
+
     def add_to_history(self, session_id: str, role: str, content: str):
         """Add message to session history for context."""
         if session_id not in self.session_history:

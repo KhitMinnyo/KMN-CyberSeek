@@ -153,6 +153,10 @@ class VulnersSettings(BaseModel):
     """Vulners API key update model (optional CVE enrichment - see core/cve_lookup.py)."""
     api_key: str = ""
 
+class ThreatIntelRequest(BaseModel):
+    """Request to research a topic on the open web (see core/threat_intel.py)."""
+    topic: str = Field(..., min_length=1, max_length=200, description="Topic to research, e.g. 'Apache httpd' or 'latest critical CVEs'")
+
 # API Endpoints
 @app.get("/")
 async def root():
@@ -277,6 +281,27 @@ async def get_vulnerabilities(session_id: str):
         "vulnerabilities": vulnerabilities,
         "count": len(vulnerabilities)
     }
+
+
+@app.post("/api/threat-intel/research")
+async def start_threat_intel_research(request: ThreatIntelRequest):
+    """Kick off AI-directed open-web research for a topic (core/threat_intel.py).
+    Runs in the background - poll GET /api/threat-intel for results. Findings are
+    stored unverified; this is a shared cache, not tied to any single session."""
+    logger.info(f"Starting threat-intel research: {request.topic}")
+    asyncio.create_task(orchestrator.run_threat_intel_research(request.topic))
+    return {
+        "status": "started",
+        "topic": request.topic,
+        "message": "Research started in the background. Poll GET /api/threat-intel for results."
+    }
+
+
+@app.get("/api/threat-intel")
+async def list_threat_intel(topic: Optional[str] = None):
+    """List cached threat-intel findings, optionally filtered by topic (substring match)."""
+    findings = orchestrator.get_threat_intel(topic)
+    return {"topic_filter": topic, "findings": findings, "count": len(findings)}
 
 
 @app.post("/api/sessions/{session_id}/start")

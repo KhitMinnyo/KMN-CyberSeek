@@ -17,6 +17,7 @@ from ai.connector import KMN_AI_Connector, AIResponse
 from core.scanner import Scanner
 from core.validators import is_valid_target, is_target_in_scope, is_allowlisted_command
 from core import cve_lookup
+from core import threat_intel
 
 logger = logging.getLogger(__name__)
 
@@ -99,13 +100,19 @@ class Orchestrator:
         self.sessions: Dict[str, Session] = {}
         self.pending_commands: Dict[str, Dict] = {}  # command_id -> command_data
         self.db_path = "kmn_cyberseek.db"
-        
+        # Shared, non-session-scoped reference cache built by threat-intel research
+        # (core/threat_intel.py) - see _load_threat_intel_cache()
+        self.threat_intel_cache: List[Dict] = []
+
         # Initialize database
         self._init_database()
-        
+
         # Restore incomplete sessions from database
         self._restore_sessions()
-        
+
+        # Load the threat-intel reference cache
+        self._load_threat_intel_cache()
+
         logger.info("Orchestrator initialized")
     
     def _init_database(self):
@@ -200,6 +207,26 @@ class Orchestrator:
                     status TEXT DEFAULT 'confirmed',  -- confirmed, suspected, false_positive, remediated
                     discovered_at TIMESTAMP NOT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions (session_id)
+                )
+            ''')
+
+            # Create threat_intel table - a shared, non-session-scoped reference cache
+            # populated by AI-directed open-web research (core/threat_intel.py).
+            # Deliberately NOT tied to any session_id: the goal is a local database
+            # that gets more useful over time and future sessions can all draw on it.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS threat_intel (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    topic TEXT,
+                    cve_ids TEXT,              -- JSON array
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    affected_software TEXT,
+                    severity TEXT,
+                    source_url TEXT NOT NULL,
+                    source_tool TEXT DEFAULT 'web-research',
+                    verified BOOLEAN DEFAULT FALSE,
+                    discovered_at TIMESTAMP NOT NULL
                 )
             ''')
 
@@ -387,36 +414,69 @@ class Orchestrator:
         # --- Best-effort CVE enrichment via Vulners (optional, needs VULNERS_API_KEY) ---
         # Runs for every service with a known version regardless of NSE findings above,
         # since NSE only covers a fixed set of known checks and can miss CVEs a
-        # database lookup would catch.
+        # database lookup would catch. NOTE: must not early-return here - the
+        # threat-intel cross-reference step below has to run either way.
         if not cve_lookup.is_configured():
             logger.info(f"VULNERS_API_KEY not configured - skipping CVE enrichment for session {session_id}")
-            return
+        else:
+            for service in session.discovered_services:
+                service_name = service.get('service', '') or ''
+                version = service.get('version', '') or ''
+                if not version or service_name.lower() in ('unknown', ''):
+                    continue
+                try:
+                    hits = await cve_lookup.lookup_cves(service_name, version)
+                except Exception as e:
+                    logger.warning(f"Vulners lookup crashed unexpectedly for {service_name} {version} (continuing): {e}")
+                    continue
 
-        for service in session.discovered_services:
-            service_name = service.get('service', '') or ''
-            version = service.get('version', '') or ''
-            if not version or service_name.lower() in ('unknown', ''):
-                continue
-            try:
-                hits = await cve_lookup.lookup_cves(service_name, version)
-            except Exception as e:
-                logger.warning(f"Vulners lookup crashed unexpectedly for {service_name} {version} (continuing): {e}")
-                continue
+                for hit in hits:
+                    self.add_vulnerability(session_id, {
+                        "host": service.get('host', session.target_ip),
+                        "port": service.get('port'),
+                        "service": service_name,
+                        "service_version": version,
+                        "name": hit.get("title") or hit.get("cve_id") or "Unnamed CVE",
+                        "description": hit.get("description", ""),
+                        "risk_level": _cvss_to_risk(hit.get("cvss_score")),
+                        "cve_ids": hit.get("cve_ids") or ([hit["cve_id"]] if hit.get("cve_id") else []),
+                        "cvss_score": hit.get("cvss_score"),
+                        "reference_urls": [hit["url"]] if hit.get("url") else [],
+                        "source_tool": "vulners"
+                    })
 
-            for hit in hits:
-                self.add_vulnerability(session_id, {
-                    "host": service.get('host', session.target_ip),
-                    "port": service.get('port'),
-                    "service": service_name,
-                    "service_version": version,
-                    "name": hit.get("title") or hit.get("cve_id") or "Unnamed CVE",
-                    "description": hit.get("description", ""),
-                    "risk_level": _cvss_to_risk(hit.get("cvss_score")),
-                    "cve_ids": hit.get("cve_ids") or ([hit["cve_id"]] if hit.get("cve_id") else []),
-                    "cvss_score": hit.get("cvss_score"),
-                    "reference_urls": [hit["url"]] if hit.get("url") else [],
-                    "source_tool": "vulners"
-                })
+        # --- Cross-reference the shared threat-intel cache (core/threat_intel.py) ---
+        # This is what makes the local database "get better over time": findings
+        # gathered from open-web research on a past occasion (for this service or
+        # a similar one) surface here too. Marked unverified/lower-confidence since
+        # it came from unstructured web scraping, not a structured feed - an
+        # operator should treat these as leads, not confirmed findings.
+        try:
+            for service in session.discovered_services:
+                service_name = (service.get('service') or '').strip().lower()
+                if not service_name or service_name == 'unknown':
+                    continue
+                for cached in self.threat_intel_cache:
+                    haystack = " ".join([
+                        cached.get("affected_software", ""), cached.get("title", ""),
+                        cached.get("description", ""), cached.get("topic", "")
+                    ]).lower()
+                    if service_name in haystack:
+                        self.add_vulnerability(session_id, {
+                            "host": service.get('host', session.target_ip),
+                            "port": service.get('port'),
+                            "service": service.get('service'),
+                            "service_version": service.get('version'),
+                            "name": cached.get("title") or "Unnamed finding (web research)",
+                            "description": cached.get("description", ""),
+                            "risk_level": "unknown",
+                            "cve_ids": cached.get("cve_ids", []),
+                            "reference_urls": [cached["source_url"]] if cached.get("source_url") else [],
+                            "source_tool": "threat-intel-cache",
+                            "status": "unverified"
+                        })
+        except Exception as e:
+            logger.warning(f"Threat-intel cross-reference failed for session {session_id} (non-fatal): {e}")
 
     async def _analyze_with_ai(self, session_id: str):
         """Analyze scan results with AI."""
@@ -1114,6 +1174,114 @@ CRITICAL RULE: If a Target Domain is provided ({session.target_domain}), you MUS
         """Get all recorded vulnerability findings for a session (in-memory, fast path)."""
         session = self.sessions.get(session_id)
         return list(session.vulnerabilities) if session else []
+
+    # --- Threat intel (shared, non-session-scoped reference cache) -------------------
+
+    def _load_threat_intel_cache(self):
+        """Load the threat_intel table into memory on startup."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT topic, cve_ids, title, description, affected_software, severity,
+                       source_url, source_tool, verified, discovered_at
+                FROM threat_intel
+                ORDER BY discovered_at DESC
+            ''')
+            for row in cursor.fetchall():
+                (topic, cve_ids_json, title, description, affected_software, severity,
+                 source_url, source_tool, verified, discovered_at) = row
+                try:
+                    cve_ids = json.loads(cve_ids_json) if cve_ids_json else []
+                except json.JSONDecodeError:
+                    cve_ids = []
+                self.threat_intel_cache.append({
+                    "topic": topic, "cve_ids": cve_ids, "title": title, "description": description,
+                    "affected_software": affected_software, "severity": severity,
+                    "source_url": source_url, "source_tool": source_tool,
+                    "verified": bool(verified), "discovered_at": discovered_at
+                })
+            conn.close()
+            logger.info(f"Loaded {len(self.threat_intel_cache)} threat-intel findings from database")
+        except sqlite3.Error as e:
+            logger.error(f"Failed to load threat-intel cache: {e}")
+
+    def add_threat_intel_finding(self, finding: Dict) -> Optional[Dict]:
+        """Record a threat-intel finding from core/threat_intel.py. De-duplicates
+        on (source_url, title). Always stored as verified=False - see
+        core/threat_intel.py module docstring for why."""
+        title = (finding.get("title") or "").strip()
+        source_url = (finding.get("source_url") or "").strip()
+        if not title or not source_url:
+            return None
+
+        for existing in self.threat_intel_cache:
+            if existing.get("source_url") == source_url and existing.get("title") == title:
+                return None  # already cached
+
+        record = {
+            "topic": finding.get("topic", ""),
+            "cve_ids": finding.get("cve_ids") or [],
+            "title": title,
+            "description": finding.get("description", ""),
+            "affected_software": finding.get("affected_software", ""),
+            "severity": finding.get("severity", ""),
+            "source_url": source_url,
+            "source_tool": finding.get("source_tool", "web-research"),
+            "verified": False,
+            "discovered_at": datetime.now().isoformat()
+        }
+        self.threat_intel_cache.append(record)
+        self._save_threat_intel_db(record)
+        return record
+
+    def _save_threat_intel_db(self, record: Dict):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO threat_intel (
+                    topic, cve_ids, title, description, affected_software, severity,
+                    source_url, source_tool, verified, discovered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                record.get("topic"), json.dumps(record.get("cve_ids") or []), record.get("title"),
+                record.get("description"), record.get("affected_software"), record.get("severity"),
+                record.get("source_url"), record.get("source_tool"), record.get("verified", False),
+                record.get("discovered_at")
+            ))
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.error(f"Failed to save threat-intel finding to database: {e}")
+
+    def get_threat_intel(self, topic: Optional[str] = None) -> List[Dict]:
+        """Get cached threat-intel findings, optionally filtered by topic (substring match)."""
+        if not topic:
+            return list(self.threat_intel_cache)
+        topic_lower = topic.lower()
+        return [f for f in self.threat_intel_cache if topic_lower in (f.get("topic") or "").lower()]
+
+    async def run_threat_intel_research(self, topic: str) -> List[Dict]:
+        """Kick off AI-directed open-web research for a topic (core/threat_intel.py)
+        and store whatever it finds into the shared cache. Safe to call repeatedly -
+        results are de-duplicated. Never raises; returns [] on total failure."""
+        logger.info(f"Starting threat-intel research for topic: {topic}")
+        try:
+            findings = await threat_intel.research_topic(topic, self.ai_connector)
+        except Exception as e:
+            logger.error(f"Threat-intel research crashed for topic '{topic}' (non-fatal): {e}")
+            return []
+
+        stored = []
+        for finding in findings:
+            record = self.add_threat_intel_finding(finding)
+            if record:
+                stored.append(record)
+
+        logger.info(f"Threat-intel research for '{topic}' stored {len(stored)} new findings "
+                     f"({len(findings) - len(stored)} were duplicates/skipped)")
+        return stored
 
     def _restore_sessions(self):
         """Restore incomplete sessions from database on startup."""
