@@ -268,6 +268,29 @@ async def get_pending_commands(session_id: str):
     }
 
 
+@app.get("/api/sessions/history")
+async def list_session_history():
+    """List ALL sessions from the database including completed and failed ones.
+    Unlike GET /api/sessions (active-only, in-memory), this queries the DB
+    directly so historical sessions survive backend restarts. Returns lightweight
+    summary rows - no scan blobs or command output."""
+    history = orchestrator.get_session_history()
+    return {"sessions": history, "count": len(history)}
+
+
+@app.post("/api/sessions/{session_id}/complete")
+async def complete_session(session_id: str):
+    """Mark a session as completed. Useful when the operator is done and wants
+    the session archived (it will appear in /api/sessions/history but not be
+    loaded into active memory on the next restart)."""
+    if session_id not in orchestrator.sessions:
+        raise HTTPException(status_code=404, detail="Session not found (must be active to complete)")
+    result = orchestrator.complete_session(session_id)
+    if result["status"] == "error":
+        raise HTTPException(status_code=500, detail=result["message"])
+    return result
+
+
 @app.get("/api/sessions/{session_id}/vulnerabilities")
 async def get_vulnerabilities(session_id: str):
     """Get all recorded vulnerability findings for a session (structured, from

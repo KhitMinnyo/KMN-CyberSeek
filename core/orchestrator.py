@@ -348,6 +348,13 @@ class Orchestrator:
             session.status = "analyzing"
             session.current_stage = "vulnerability_analysis"
 
+            # Auto-trigger threat-intel background research for any service names
+            # not yet in the cache. This is the "database gets better over time
+            # automatically" feature: each new scan enriches the shared cache so
+            # future sessions can cross-reference it without a manual research step.
+            # Runs as fire-and-forget background tasks so it never delays the scan.
+            self._schedule_auto_threat_intel(session_id)
+
             # Run vulnerability scanning + CVE enrichment BEFORE AI analysis so its
             # first pass is grounded in real findings instead of guessing from
             # service/version strings alone.
@@ -362,6 +369,54 @@ class Orchestrator:
             logger.error(f"Reconnaissance failed for session {session_id}: {e}")
             session.status = "failed"
             session.current_stage = "error"
+
+    def _schedule_auto_threat_intel(self, session_id: str):
+        """Fire background threat-intel research tasks for each unique service
+        name discovered in this session that isn't already covered by the local
+        cache. Capped at 3 service topics per scan to limit network load and
+        API usage. Each task runs independently - failures are non-fatal."""
+        _MAX_AUTO_TOPICS = 3
+
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        # Build set of service names already well-covered by the cache.
+        cached_topics = set()
+        for entry in self.threat_intel_cache:
+            topic = (entry.get("topic") or "").strip().lower()
+            affected = (entry.get("affected_software") or "").strip().lower()
+            if topic:
+                cached_topics.add(topic)
+            if affected:
+                cached_topics.add(affected)
+
+        # Collect unique, non-trivial service names from this session.
+        seen = set()
+        topics_to_research = []
+        for svc in session.discovered_services:
+            name = (svc.get("service") or "").strip().lower()
+            if not name or name in ("unknown", "tcpwrapped", "open", ""):
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            # Skip if any cached entry already mentions this service name.
+            if any(name in ct for ct in cached_topics):
+                logger.info(
+                    f"Auto threat-intel: skipping '{name}' (already in cache)"
+                )
+                continue
+            topics_to_research.append(name)
+            if len(topics_to_research) >= _MAX_AUTO_TOPICS:
+                break
+
+        for topic in topics_to_research:
+            logger.info(
+                f"Auto threat-intel: scheduling background research for "
+                f"service '{topic}' discovered in session {session_id}"
+            )
+            asyncio.create_task(self.run_threat_intel_research(topic))
 
     async def _run_vulnerability_analysis(self, session_id: str):
         """Run NSE vuln-script scanning + best-effort CVE enrichment (Vulners) for
@@ -1175,6 +1230,72 @@ CRITICAL RULE: If a Target Domain is provided ({session.target_domain}), you MUS
         session = self.sessions.get(session_id)
         return list(session.vulnerabilities) if session else []
 
+    def complete_session(self, session_id: str) -> Dict:
+        """Mark a session as completed - persists to DB and updates in-memory state."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return {"status": "error", "message": f"Session {session_id} not found"}
+        session.status = "completed"
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE sessions SET status = 'completed' WHERE session_id = ?",
+                (session_id,)
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.error(f"Failed to mark session {session_id} completed in DB: {e}")
+        logger.info(f"Session {session_id} marked as completed")
+        return {"status": "success", "session_id": session_id}
+
+    def get_session_history(self) -> List[Dict]:
+        """Return summary rows for ALL sessions in the DB (including completed/failed).
+        Unlike get_sessions() which reads from the in-memory dict (only active sessions),
+        this queries the DB so historical sessions survive app restarts.
+        Returns lightweight rows - no scan data / command output blobs."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT s.session_id, s.target_ip, s.target_domain, s.created_at,
+                       s.status, s.current_stage, s.auto_approve, s.authorization_confirmed,
+                       COUNT(DISTINCT sr.id) AS scan_count,
+                       COUNT(DISTINCT c.id)  AS command_count,
+                       COUNT(DISTINCT v.id)  AS vuln_count
+                FROM sessions s
+                LEFT JOIN scan_results sr ON sr.session_id = s.session_id
+                LEFT JOIN commands c       ON c.session_id  = s.session_id
+                LEFT JOIN vulnerabilities v ON v.session_id = s.session_id
+                GROUP BY s.session_id
+                ORDER BY s.created_at DESC
+            ''')
+            rows = cursor.fetchall()
+            conn.close()
+            results = []
+            for row in rows:
+                (sid, target_ip, target_domain, created_at, status, current_stage,
+                 auto_approve, authorization_confirmed, scan_count, command_count, vuln_count) = row
+                results.append({
+                    "session_id": sid,
+                    "target_ip": target_ip,
+                    "target_domain": target_domain,
+                    "created_at": created_at,
+                    "status": status,
+                    "current_stage": current_stage,
+                    "auto_approve": bool(auto_approve),
+                    "authorization_confirmed": bool(authorization_confirmed),
+                    "scan_count": scan_count,
+                    "command_count": command_count,
+                    "vuln_count": vuln_count,
+                    "active_in_memory": sid in self.sessions
+                })
+            return results
+        except sqlite3.Error as e:
+            logger.error(f"Failed to load session history from DB: {e}")
+            return []
+
     # --- Threat intel (shared, non-session-scoped reference cache) -------------------
 
     def _load_threat_intel_cache(self):
@@ -1614,6 +1735,7 @@ CRITICAL RULE: If a Target Domain is provided ({session.target_domain}), you MUS
             cursor.execute('DELETE FROM scan_results WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM commands WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM evidence WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM vulnerabilities WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
             
             conn.commit()
@@ -1656,6 +1778,7 @@ CRITICAL RULE: If a Target Domain is provided ({session.target_domain}), you MUS
             cursor.execute('DELETE FROM scan_results')
             cursor.execute('DELETE FROM commands')
             cursor.execute('DELETE FROM evidence')
+            cursor.execute('DELETE FROM vulnerabilities')
             cursor.execute('DELETE FROM sessions')
             
             conn.commit()
