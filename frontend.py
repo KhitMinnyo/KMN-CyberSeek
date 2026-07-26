@@ -893,15 +893,23 @@ def show_session_overview(session_details: Dict):
             time.sleep(1)
             st.rerun()
 
-    # Report download
-    report_url = f"{API_BASE}/sessions/{session_id}/report"
-    st.markdown(
-        f'<a href="{report_url}" target="_blank" download>'
-        f'<button style="background:#1565C0;color:white;border:none;padding:0.5rem 1.2rem;'
-        f'border-radius:4px;cursor:pointer;width:100%;margin-bottom:0.5rem">📄 Download DOCX Report</button>'
-        f'</a>',
-        unsafe_allow_html=True
-    )
+    # Report download — use api_session so X-API-Key header is included
+    if st.button("📄 Download DOCX Report", use_container_width=True):
+        with st.spinner("Generating report…"):
+            try:
+                resp = api_session.get(f"{API_BASE}/sessions/{session_id}/report", timeout=60)
+                if resp.status_code == 200:
+                    st.download_button(
+                        label="💾 Save DOCX",
+                        data=resp.content,
+                        file_name=f"kmn_report_{session_id[:12]}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True,
+                    )
+                else:
+                    st.error(f"Report generation failed ({resp.status_code}): {resp.text[:200]}")
+            except Exception as e:
+                st.error(f"Could not reach backend: {e}")
 
     # Add delete button next to Stop Session
     if st.button("🗑️ Delete This Session", type="primary", use_container_width=True):
@@ -922,12 +930,16 @@ def show_session_overview(session_details: Dict):
     
     # Define the typical flow of stages - must match AI's attack_phase outputs exactly
     stages = [
-        {"event": "Session created", "stage_key": "created"},
-        {"event": "Reconnaissance", "stage_key": "reconnaissance"},
-        {"event": "Vulnerability Analysis", "stage_key": "vulnerability_analysis"},
-        {"event": "Exploitation", "stage_key": "exploitation"},
-        {"event": "Post-Exploitation", "stage_key": "post_exploitation"},
-        {"event": "Lateral Movement", "stage_key": "lateral_movement"}
+        {"event": "Session created",       "stage_key": "created"},
+        {"event": "OSINT",                 "stage_key": "osint"},
+        {"event": "Reconnaissance",        "stage_key": "reconnaissance"},
+        {"event": "Enumeration",           "stage_key": "enumeration"},
+        {"event": "Vulnerability Analysis","stage_key": "vulnerability_analysis"},
+        {"event": "Exploitation",          "stage_key": "exploitation"},
+        {"event": "Post-Exploitation",     "stage_key": "post_exploitation"},
+        {"event": "Privilege Escalation",  "stage_key": "privilege_escalation"},
+        {"event": "Lateral Movement",      "stage_key": "lateral_movement"},
+        {"event": "Credential Reuse",      "stage_key": "credential_reuse"},
     ]
     
     # Determine status for each stage based on current_stage
@@ -1343,20 +1355,140 @@ def show_evidence(session_details: Dict):
     
     st.markdown("---")
     st.markdown("### 📤 Evidence Export")
-    
+
+    sid = session_details.get("session_id", "")
     col1, col2, col3 = st.columns(3)
-    
+
+    # ── JSON export ────────────────────────────────────────────────────────
     with col1:
         if st.button("📄 Export as JSON", use_container_width=True):
-            st.info("JSON export feature coming soon...")
-    
+            import json as _json
+            payload = {
+                "session_id": sid,
+                "target_ip": session_details.get("target_ip"),
+                "created_at": session_details.get("created_at"),
+                "status": session_details.get("status"),
+                "vulnerabilities": session_details.get("vulnerabilities", []),
+                "commands_executed": session_details.get("commands_executed", []),
+                "ai_decisions": session_details.get("ai_decisions", []),
+                "discovered_services": session_details.get("discovered_services", []),
+                "credentials": session_details.get("credentials", []),
+            }
+            st.download_button(
+                label="💾 Save JSON",
+                data=_json.dumps(payload, indent=2, default=str),
+                file_name=f"kmn_report_{sid[:12]}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+    # ── PDF export ─────────────────────────────────────────────────────────
     with col2:
         if st.button("📊 Export as PDF", use_container_width=True):
-            st.info("PDF report generation coming soon...")
-    
+            with st.spinner("Generating PDF…"):
+                try:
+                    resp = api_session.get(f"{API_BASE}/sessions/{sid}/report/pdf", timeout=60)
+                    if resp.status_code == 200:
+                        st.download_button(
+                            label="💾 Save PDF",
+                            data=resp.content,
+                            file_name=f"kmn_report_{sid[:12]}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                        )
+                    elif resp.status_code == 501:
+                        st.warning("fpdf2 not installed on backend. Run: pip install fpdf2")
+                    else:
+                        st.error(f"PDF generation failed ({resp.status_code}): {resp.text[:200]}")
+                except Exception as e:
+                    st.error(f"Could not reach backend: {e}")
+
+    # ── HTML report export ─────────────────────────────────────────────────
     with col3:
-        if st.button("🔗 Share Report", use_container_width=True):
-            st.info("Report sharing coming soon...")
+        if st.button("🌐 Export as HTML", use_container_width=True):
+            vulns = session_details.get("vulnerabilities", [])
+            services = session_details.get("discovered_services", [])
+            creds = session_details.get("credentials", [])
+            cmds = session_details.get("commands_executed", [])
+
+            _rc = {"high": "#d32f2f", "medium": "#f57f17", "low": "#2e7d32"}
+            _risk_order = {"high": 0, "medium": 1, "low": 2}
+
+            def _vuln_row(v):
+                rl = v.get("risk_level", "")
+                color = _rc.get(rl, "#555")
+                return (
+                    f"<tr><td style='color:{color}'><b>{rl.upper()}</b></td>"
+                    f"<td>{v.get('name','')}</td><td>{v.get('host','')}</td>"
+                    f"<td>{v.get('port','')}</td><td>{v.get('service','')}</td></tr>"
+                )
+
+            def _cred_row(c):
+                secret = "*" * 8 if c.get("secret_type") == "password" else c.get("secret", "")[:30]
+                return (
+                    f"<tr><td>{c.get('username','')}</td><td><code>{secret}</code></td>"
+                    f"<td>{c.get('secret_type','')}</td><td>{c.get('service','')}</td></tr>"
+                )
+
+            def _cmd_row(c):
+                ok = "✓" if c.get("success") else "✗"
+                return (
+                    f"<tr><td>{ok}</td>"
+                    f"<td><code>{c.get('command','')[:120]}</code></td>"
+                    f"<td>{c.get('timestamp','')}</td></tr>"
+                )
+
+            vuln_rows = "".join(
+                _vuln_row(v)
+                for v in sorted(vulns, key=lambda x: _risk_order.get(x.get("risk_level", ""), 3))
+            )
+            svc_rows = "".join(
+                f"<tr><td>{s.get('host','')}</td><td>{s.get('port','')}</td>"
+                f"<td>{s.get('service','')}</td><td>{s.get('version','')}</td></tr>"
+                for s in services[:50]
+            )
+            cred_rows = "".join(_cred_row(c) for c in creds)
+            cmd_rows  = "".join(_cmd_row(c)  for c in cmds[-30:])
+
+            html = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>KMN-CyberSeek Report — {session_details.get('target_ip','')}</title>
+<style>
+  body{{font-family:sans-serif;margin:2rem;color:#222;}}
+  h1{{background:#1a237e;color:#fff;padding:1rem;border-radius:4px;}}
+  h2{{background:#37474f;color:#fff;padding:.5rem .8rem;border-radius:3px;margin-top:2rem;}}
+  table{{border-collapse:collapse;width:100%;margin-bottom:1rem;}}
+  th{{background:#eceff1;text-align:left;padding:.4rem .6rem;border:1px solid #ccc;}}
+  td{{padding:.35rem .6rem;border:1px solid #ddd;font-size:.9em;}}
+  .meta td:first-child{{font-weight:bold;width:160px;}}
+  footer{{margin-top:3rem;font-size:.8em;color:#888;border-top:1px solid #ddd;padding-top:.5rem;}}
+</style></head>
+<body>
+<h1>KMN-CyberSeek &mdash; Penetration Test Report</h1>
+<table class="meta">
+  <tr><td>Session ID</td><td>{sid[:12]}</td></tr>
+  <tr><td>Target</td><td>{session_details.get('target_ip','—')}</td></tr>
+  <tr><td>Status</td><td>{session_details.get('status','—')}</td></tr>
+  <tr><td>Started</td><td>{session_details.get('created_at','—')}</td></tr>
+  <tr><td>Vulns (H/M/L)</td><td>{sum(1 for v in vulns if v.get("risk_level")=="high")} / {sum(1 for v in vulns if v.get("risk_level")=="medium")} / {sum(1 for v in vulns if v.get("risk_level")=="low")}</td></tr>
+</table>
+<h2>Vulnerabilities ({len(vulns)})</h2>
+<table><tr><th>Risk</th><th>Name</th><th>Host</th><th>Port</th><th>Service</th></tr>{vuln_rows or "<tr><td colspan='5'>None found</td></tr>"}</table>
+<h2>Discovered Services ({len(services)})</h2>
+<table><tr><th>Host</th><th>Port</th><th>Service</th><th>Version</th></tr>{svc_rows or "<tr><td colspan='4'>None</td></tr>"}</table>
+<h2>Credentials ({len(creds)})</h2>
+<table><tr><th>Username</th><th>Secret</th><th>Type</th><th>Service</th></tr>{cred_rows or "<tr><td colspan='4'>None captured</td></tr>"}</table>
+<h2>Commands Log (last 30)</h2>
+<table><tr><th>OK</th><th>Command</th><th>Timestamp</th></tr>{cmd_rows or "<tr><td colspan='3'>None</td></tr>"}</table>
+<footer>Generated by KMN-CyberSeek &mdash; FOR AUTHORISED USE ONLY</footer>
+</body></html>"""
+            st.download_button(
+                label="💾 Save HTML",
+                data=html,
+                file_name=f"kmn_report_{sid[:12]}.html",
+                mime="text/html",
+                use_container_width=True,
+            )
 
 
 def show_command_console():
@@ -1943,7 +2075,14 @@ def show_settings():
             compact_view = st.checkbox("Compact view mode", value=False)
         
         if st.button("💾 Save General Settings", type="primary"):
-            st.success("General settings saved!")
+            # General settings are frontend-only (display preferences).
+            # Persist to session_state so they survive reruns within this browser session.
+            st.session_state["pref_auto_refresh"] = auto_refresh
+            st.session_state["pref_refresh_interval"] = int(refresh_interval)
+            st.session_state["pref_results_per_page"] = int(results_per_page)
+            st.session_state["pref_show_timestamps"] = show_timestamps
+            st.session_state["pref_compact_view"] = compact_view
+            st.success("Display preferences saved for this session.")
     
     with tab2:
         st.markdown("### 🤖 AI Configuration")
@@ -1971,20 +2110,118 @@ def show_settings():
         )
 
         if ai_provider == "Local (Ollama)":
+            api_key = ""  # not used for local provider
             ollama_url = st.text_input("Ollama URL", value=current_ollama_url)
-            model_name = st.text_input(
-                "Model Name",
-                value=current_ollama_model,
-                help=(
-                    "Any model you've pulled with `ollama pull <name>`. Examples: "
-                    "deepseek-r1:8b, deepseek-coder-v2, or a security-tuned model like "
-                    "DeepHat/DeepHat-V1-7B (ollama pull DeepHat/DeepHat-V1-7B)."
+
+            # ── Live model picker ─────────────────────────────────────────────
+            st.markdown("#### 🔍 Available Models")
+
+            col_btn, col_status = st.columns([1, 3])
+            with col_btn:
+                fetch_models = st.button("📋 Load Models", use_container_width=True)
+            with col_status:
+                st.caption("Queries the Ollama server for installed models")
+
+            if fetch_models or st.session_state.get("_ollama_models"):
+                if fetch_models:
+                    try:
+                        resp = api_session.get(f"{API_BASE}/ollama/models", timeout=10)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            models_raw = data.get("models", [])
+                            if models_raw:
+                                st.session_state["_ollama_models"] = models_raw
+                                st.session_state["_ollama_models_error"] = None
+                            else:
+                                err = data.get("error", "No models found — is Ollama running?")
+                                st.session_state["_ollama_models_error"] = err
+                        else:
+                            st.session_state["_ollama_models_error"] = f"Backend error {resp.status_code}"
+                    except Exception as e:
+                        st.session_state["_ollama_models_error"] = str(e)
+
+                err_msg = st.session_state.get("_ollama_models_error")
+                if err_msg:
+                    st.warning(f"Could not reach Ollama: {err_msg}")
+
+                models_list = st.session_state.get("_ollama_models", [])
+                if models_list:
+                    # Build display labels: "deepseek-r1:8b (4.7 GB)"
+                    def _model_label(m):
+                        name = m.get("name", "")
+                        gb = m.get("size_gb")
+                        return f"{name} ({gb} GB)" if gb else name
+
+                    model_labels = [_model_label(m) for m in models_list]
+                    model_names  = [m.get("name", "") for m in models_list]
+
+                    # Pre-select the currently configured model if it's in the list
+                    default_idx = 0
+                    if current_ollama_model in model_names:
+                        default_idx = model_names.index(current_ollama_model)
+
+                    selected_label = st.selectbox(
+                        "Select model",
+                        model_labels,
+                        index=default_idx,
+                        key="_ollama_model_select",
+                    )
+                    model_name = model_names[model_labels.index(selected_label)]
+
+                    # Auto-detect context window when model changes
+                    if (fetch_models
+                            or st.session_state.get("_ctx_for_model") != model_name):
+                        try:
+                            info_resp = api_session.get(
+                                f"{API_BASE}/ollama/model-info",
+                                params={"model": model_name},
+                                timeout=12,
+                            )
+                            if info_resp.status_code == 200:
+                                info_data = info_resp.json()
+                                st.session_state["_ctx_for_model"]  = model_name
+                                st.session_state["_detected_ctx"]   = info_data.get("context_window", 8192)
+                                st.session_state["_ctx_source"]     = info_data.get("source", "?")
+                                st.session_state["_ctx_arch"]       = info_data.get("architecture") or ""
+                        except Exception:
+                            pass
+
+                    detected_ctx  = st.session_state.get("_detected_ctx", 8192)
+                    ctx_source    = st.session_state.get("_ctx_source", "default")
+                    ctx_arch      = st.session_state.get("_ctx_arch", "")
+
+                    col_ctx, col_src = st.columns([1, 2])
+                    with col_ctx:
+                        st.metric("Context window", f"{detected_ctx:,} tokens")
+                    with col_src:
+                        st.caption(
+                            f"Source: **{ctx_source}**"
+                            + (f"  ·  arch: `{ctx_arch}`" if ctx_arch else "")
+                        )
+
+                    # Allow manual override
+                    override = st.checkbox("Override context window", value=False)
+                    if override:
+                        detected_ctx = st.number_input(
+                            "Custom context window (tokens)",
+                            min_value=512, max_value=2_000_000,
+                            value=detected_ctx, step=512,
+                        )
+                    ollama_context_window = detected_ctx
+
+                else:
+                    # No models yet — fall back to manual entry
+                    model_name = st.text_input("Model Name (manual)", value=current_ollama_model)
+                    ollama_context_window = int(os.getenv("OLLAMA_CONTEXT_WINDOW", "8192"))
+            else:
+                # Before "Load Models" is clicked — show manual fallback
+                st.caption("Click **Load Models** to pick from installed models, or type manually below.")
+                model_name = st.text_input(
+                    "Model Name",
+                    value=current_ollama_model,
+                    help="Any model installed via `ollama pull <name>`",
                 )
-            )
-            st.caption(
-                "Security-focused local models worth trying: **DeepHat/DeepHat-V1-7B** "
-                "(offensive/defensive security fine-tune) or plain **deepseek-r1:8b**."
-            )
+                ollama_context_window = int(os.getenv("OLLAMA_CONTEXT_WINDOW", "8192"))
 
             col1, col2 = st.columns(2)
             with col1:
@@ -2000,7 +2237,8 @@ def show_settings():
                 value=current_ds_model,
                 help="e.g. deepseek-chat or deepseek-coder"
             )
-            ollama_url = ""  # not applicable for this provider
+            ollama_url = ""              # not applicable for this provider
+            ollama_context_window = None # not applicable
 
             st.info("DeepSeek API provides high-performance AI with specialized security knowledge.")
 
@@ -2033,15 +2271,20 @@ def show_settings():
                     "provider": ai_provider,
                     "api_key": api_key if ai_provider == "DeepSeek API" else "",
                     "model_name": model_name,
-                    "ollama_url": ollama_url
+                    "ollama_url": ollama_url if ai_provider == "Local (Ollama)" else "",
+                    "ollama_context_window": ollama_context_window if ai_provider == "Local (Ollama)" else None,
                 }
                 try:
                     response = api_session.post(f"{API_BASE}/settings/ai", json=payload)
                     if response.status_code == 200:
                         info = response.json()
+                        ctx_info = (
+                            f", context: **{info['context_window']:,} tokens**"
+                            if info.get("context_window") else ""
+                        )
                         st.success(
                             f"AI settings saved! Now using **{info.get('provider', payload['provider'])}** "
-                            f"with model **{info.get('model', model_name)}**."
+                            f"with model **{info.get('model', model_name)}**{ctx_info}."
                         )
                         time.sleep(1)
                         st.rerun()
@@ -2119,7 +2362,23 @@ def show_settings():
                 client_secret = st.text_input("Client Secret", type="password")
         
         if st.button("💾 Save Security Settings", type="primary"):
-            st.success("Security settings saved!")
+            payload = {
+                "require_approval_high_risk": require_approval,
+                "approval_timeout_minutes": int(approval_timeout),
+                "audit_logging": audit_logging,
+                "session_timeout_hours": int(session_timeout),
+                "max_parallel_commands": int(max_parallel_commands),
+                "auto_cleanup": auto_cleanup,
+                "cleanup_after_days": int(cleanup_days),
+            }
+            try:
+                resp = api_session.post(f"{API_BASE}/settings/security", json=payload, timeout=10)
+                if resp.status_code == 200:
+                    st.success(resp.json().get("message", "Security settings saved."))
+                else:
+                    st.error(f"Failed to save ({resp.status_code}): {resp.text[:200]}")
+            except Exception as e:
+                st.error(f"Connection error: {e}")
     
     with tab4:
         st.markdown("### ⚙️ Advanced Settings")
@@ -2148,9 +2407,73 @@ def show_settings():
         st.markdown("#### Development")
         debug_mode = st.checkbox("Debug mode", value=False)
         enable_metrics = st.checkbox("Enable performance metrics", value=True)
-        
+
+        st.markdown("#### 🧠 Local LLM Context Window")
+        st.info(
+            "Set this to your Ollama model's `num_ctx` value. "
+            "The system auto-selects a compact system prompt for smaller windows "
+            "and scales command-output truncation so the AI never runs out of context.",
+            icon="ℹ️",
+        )
+        ctx_options = {
+            "4 096  — small/fast (llama3.2:3b, deepseek-r1:7b)": 4096,
+            "8 192  — default (deepseek-r1:8b, llama3.1:8b) ★": 8192,
+            "16 384 — mid (mistral, codellama:13b)": 16384,
+            "32 768 — large (qwen2.5:14b, deepseek-r1:14b)": 32768,
+            "65 536 — xlarge (qwen2.5:32b, deepseek-r1:32b)": 65536,
+            "131 072 — huge (qwen2.5:72b, deepseek-r1:70b)": 131072,
+        }
+        ctx_default_label = "8 192  — default (deepseek-r1:8b, llama3.1:8b) ★"
+        selected_ctx_label = st.selectbox(
+            "Model context window (tokens)",
+            list(ctx_options.keys()),
+            index=list(ctx_options.keys()).index(ctx_default_label),
+        )
+        ollama_context_window = ctx_options[selected_ctx_label]
+        st.caption(
+            f"Selected: **{ollama_context_window:,} tokens**. "
+            "For DeepSeek API provider this setting is ignored (API has large context)."
+        )
+
+        st.markdown("#### 🤖 Autonomous Execution")
+        st.warning(
+            "**FULL_AUTO_MODE** — The AI will execute *every* suggested command without "
+            "human approval, regardless of risk level. Use only on isolated lab networks "
+            "where you have explicit written authorization to test.",
+            icon="⚠️",
+        )
+        full_auto_mode = st.checkbox(
+            "Enable Full Auto Mode",
+            value=False,
+            help="Bypasses keyword backstop, binary allowlist, and depth limit. "
+                 "authorization_confirmed still required per session.",
+        )
+
         if st.button("💾 Save Advanced Settings", type="primary"):
-            st.success("Advanced settings saved!")
+            payload = {
+                "log_level": log_level,
+                "log_file": log_file,
+                "debug": debug_mode,
+                "db_path": db_path,
+                "full_auto_mode": full_auto_mode,
+                "ollama_context_window": ollama_context_window,
+            }
+            try:
+                resp = api_session.post(f"{API_BASE}/settings/advanced", json=payload, timeout=10)
+                if resp.status_code == 200:
+                    info = resp.json()
+                    mode_label = "ON ⚠️" if info.get("full_auto_mode") else "off"
+                    ctx_val = info.get("ollama_context_window", ollama_context_window)
+                    st.success(
+                        f"{info.get('message', 'Advanced settings saved.')} "
+                        f"(log: {info.get('log_level', log_level)}, "
+                        f"full_auto: {mode_label}, "
+                        f"ctx: {ctx_val:,} tokens)"
+                    )
+                else:
+                    st.error(f"Failed to save ({resp.status_code}): {resp.text[:200]}")
+            except Exception as e:
+                st.error(f"Connection error: {e}")
         
         st.markdown("---")
         

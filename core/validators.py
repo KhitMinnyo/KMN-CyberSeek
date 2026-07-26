@@ -119,24 +119,150 @@ def is_target_in_scope(target: Optional[str], allowlist_str: Optional[str]) -> b
 
 # --- Binary allowlist for the autonomous auto-execute path ----------------------
 
-# Known pentest tools referenced throughout ai/prompts.py's methodology, plus a
-# small set of harmless shell utilities. Anything not here gets bounced to manual
-# approval when the AGENT (not a human) is the one about to execute it.
+# Comprehensive Kali Linux toolset allowlist for the autonomous auto-execute path.
+# Covers recon, web-app, brute-force, exploitation, AD/SMB, post-exploitation,
+# wireless, forensics, scripting, and standard shell utilities.
+# When FULL_AUTO_MODE=true this list is bypassed entirely — see is_allowlisted_command().
 ALLOWED_BINARIES = {
-    "nmap", "masscan", "whatweb", "curl", "wget",
-    "wpscan", "nikto", "gobuster", "dirb", "dirsearch", "ffuf",
-    "sqlmap", "hydra", "ncrack", "medusa",
-    "msfconsole", "msfvenom",
-    "smbclient", "crackmapexec", "cme", "enum4linux", "enum4linux-ng",
-    "searchsploit", "joomscan", "droopescan",
-    "ssh", "ssh-keyscan", "scp",
-    "hashcat", "john",
-    "nc", "ncat", "netcat",
-    "python3", "python", "bash", "sh",
-    "echo", "cat", "ls", "mkdir", "cp", "grep", "awk", "sed", "head", "tail",
-    "apt-get", "apt",
-    "impacket-secretsdump", "impacket-psexec", "impacket-wmiexec", "impacket-smbexec",
-    "responder", "certutil", "openssl", "sslscan", "testssl",
+    # ── Reconnaissance & scanning ───────────────────────────────────────
+    "nmap", "masscan", "rustscan", "unicornscan",
+    "netdiscover", "arp-scan", "hping3", "fping", "p0f",
+    "tcpdump", "tshark", "wireshark", "netstat", "ss", "iptables", "ip",
+    "ping", "ping6", "traceroute", "traceroute6", "mtr",
+    "whois", "dig", "nslookup", "host",
+    "fierce", "dnsrecon", "dnsenum", "dnswalk", "dnsmap",
+    "sublist3r", "amass", "subfinder", "assetfinder", "dnsx", "httpx",
+    "aquatone", "eyewitness", "gowitness",
+
+    # ── Web application ─────────────────────────────────────────────────
+    "whatweb", "nikto", "gobuster", "dirb", "dirsearch", "ffuf",
+    "wfuzz", "feroxbuster",
+    "wpscan", "joomscan", "droopescan", "cmseek",
+    "sqlmap", "ghauri", "commix", "xsser", "dalfox", "arjun",
+    "nuclei", "jaeles",
+    "nosqlmap", "jwt_tool", "jwttool",
+    "burpsuite", "zaproxy", "mitmproxy",
+    "cutycapt", "wkhtmltoimage",
+
+    # ── Brute-force & credential attacks ───────────────────────────────
+    "hydra", "ncrack", "medusa", "crowbar", "patator",
+    "crackmapexec", "cme",
+    "cewl", "crunch", "cupp", "rsmangler", "mentalist",
+    "hashcat", "john", "hash-identifier", "hashid", "haiti",
+    "ophcrack", "samdump2", "chntpw",
+
+    # ── Exploitation & frameworks ───────────────────────────────────────
+    "msfconsole", "msfvenom", "msfdb", "msfrpc",
+    "searchsploit",
+    "nc", "ncat", "netcat", "socat",
+    "pwncat", "pwncat-cs",
+    "rlwrap",
+    "beef-xss",
+
+    # ── SMB / Windows / Active Directory ────────────────────────────────
+    "smbclient", "smbmap", "smbget",
+    "enum4linux", "enum4linux-ng",
+    "rpcclient", "net", "rpcinfo",
+    "ldapsearch", "ldapdomaindump", "ldapmodify", "ldapadd",
+    "kinit", "klist", "kdestroy", "kvno",
+    "bloodhound", "bloodhound-python", "neo4j",
+    "kerbrute",
+    "impacket-secretsdump", "impacket-psexec", "impacket-wmiexec",
+    "impacket-smbexec", "impacket-getuserspns", "impacket-getnpusers",
+    "impacket-ntlmrelayx", "impacket-smbserver", "impacket-lookupsid",
+    "impacket-reg", "impacket-dcomexec", "impacket-atexec",
+    "impacket-ticketer", "impacket-goldenPac", "impacket-rpcdump",
+    "evil-winrm",
+    "xfreerdp", "rdesktop", "freerdp",
+    "winexe",
+
+    # ── Post-exploitation & pivoting ────────────────────────────────────
+    "proxychains", "proxychains4",
+    "chisel", "ligolo-ng", "ligolo",
+    "pspy", "pspy32", "pspy64",
+    "linpeas", "winpeas", "linenum",
+    "unix-privesc-check", "linux-exploit-suggester",
+    "gtfobins",
+
+    # ── Wireless ────────────────────────────────────────────────────────
+    "aircrack-ng", "airmon-ng", "aireplay-ng", "airodump-ng",
+    "airdecap-ng", "packetforge-ng", "airbase-ng",
+    "kismet", "wifite", "bettercap",
+    "hostapd", "hostapd-wpe",
+    "hcxtools", "hcxdumptool",
+    "reaver", "bully", "pixiewps",
+    "wpa_supplicant", "iw", "iwconfig", "iwlist",
+
+    # ── Vulnerability analysis ──────────────────────────────────────────
+    "openvas", "openvas-start", "gvm-cli", "gvm-check-setup",
+    "lynis", "chkrootkit", "rkhunter",
+    "testssl", "sslscan", "sslyze",
+    "certutil", "openssl",
+
+    # ── Network utilities ───────────────────────────────────────────────
+    "curl", "wget",
+    "ssh", "ssh-keyscan", "ssh-keygen", "ssh-copy-id", "scp", "sftp",
+    "responder", "mitm6", "arpspoof", "ettercap",
+    "tcpflow", "ngrep", "dsniff", "sslstrip",
+    "nfqueue", "scapy",
+    "proxytunnel", "corkscrew",
+
+    # ── Forensics & reverse engineering ─────────────────────────────────
+    "binwalk", "strings", "file", "hexdump", "xxd",
+    "objdump", "readelf", "nm", "strace", "ltrace",
+    "radare2", "r2", "r2pm",
+    "gdb", "gdbserver",
+    "volatility", "volatility3",
+    "foremost", "scalpel", "bulk_extractor", "photorec",
+    "exiftool", "steghide", "stegcracker", "zsteg",
+    "pdfinfo", "pdfcrack",
+
+    # ── Scripting runtimes ──────────────────────────────────────────────
+    "python3", "python", "python2",
+    "bash", "sh", "zsh", "dash", "fish",
+    "perl", "ruby", "php",
+    "node", "nodejs", "npm",
+    "go", "java", "javac", "jar",
+    "gcc", "g++", "make", "cmake",
+    "powershell", "pwsh",
+
+    # ── Standard shell utilities ─────────────────────────────────────────
+    "echo", "printf", "cat", "tac",
+    "ls", "ll", "la", "dir",
+    "mkdir", "cp", "mv", "rm", "rmdir", "ln", "touch",
+    "grep", "egrep", "fgrep", "rg", "ag",
+    "awk", "gawk", "sed", "head", "tail", "less", "more",
+    "sort", "uniq", "wc", "tr", "cut", "paste", "join",
+    "find", "locate", "which", "whereis", "type",
+    "xargs", "parallel",
+    "chmod", "chown", "chgrp", "stat", "lsattr", "chattr", "getfacl", "setfacl",
+    "id", "whoami", "groups", "uname", "hostname", "uptime", "uname",
+    "ps", "pstree", "top", "htop", "kill", "pkill", "killall", "signal",
+    "jobs", "fg", "bg", "nohup", "disown",
+    "screen", "tmux",
+    "date", "cal", "bc", "expr",
+    "base64", "base32",
+    "zip", "unzip", "tar", "gzip", "gunzip", "bzip2", "xz", "lzma",
+    "7z", "7za", "rar", "unrar",
+    "tee", "timeout", "watch", "time",
+    "env", "printenv",
+    "diff", "patch", "cmp",
+    "wget", "curl",
+
+    # ── Package management ───────────────────────────────────────────────
+    "apt-get", "apt", "apt-cache", "dpkg",
+    "pip", "pip3", "pip2",
+    "gem", "bundle",
+
+    # ── OSINT ────────────────────────────────────────────────────────────
+    "theharvester", "recon-ng", "maltego",
+    "shodan",
+
+    # ── Version control / misc ───────────────────────────────────────────
+    "git", "svn",
+    "docker", "kubectl",
+    "jq", "yq", "xmllint",
+    "nc", "ncat",
 }
 
 # "curl/wget SOMETHING | bash/sh/python" is a classic download-and-execute chain.
@@ -155,12 +281,19 @@ def is_allowlisted_command(command: Optional[str]) -> Optional[str]:
     Returns None if the command is allowed to run, or a short human-readable
     rejection reason if it should instead be routed to manual approval.
 
+    When FULL_AUTO_MODE=true in the environment this check is bypassed entirely —
+    the operator has explicitly opted into unrestricted AI-driven execution.
+
     NOT applied to commands a human explicitly typed or clicked "approve" on —
     that's a legitimate trust boundary and operators should retain full
     flexibility to run any tool they choose to review themselves.
     """
     if not command or not command.strip():
         return "Empty command"
+
+    # FULL_AUTO_MODE bypasses the allowlist entirely.
+    if os.getenv("FULL_AUTO_MODE", "false").lower() == "true":
+        return None
 
     if "`" in command or "$(" in command:
         return "Command substitution (backticks or $()) is not allowed in auto-executed commands"

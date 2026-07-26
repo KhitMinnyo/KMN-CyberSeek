@@ -27,7 +27,7 @@ class AIResponse(BaseModel):
     risk_level: str = Field(..., description="low/medium/high risk classification")
     target_info: Optional[Dict[str, Any]] = Field(None, description="Additional target information")
     confidence: float = Field(0.0, description="Confidence score (0.0 to 1.0)")
-    attack_phase: str = Field(..., description="Current attack phase: reconnaissance, vulnerability_analysis, exploitation, post_exploitation, lateral_movement")
+    attack_phase: str = Field(..., description="Current attack phase: osint, reconnaissance, enumeration, vulnerability_analysis, exploitation, post_exploitation, privilege_escalation, lateral_movement, credential_reuse")
 
 
 class KMN_AI_Connector:
@@ -108,41 +108,117 @@ class KMN_AI_Connector:
         
         # Session history for context
         self.session_history: Dict[str, List[Dict]] = {}
-        
-        logger.info(f"Initialized AI connector with provider: {self.provider}")
-    
+
+        # ── Context-window budget ─────────────────────────────────────────────
+        # Read from env; user should set this to their Ollama model's num_ctx.
+        # Common values: 4096 (small models), 8192 (mid), 32768 (large).
+        # For the DeepSeek API provider this is effectively unlimited — we use
+        # a very large placeholder so all budget checks pass.
+        raw_ctx = os.getenv("OLLAMA_CONTEXT_WINDOW", "8192").strip()
+        try:
+            self.context_window: int = int(raw_ctx)
+        except ValueError:
+            self.context_window = 8192
+
+        logger.info(
+            f"Initialized AI connector — provider={self.provider}, "
+            f"context_window={self.context_window} tokens"
+        )
+
+    # ── Token budget helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimate: 1 token ≈ 4 characters (English + code mix).
+        Good enough for budget planning; not a substitute for a tokenizer."""
+        return max(1, len(text) // 4)
+
+    def _budget_for_output(self) -> int:
+        """Return max characters to include from a single command's output.
+        Scales with the configured context window so small models get
+        aggressively trimmed output while large models see the full result.
+
+        Context tiers:
+          < 4 K tokens  → 800 chars  (~200 tokens)
+          4–8 K tokens  → 2 000 chars (~500 tokens)
+          8–16 K tokens → 5 000 chars (~1 250 tokens)
+          > 16 K tokens → 12 000 chars (~3 000 tokens)
+        """
+        cw = self.context_window
+        if cw < 4_000:
+            return 800
+        if cw < 8_000:
+            return 2_000
+        if cw < 16_000:
+            return 5_000
+        return 12_000
+
+    def _select_system_prompt(self, custom: Optional[str] = None) -> str:
+        """Return the appropriate system prompt based on context window size.
+
+        Tiers:
+          < 8 K tokens → SYSTEM_PROMPT_COMPACT  (~700 tokens)
+          ≥ 8 K tokens → SYSTEM_PROMPT (full, ~4 000 tokens)
+
+        The compact prompt relies on the model's own pentest training for
+        methodology details and only enforces the critical structural rules.
+        """
+        if custom:
+            return custom
+        from .prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_COMPACT
+        if self.provider == "api":
+            # API provider has a large context — always use full prompt
+            return SYSTEM_PROMPT
+        return SYSTEM_PROMPT_COMPACT if self.context_window < 8_000 else SYSTEM_PROMPT
+
     def _prepare_prompt(self, prompt: str, system_prompt: Optional[str] = None, memory: Optional[str] = None) -> str:
-        """Prepare the complete prompt with system instructions."""
-        from .prompts import SYSTEM_PROMPT
-        
-        system = system_prompt or SYSTEM_PROMPT
-        
-        # Format system prompt with memory if provided
-        if memory is not None:
-            try:
-                system = system.format(memory=memory)
-            except KeyError as e:
-                logger.warning(f"Failed to format SYSTEM_PROMPT with memory: {e}. Memory placeholder may be missing.")
-            except Exception as e:
-                logger.warning(f"Error formatting SYSTEM_PROMPT: {e}")
-        
-        full_prompt = f"""{system}
+        """Prepare the complete prompt, respecting the configured context window.
 
-Current Context:
-{prompt}
+        Budget allocation (approximate):
+          system prompt  → _select_system_prompt() already picks compact vs full
+          memory block   → trimmed to memory_budget chars
+          prompt body    → passed as-is (orchestrator already trims cmd output)
+          response       → reserve 20% of context_window for the JSON reply
+        """
+        system = self._select_system_prompt(system_prompt)
 
-Please analyze the above information and provide your response in the following JSON format:
-{{
-    "reasoning": "Your detailed thought process and analysis...",
-    "suggested_command": "The exact CLI command to execute next",
-    "risk_level": "low/medium/high",
-    "attack_phase": "reconnaissance/vulnerability_analysis/exploitation/post_exploitation/lateral_movement",
-    "confidence": 0.85,
-    "target_info": {{"key": "value"}}  # Optional field
-}}
+        # ── Memory budget ─────────────────────────────────────────────────────
+        # For small-context models trim the memory JSON aggressively.
+        cw = self.context_window
+        if cw < 4_000:
+            memory_budget_chars = 600
+        elif cw < 8_000:
+            memory_budget_chars = 1_600
+        elif cw < 16_000:
+            memory_budget_chars = 4_000
+        else:
+            memory_budget_chars = 10_000
 
-Important: Your response must be valid JSON only, no additional text."""
-        
+        mem_block = ""
+        if memory:
+            trimmed_memory = memory[:memory_budget_chars]
+            if len(memory) > memory_budget_chars:
+                trimmed_memory += "\n... [memory trimmed for context budget]"
+            mem_block = f"\n\n=== SESSION MEMORY ===\n{trimmed_memory}"
+
+        full_prompt = (
+            f"{system}"
+            f"{mem_block}"
+            f"\n\nCurrent Context:\n{prompt}"
+            f"\n\nRespond with valid raw JSON only — no markdown, no extra text."
+        )
+
+        # ── Warn if we're over budget ─────────────────────────────────────────
+        estimated = self._estimate_tokens(full_prompt)
+        # Reserve 20% of context window for the model's response
+        usable = int(cw * 0.80)
+        if estimated > usable:
+            logger.warning(
+                f"Prompt estimated at {estimated} tokens but usable budget is "
+                f"{usable} tokens (context_window={cw}). "
+                "Consider increasing OLLAMA_CONTEXT_WINDOW or using a larger model."
+            )
+
         return full_prompt
     
     def ask_ai_local(self, prompt: str, session_id: Optional[str] = None) -> AIResponse:
@@ -157,11 +233,15 @@ Important: Your response must be valid JSON only, no additional text."""
                 "options": {
                     "temperature": 0.7,
                     "top_p": 0.9,
-                    "top_k": 40
+                    "top_k": 40,
+                    # Tell Ollama to load the model with our configured context size.
+                    # Without this, Ollama uses the model's baked-in default (often
+                    # 2048 or 4096) even if the model supports more.
+                    "num_ctx": self.context_window,
                 }
             }
-            
-            response = requests.post(self.ollama_url, json=payload, timeout=60)
+
+            response = requests.post(self.ollama_url, json=payload, timeout=120)
             response.raise_for_status()
             
             result = response.json()
@@ -346,7 +426,7 @@ Important: Your response must be valid JSON only, no additional text."""
             "model": self.local_model,
             "prompt": full_prompt,
             "stream": False,
-            "options": {"temperature": 0.3}
+            "options": {"temperature": 0.3, "num_ctx": self.context_window},
         }
         response = requests.post(self.ollama_url, json=payload, timeout=60)
         response.raise_for_status()
