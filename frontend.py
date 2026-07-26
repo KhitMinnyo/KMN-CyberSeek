@@ -322,6 +322,33 @@ def get_threat_intel(topic: str = None):
     return []
 
 
+def get_session_history():
+    """Get all sessions from DB (including completed/failed) via /api/sessions/history."""
+    try:
+        response = api_session.get(f"{API_BASE}/sessions/history", timeout=10)
+        if response.status_code == 200:
+            return response.json().get("sessions", [])
+    except Exception as e:
+        logger.error(f"Failed to get session history: {e}")
+    return []
+
+
+def complete_session(session_id: str):
+    """Mark a session as completed."""
+    try:
+        response = api_session.post(f"{API_BASE}/sessions/{session_id}/complete", timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        try:
+            detail = response.json().get("detail", response.text)
+        except Exception:
+            detail = response.text
+        return {"status": "error", "message": detail}
+    except Exception as e:
+        logger.error(f"Failed to complete session: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 def main():
     """Main Streamlit application."""
     
@@ -347,8 +374,8 @@ def main():
         # Navigation menu
         selected = option_menu(
             menu_title="Navigation",
-            options=["Dashboard", "New Session", "Active Sessions", "Command Console", "Threat Intel", "Settings"],
-            icons=["speedometer2", "plus-circle", "list-task", "terminal", "search", "gear"],
+            options=["Dashboard", "New Session", "Active Sessions", "Command Console", "Threat Intel", "History", "Settings"],
+            icons=["speedometer2", "plus-circle", "list-task", "terminal", "search", "clock-history", "gear"],
             menu_icon="cast",
             default_index=0,
             styles={
@@ -411,6 +438,8 @@ def main():
             show_command_console()
         elif selected == "Threat Intel":
             show_threat_intel()
+        elif selected == "History":
+            show_history()
         elif selected == "Settings":
             show_settings()
 
@@ -1533,6 +1562,102 @@ def show_threat_intel():
 
             if f.get("source_url"):
                 st.markdown(f"**Source:** [{f['source_url']}]({f['source_url']})")
+
+
+def show_history():
+    """Session History page - all sessions from DB including completed/failed ones.
+    Unlike Active Sessions (in-memory only), this queries the DB directly so
+    historical sessions survive backend restarts."""
+    st.markdown("<h1 class='main-header'>🕐 Session History</h1>", unsafe_allow_html=True)
+
+    if not check_backend_health():
+        st.error("Backend is not available. Please start the FastAPI server.")
+        return
+
+    history = get_session_history()
+
+    if not history:
+        st.info("No sessions recorded yet. Start a new session to build history.")
+        return
+
+    # Summary metrics row
+    active = sum(1 for s in history if s.get("active_in_memory"))
+    completed = sum(1 for s in history if s.get("status") == "completed")
+    failed = sum(1 for s in history if s.get("status") == "failed")
+    total_vulns = sum(s.get("vuln_count", 0) for s in history)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Sessions", len(history))
+    c2.metric("Active", active)
+    c3.metric("Completed", completed)
+    c4.metric("Total Vulns Found", total_vulns)
+
+    st.markdown("---")
+
+    # Status filter
+    status_filter = st.selectbox(
+        "Filter by status",
+        ["All", "active", "initialized", "scanning", "analyzing", "executing", "ready", "completed", "failed"],
+        key="history_status_filter"
+    )
+
+    filtered = history if status_filter == "All" else [
+        s for s in history
+        if (status_filter == "active" and s.get("active_in_memory"))
+        or (status_filter != "active" and s.get("status") == status_filter)
+    ]
+
+    st.caption(f"Showing {len(filtered)} of {len(history)} session(s)")
+
+    _STATUS_COLORS = {
+        "initialized": "#2d3748", "scanning": "#975a16", "analyzing": "#22543d",
+        "executing": "#702459", "ready": "#4caf50", "completed": "#388e3c", "failed": "#d32f2f"
+    }
+
+    for s in filtered:
+        status = s.get("status", "unknown")
+        color = _STATUS_COLORS.get(status, "#555")
+        in_mem = " 🟢 active" if s.get("active_in_memory") else ""
+        target = s.get("target_ip", "?")
+        domain = f" / {s['target_domain']}" if s.get("target_domain") else ""
+        created = (s.get("created_at") or "")[:19].replace("T", " ")
+
+        with st.expander(
+            f"🎯 {target}{domain}  |  status: {status}{in_mem}  |  {created}"
+        ):
+            col_l, col_r = st.columns([3, 1])
+            with col_l:
+                st.markdown(f"""
+                <div class='session-card' style='border-left-color: {color}'>
+                    <strong>Session ID:</strong> <code>{s['session_id']}</code><br>
+                    <strong>Target:</strong> {target}{domain}<br>
+                    <strong>Status:</strong> <span style='color:{color};font-weight:bold'>{status.upper()}</span><br>
+                    <strong>Stage:</strong> {s.get('current_stage', 'N/A')}<br>
+                    <strong>Created:</strong> {created}<br>
+                    <strong>Scans:</strong> {s.get('scan_count', 0)} &nbsp;
+                    <strong>Commands:</strong> {s.get('command_count', 0)} &nbsp;
+                    <strong>Vulnerabilities:</strong> {s.get('vuln_count', 0)}<br>
+                    <strong>Auto-approve:</strong> {'Yes' if s.get('auto_approve') else 'No'} &nbsp;
+                    <strong>Auth confirmed:</strong> {'Yes' if s.get('authorization_confirmed') else 'No'}
+                </div>
+                """, unsafe_allow_html=True)
+
+            with col_r:
+                # If the session is still active in memory we can switch to it or complete it
+                if s.get("active_in_memory"):
+                    if st.button("📂 Open", key=f"open_{s['session_id']}"):
+                        st.session_state.selected_session = s['session_id']
+                        st.session_state.force_nav_to_active = True
+                        st.rerun()
+
+                    if status not in ("completed", "failed"):
+                        if st.button("✅ Mark Complete", key=f"complete_{s['session_id']}"):
+                            result = complete_session(s['session_id'])
+                            if result.get("status") == "success":
+                                st.success("Session marked as completed.")
+                            else:
+                                st.error(result.get("message", "Failed to complete session."))
+                            st.rerun()
 
 
 def show_settings():
