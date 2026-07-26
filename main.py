@@ -166,16 +166,77 @@ class ApprovalRequest(BaseModel):
     command_id: str = Field(..., description="Command identifier")
     approve: bool = Field(True, description="Approve or deny the command")
 
+# Known context windows for common Ollama models — used as fallback when
+# /api/show doesn't expose the model_info.context_length field.
+_KNOWN_CTX: dict = {
+    "deepseek-r1:1.5b": 4096,
+    "deepseek-r1:7b":   8192,
+    "deepseek-r1:8b":   8192,
+    "deepseek-r1:14b":  16384,
+    "deepseek-r1:32b":  32768,
+    "deepseek-r1:70b":  131072,
+    "deepseek-r1:671b": 131072,
+    "llama3.1:8b":      131072,
+    "llama3.1:70b":     131072,
+    "llama3.2:1b":      131072,
+    "llama3.2:3b":      131072,
+    "llama3.3:70b":     131072,
+    "qwen2.5:7b":       32768,
+    "qwen2.5:14b":      32768,
+    "qwen2.5:32b":      32768,
+    "qwen2.5:72b":      131072,
+    "qwen2.5-coder:7b": 32768,
+    "qwen2.5-coder:14b":32768,
+    "qwen2.5-coder:32b":32768,
+    "mistral:7b":       32768,
+    "mistral:latest":   32768,
+    "mistral-nemo":     128000,
+    "codellama:7b":     16384,
+    "codellama:13b":    16384,
+    "phi3:mini":        128000,
+    "phi3:medium":      128000,
+    "phi4:latest":      16384,
+    "gemma2:2b":        8192,
+    "gemma2:9b":        8192,
+    "gemma2:27b":       8192,
+    "deephat/deephat-v1-7b": 8192,
+    "deepseek-coder-v2:16b": 32768,
+    "deepseek-coder-v2:236b": 131072,
+}
+
 class AISettings(BaseModel):
     """AI settings update model."""
     provider: str  # "Local (Ollama)" or "DeepSeek API"
     api_key: str = ""
     model_name: str = ""  # Ollama model tag OR DeepSeek model name, depending on provider
     ollama_url: str = ""
+    ollama_context_window: Optional[int] = None  # if set, saved to .env + applied immediately
 
 class VulnersSettings(BaseModel):
     """Vulners API key update model (optional CVE enrichment - see core/cve_lookup.py)."""
     api_key: str = ""
+
+
+class SecuritySettings(BaseModel):
+    """Security / operational settings persisted to .env."""
+    require_approval_high_risk: bool = True
+    approval_timeout_minutes: int = 15
+    audit_logging: bool = True
+    session_timeout_hours: int = 24
+    max_parallel_commands: int = 3
+    auto_cleanup: bool = True
+    cleanup_after_days: int = 30
+
+
+class AdvancedSettings(BaseModel):
+    """Advanced backend settings persisted to .env."""
+    log_level: str = "INFO"
+    log_file: str = "backend.log"
+    debug: bool = False
+    db_path: str = "kmn_cyberseek.db"
+    full_auto_mode: bool = False
+    ollama_context_window: int = 8192
+
 
 class ScheduledScanRequest(BaseModel):
     """Create or update a scheduled recurring scan."""
@@ -333,6 +394,38 @@ async def download_session_report(session_id: str):
     return FileResponse(
         path=out_path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@app.get("/api/sessions/{session_id}/report/pdf")
+async def download_session_report_pdf(session_id: str):
+    """Generate and download a PDF penetration-test report for a session.
+    Requires fpdf2 (pip install fpdf2). Returns the file directly."""
+    try:
+        report_data = orchestrator.get_session_report(session_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    try:
+        from core.report_generator import generate_pdf_report
+    except ImportError as e:
+        raise HTTPException(status_code=501, detail=f"PDF generation unavailable: {e}. Install fpdf2.")
+
+    try:
+        import tempfile
+        out_dir = tempfile.gettempdir()
+        out_path = os.path.join(out_dir, f"kmn_report_{session_id[:12]}.pdf")
+        generate_pdf_report(report_data, output_path=out_path)
+    except Exception as e:
+        logger.error(f"PDF report generation failed for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF report generation failed: {e}")
+
+    filename = f"kmn_report_{session_id[:12]}.pdf"
+    return FileResponse(
+        path=out_path,
+        media_type="application/pdf",
         filename=filename,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
@@ -569,6 +662,101 @@ async def resume_session(session_id: str):
     asyncio.create_task(orchestrator._analyze_with_ai(session_id))
     return {"status": "success", "message": "AI analysis resumed"}
 
+@app.get("/api/ollama/models")
+async def list_ollama_models():
+    """Return the list of models available on the configured Ollama server.
+    Queries Ollama's GET /api/tags endpoint. Returns an empty list (not an
+    error) if Ollama is unreachable so the frontend can degrade gracefully."""
+    base = os.getenv("OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
+    # Strip /api/generate suffix if present
+    if base.endswith("/api/generate"):
+        base = base[: -len("/api/generate")].rstrip("/")
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(f"{base}/api/tags")
+            r.raise_for_status()
+            data = r.json()
+        models = []
+        for m in data.get("models", []):
+            name = m.get("name", "")
+            size_bytes = m.get("size", 0)
+            size_gb = round(size_bytes / 1e9, 1) if size_bytes else None
+            models.append({"name": name, "size_gb": size_gb})
+        return {"models": models, "ollama_url": base}
+    except Exception as exc:
+        return {"models": [], "error": str(exc), "ollama_url": base}
+
+
+@app.get("/api/ollama/model-info")
+async def get_ollama_model_info(model: str):
+    """Return context window and basic metadata for a specific Ollama model.
+    Tries three sources in order:
+      1. Ollama /api/show → model_info (architecture-specific context_length key)
+      2. Ollama /api/show → parameters string (num_ctx override)
+      3. Built-in _KNOWN_CTX lookup table
+    Falls back to 8192 if none of the above yields a value."""
+    base = os.getenv("OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
+    if base.endswith("/api/generate"):
+        base = base[: -len("/api/generate")].rstrip("/")
+
+    context_window = None
+    architecture = None
+    param_count = None
+    source = "unknown"
+
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(f"{base}/api/show", json={"name": model})
+            r.raise_for_status()
+            info = r.json()
+
+        # ── Source 1: model_info ─────────────────────────────────────────────
+        model_info = info.get("model_info", {})
+        # Context length key varies by architecture: llama.context_length,
+        # qwen2.context_length, phi3.context_length, gemma.context_length, etc.
+        for key, val in model_info.items():
+            if "context_length" in key.lower() and isinstance(val, int) and val > 0:
+                context_window = val
+                source = f"model_info[{key!r}]"
+                break
+        architecture = model_info.get("general.architecture", None)
+        param_count = model_info.get("general.parameter_count", None)
+
+        # ── Source 2: parameters override (num_ctx in Modelfile) ────────────
+        if not context_window:
+            params_str = info.get("parameters", "")
+            import re as _re
+            m = _re.search(r'\bnum_ctx\s+(\d+)', params_str, _re.IGNORECASE)
+            if m:
+                context_window = int(m.group(1))
+                source = "parameters[num_ctx]"
+
+    except Exception as exc:
+        pass  # Ollama unreachable — fall through to lookup table
+
+    # ── Source 3: known-models lookup table ──────────────────────────────────
+    if not context_window:
+        clean = model.lower().strip()
+        context_window = _KNOWN_CTX.get(clean)
+        if context_window:
+            source = "built-in lookup table"
+
+    # ── Default ──────────────────────────────────────────────────────────────
+    if not context_window:
+        context_window = 8192
+        source = "default fallback"
+
+    return {
+        "model": model,
+        "context_window": context_window,
+        "architecture": architecture,
+        "param_count": param_count,
+        "source": source,
+    }
+
+
 @app.post("/api/settings/ai")
 async def update_ai_settings(settings: AISettings):
     """Update AI settings (persisted to .env, works even if .env starts empty) and
@@ -600,6 +788,9 @@ async def update_ai_settings(settings: AISettings):
         if settings.ollama_url:
             set_key(env_path, "OLLAMA_URL", settings.ollama_url)
             ollama_url = settings.ollama_url
+        if settings.ollama_context_window is not None:
+            set_key(env_path, "OLLAMA_CONTEXT_WINDOW", str(settings.ollama_context_window))
+            os.environ["OLLAMA_CONTEXT_WINDOW"] = str(settings.ollama_context_window)
 
     # Re-initialize the global AI connector with new settings
     global ai_connector, orchestrator
@@ -612,11 +803,13 @@ async def update_ai_settings(settings: AISettings):
     )
     orchestrator.ai_connector = ai_connector
 
+    ctx = ai_connector.context_window if provider_code == "local" else None
     return {
         "status": "success",
         "message": "AI settings updated and connector reloaded",
         "provider": provider_code,
-        "model": ai_connector.local_model if provider_code == "local" else ai_connector.api_model
+        "model": ai_connector.local_model if provider_code == "local" else ai_connector.api_model,
+        "context_window": ctx,
     }
 
 @app.post("/api/settings/vulners")
@@ -638,6 +831,66 @@ async def update_vulners_settings(settings: VulnersSettings):
         "message": "Vulners API key saved" if settings.api_key else "Vulners API key cleared (CVE enrichment disabled)",
         "configured": bool(settings.api_key)
     }
+
+@app.post("/api/settings/security")
+async def update_security_settings(settings: SecuritySettings):
+    """Persist security/operational settings to .env so they survive restarts."""
+    env_path = os.path.join(os.getcwd(), ".env")
+    if not os.path.exists(env_path):
+        open(env_path, "w").close()
+
+    set_key(env_path, "REQUIRE_APPROVAL_HIGH_RISK", str(settings.require_approval_high_risk).lower())
+    set_key(env_path, "APPROVAL_TIMEOUT_MINUTES",   str(settings.approval_timeout_minutes))
+    set_key(env_path, "AUDIT_LOGGING",              str(settings.audit_logging).lower())
+    set_key(env_path, "SESSION_TIMEOUT_HOURS",       str(settings.session_timeout_hours))
+    set_key(env_path, "MAX_CONCURRENT_SCANS",        str(settings.max_parallel_commands))
+    set_key(env_path, "AUTO_CLEANUP",               str(settings.auto_cleanup).lower())
+    set_key(env_path, "CLEANUP_AFTER_DAYS",          str(settings.cleanup_after_days))
+
+    return {"status": "success", "message": "Security settings saved"}
+
+
+@app.post("/api/settings/advanced")
+async def update_advanced_settings(settings: AdvancedSettings):
+    """Persist advanced backend settings to .env."""
+    env_path = os.path.join(os.getcwd(), ".env")
+    if not os.path.exists(env_path):
+        open(env_path, "w").close()
+
+    valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+    log_level = settings.log_level.upper() if settings.log_level.upper() in valid_levels else "INFO"
+
+    set_key(env_path, "LOG_LEVEL",       log_level)
+    set_key(env_path, "LOG_FILE",        settings.log_file or "backend.log")
+    set_key(env_path, "DEBUG",           str(settings.debug).lower())
+    set_key(env_path, "DB_PATH",         settings.db_path or "kmn_cyberseek.db")
+    set_key(env_path, "FULL_AUTO_MODE",          str(settings.full_auto_mode).lower())
+    set_key(env_path, "OLLAMA_CONTEXT_WINDOW",    str(settings.ollama_context_window))
+
+    # Apply log level to running process immediately (no restart needed)
+    import logging as _logging
+    _logging.getLogger().setLevel(getattr(_logging, log_level, _logging.INFO))
+
+    # Propagate runtime-changeable settings into os.environ so the running
+    # process picks them up on the next call without requiring a restart.
+    os.environ["FULL_AUTO_MODE"] = str(settings.full_auto_mode).lower()
+    os.environ["OLLAMA_CONTEXT_WINDOW"] = str(settings.ollama_context_window)
+
+    # Also update the live AI connector instance so the context window takes
+    # effect immediately for the current session.
+    try:
+        orchestrator.ai_connector.context_window = settings.ollama_context_window
+    except Exception:
+        pass  # non-fatal if connector not yet initialised
+
+    return {
+        "status": "success",
+        "message": "Advanced settings saved",
+        "log_level": log_level,
+        "full_auto_mode": settings.full_auto_mode,
+        "ollama_context_window": settings.ollama_context_window,
+    }
+
 
 @app.post("/api/execute")
 async def execute_command(command_request: CommandRequest):

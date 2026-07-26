@@ -498,3 +498,226 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
     doc.save(output_path)
     logger.info(f"Report saved to {output_path}")
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# PDF report generator (uses fpdf2 — pure Python, no LibreOffice needed)
+# ---------------------------------------------------------------------------
+
+def _require_fpdf():
+    try:
+        from fpdf import FPDF  # noqa: F401
+    except ImportError:
+        raise ImportError(
+            "fpdf2 is required for PDF report generation. "
+            "Install it with: pip install fpdf2"
+        )
+
+
+def generate_pdf_report(session_report: Dict, output_path: Optional[str] = None) -> str:
+    """Generate a PDF penetration-test report.
+
+    Args:
+        session_report: dict as returned by orchestrator.get_session_report()
+        output_path: where to write the file. Defaults to /tmp/kmn_report_<id>.pdf
+
+    Returns:
+        Absolute path to the generated PDF.
+    """
+    _require_fpdf()
+    from fpdf import FPDF
+
+    meta = session_report.get("session", {})
+    session_id = meta.get("session_id", "unknown")[:12]
+    target = meta.get("target_ip", "—")
+    created = meta.get("created_at", "—")
+    status = meta.get("status", "—")
+    generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    vulns: List[Dict] = session_report.get("vulnerabilities", [])
+    commands: List[Dict] = session_report.get("commands", [])
+    services: List[Dict] = session_report.get("services", [])
+    credentials: List[Dict] = session_report.get("credentials", [])
+    ai_decisions: List[Dict] = session_report.get("ai_decisions", [])
+
+    # Risk summary
+    high_c = sum(1 for v in vulns if v.get("risk_level") == "high")
+    med_c  = sum(1 for v in vulns if v.get("risk_level") == "medium")
+    low_c  = sum(1 for v in vulns if v.get("risk_level") == "low")
+
+    if output_path is None:
+        output_path = os.path.join("/tmp", f"kmn_report_{session_id}.pdf")
+
+    # ── PDF setup ──────────────────────────────────────────────────────────
+    class _PDF(FPDF):
+        def header(self):
+            self.set_fill_color(26, 35, 126)       # dark indigo
+            self.rect(0, 0, 210, 14, "F")
+            self.set_font("Helvetica", "B", 9)
+            self.set_text_color(255, 255, 255)
+            self.set_xy(8, 3)
+            self.cell(0, 8, "KMN-CyberSeek  |  Penetration Test Report  — CONFIDENTIAL")
+            self.set_text_color(0, 0, 0)
+
+        def footer(self):
+            self.set_y(-12)
+            self.set_font("Helvetica", "", 7)
+            self.set_text_color(120, 120, 120)
+            self.cell(0, 6, f"Page {self.page_no()}", align="C")
+            self.set_text_color(0, 0, 0)
+
+    pdf = _PDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.add_page()
+    pdf.set_margins(14, 18, 14)
+
+    def _h1(txt: str):
+        pdf.ln(4)
+        pdf.set_fill_color(55, 71, 79)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 8, f"  {txt}", fill=True, ln=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+
+    def _row(label: str, value: str, bold_val: bool = False):
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(50, 6, label + ":", ln=False)
+        pdf.set_font("Helvetica", "B" if bold_val else "", 9)
+        pdf.multi_cell(0, 6, str(value))
+
+    def _para(txt: str, size: int = 9):
+        pdf.set_font("Helvetica", "", size)
+        pdf.multi_cell(0, 5, txt)
+        pdf.ln(1)
+
+    # ── Cover / summary ───────────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 20)
+    pdf.set_text_color(26, 35, 126)
+    pdf.cell(0, 12, "KMN-CyberSeek", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 12)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(0, 7, "AI-Driven Penetration Test Report", ln=True, align="C")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(6)
+
+    _h1("Session Metadata")
+    _row("Session ID", session_id)
+    _row("Target", target)
+    _row("Status", status)
+    _row("Started", str(created))
+    _row("Generated", generated_at)
+    pdf.ln(2)
+
+    _h1("Executive Summary")
+    _row("Total Vulnerabilities", str(len(vulns)))
+    _row("High Risk", str(high_c), bold_val=high_c > 0)
+    _row("Medium Risk", str(med_c))
+    _row("Low Risk", str(low_c))
+    _row("Services Discovered", str(len(services)))
+    _row("Commands Executed", str(len(commands)))
+    _row("Credentials Captured", str(len(credentials)))
+    pdf.ln(2)
+
+    # ── Vulnerabilities ───────────────────────────────────────────────────
+    if vulns:
+        _h1(f"Vulnerability Findings ({len(vulns)})")
+        for i, v in enumerate(
+            sorted(vulns, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.get("risk_level", ""), 3)),
+            start=1
+        ):
+            risk = v.get("risk_level", "unknown").upper()
+            name = v.get("name", "Unknown")
+            host = v.get("host", "—")
+            port = v.get("port") or "—"
+            svc  = v.get("service", "—")
+            cves = ", ".join(json.loads(v.get("cve_ids") or "[]") or []) or "—"
+            desc = v.get("description", "")
+
+            # Risk colour
+            rc = {"HIGH": (211, 47, 47), "MEDIUM": (245, 127, 23), "LOW": (46, 125, 50)}.get(risk, (100, 100, 100))
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(*rc)
+            pdf.cell(0, 6, f"[{risk}] {i}. {name}", ln=True)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.cell(0, 5, f"Host: {host}  |  Port: {port}  |  Service: {svc}  |  CVEs: {cves}", ln=True)
+            if desc:
+                pdf.set_font("Helvetica", "I", 8)
+                pdf.multi_cell(0, 5, desc[:300] + ("…" if len(desc) > 300 else ""))
+            pdf.ln(1)
+
+    # ── Services ─────────────────────────────────────────────────────────
+    if services:
+        _h1(f"Discovered Services ({len(services)})")
+        pdf.set_font("Helvetica", "B", 8)
+        # Header row
+        col_w = [30, 20, 18, 60, 52]
+        headers = ["Host", "Port", "State", "Service", "Version"]
+        for w, h in zip(col_w, headers):
+            pdf.cell(w, 6, h, border=1)
+        pdf.ln()
+        pdf.set_font("Helvetica", "", 8)
+        for s in services[:40]:
+            host = str(s.get("host", ""))[:18]
+            port = str(s.get("port", ""))
+            state = str(s.get("state", ""))
+            svc  = str(s.get("service", ""))[:28]
+            ver  = str(s.get("version", ""))[:30]
+            for w, val in zip(col_w, [host, port, state, svc, ver]):
+                pdf.cell(w, 5, val, border=1)
+            pdf.ln()
+        pdf.ln(2)
+
+    # ── Credentials ───────────────────────────────────────────────────────
+    if credentials:
+        _h1(f"Captured Credentials ({len(credentials)})")
+        pdf.set_font("Helvetica", "B", 8)
+        for w, h in zip([40, 60, 25, 30, 25], ["Username", "Secret", "Type", "Service", "Host"]):
+            pdf.cell(w, 6, h, border=1)
+        pdf.ln()
+        pdf.set_font("Helvetica", "", 8)
+        for c in credentials:
+            secret = str(c.get("secret", ""))
+            if len(secret) > 28:
+                secret = secret[:25] + "…"
+            for w, val in zip([40, 60, 25, 30, 25], [
+                str(c.get("username", ""))[:22],
+                secret,
+                str(c.get("secret_type", ""))[:10],
+                str(c.get("service", ""))[:14],
+                str(c.get("host", ""))[:14],
+            ]):
+                pdf.cell(w, 5, val, border=1)
+            pdf.ln()
+        pdf.ln(2)
+
+    # ── Commands ──────────────────────────────────────────────────────────
+    if commands:
+        _h1(f"Commands Log ({len(commands)})")
+        for i, cmd in enumerate(commands[-30:], start=1):   # last 30 max
+            ok = cmd.get("success", False)
+            pdf.set_font("Helvetica", "B", 8)
+            pdf.set_text_color(30, 100, 30) if ok else pdf.set_text_color(180, 30, 30)
+            pdf.cell(0, 5, f"{'✓' if ok else '✗'}  {str(cmd.get('command', ''))[:100]}", ln=True)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Helvetica", "", 7)
+            out = str(cmd.get("output") or "").strip()[:400]
+            if out:
+                pdf.multi_cell(0, 4, out)
+            pdf.ln(1)
+
+    # ── Legal disclaimer ──────────────────────────────────────────────────
+    pdf.add_page()
+    _h1("Legal Disclaimer")
+    _para(
+        "This report was generated by KMN-CyberSeek and is intended SOLELY for use by "
+        "authorised security professionals operating on systems for which explicit written "
+        "authorisation was obtained prior to testing. Vulnerability findings derived from "
+        "unverified web research are marked as such and must be independently corroborated. "
+        "The operator is solely responsible for the legality and scope of all testing activity."
+    )
+
+    pdf.output(output_path)
+    logger.info(f"PDF report saved to {output_path}")
+    return output_path
