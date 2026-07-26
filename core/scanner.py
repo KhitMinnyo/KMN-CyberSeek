@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 
 import nmap  # python-nmap
 
-from core.validators import is_valid_target
+from core.validators import is_valid_target, is_cidr
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +281,53 @@ class Scanner:
         
         return await self.perform_nmap_scan(target, options)
     
+    async def perform_subnet_sweep(self, cidr: str) -> Dict:
+        """Run a fast nmap ping sweep (-sn) on a CIDR subnet to discover live hosts.
+        Returns the same structure as perform_nmap_scan so callers can use
+        parse_nmap_results() on the result.
+
+        Only callable with CIDR targets — plain IPs are rejected to enforce the
+        semantic distinction (ping sweep on a /32 would be an ordinary host scan,
+        which is confusing; use perform_nmap_scan for that).
+        """
+        if not is_cidr(cidr):
+            return _invalid_target_result(cidr, {"vulnerabilities": []})
+
+        logger.info(f"Starting subnet ping sweep: {cidr}")
+        cmd = f"nmap -sn -T4 {shlex.quote(cidr)}"
+        try:
+            process = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd="/tmp"
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+            raw_output = stdout.decode()
+            parsed = self._parse_nmap_output(raw_output)
+            logger.info(
+                f"Subnet sweep of {cidr} found "
+                f"{parsed.get('summary', {}).get('up_hosts', 0)} live host(s)"
+            )
+            return {
+                "target": cidr,
+                "success": process.returncode == 0,
+                "scan_type": "subnet_sweep",
+                "scan_options": "-sn -T4",
+                "raw_output": raw_output,
+                "parsed_results": parsed,
+                "timestamp": self._get_timestamp()
+            }
+        except Exception as e:
+            logger.error(f"Subnet sweep failed for {cidr}: {e}")
+            return {
+                "target": cidr,
+                "success": False,
+                "error": str(e),
+                "raw_output": "",
+                "parsed_results": {}
+            }
+
     async def perform_vulnerability_scan(self, target: str, ports: Optional[List[int]] = None) -> Dict:
         """
         Perform basic vulnerability scan using Nmap's 'vuln' NSE script category.

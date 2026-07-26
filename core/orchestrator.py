@@ -7,15 +7,37 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
+# ---------------------------------------------------------------------------
+# Credential extraction patterns
+# Ordered from most to least specific. All patterns must have exactly 2 groups:
+# (username, password) - or (hash, cracked_password) for hash-cracker output.
+# ---------------------------------------------------------------------------
+_CRED_PATTERNS: List[re.Pattern] = [
+    # hydra: [22][ssh] host: 10.0.0.1   login: admin   password: password123
+    re.compile(r'\[\d+\]\[\w+\]\s+host:\s*\S+\s+login:\s*(\S+)\s+password:\s*(\S+)', re.IGNORECASE),
+    # medusa: ACCOUNT FOUND: [ssh] Host: 10.0.0.1 User: admin Password: secret
+    re.compile(r'ACCOUNT FOUND.*User:\s*(\S+)\s+Password:\s*(\S+)', re.IGNORECASE),
+    # ncrack: Discovered credentials ... on ... 22/tcp ... 'admin' 'pass'
+    re.compile(r"Discovered credentials.*?'([^']+)'\s+'([^']+)'", re.IGNORECASE),
+    # crackmapexec: [+] IP\user:pass (Pwn3d!) or without domain
+    re.compile(r'\[\+\]\s+[\w.\-]+\\(\w+):(\S+)', re.IGNORECASE),
+    # nmap NSE http-auth-finder / http-brute style: username: admin  password: secret
+    re.compile(r'username[:\s]+(\S+)[,\s]+password[:\s]+(\S+)', re.IGNORECASE),
+    # john/hashcat cracked: HASH (PASSWORD) or hash:password
+    re.compile(r'^\S+\s+\((.+?)\)\s*$', re.MULTILINE),   # john --show style
+    re.compile(r'^([^:]+):([^:]+):\d+:\d+:::',  re.MULTILINE),  # /etc/shadow dump - user:hash
+]
+
 from ai.connector import KMN_AI_Connector, AIResponse
 from core.scanner import Scanner
-from core.validators import is_valid_target, is_target_in_scope, is_allowlisted_command
+from core.validators import is_valid_target, is_target_in_scope, is_allowlisted_command, is_cidr
 from core import cve_lookup
 from core import threat_intel
 
@@ -103,6 +125,15 @@ class Orchestrator:
         # Shared, non-session-scoped reference cache built by threat-intel research
         # (core/threat_intel.py) - see _load_threat_intel_cache()
         self.threat_intel_cache: List[Dict] = []
+        # Optional async callable(message_type: str, data: Dict) -> None for
+        # broadcasting real-time command output to WebSocket clients. Set by
+        # main.py after orchestrator is created: orchestrator.broadcast_callback = broadcast_message
+        self.broadcast_callback: Optional[Any] = None
+        # Per-session live-output buffer for polling by Streamlit frontend.
+        # Keyed by session_id → current running command's accumulated output (last
+        # _LIVE_OUTPUT_MAX chars). Cleared when command finishes.
+        self._live_output: Dict[str, str] = {}
+        _LIVE_OUTPUT_MAX = 8000  # keep last N chars so the buffer doesn't grow forever
 
         # Initialize database
         self._init_database()
@@ -207,6 +238,46 @@ class Orchestrator:
                     status TEXT DEFAULT 'confirmed',  -- confirmed, suspected, false_positive, remediated
                     discovered_at TIMESTAMP NOT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions (session_id)
+                )
+            ''')
+
+            # Create credentials table - captures username/password pairs found by
+            # brute-force tools (hydra, medusa, ncrack), credential-dump tools
+            # (crackmapexec, impacket), and NSE scripts. Populated automatically by
+            # _extract_and_store_credentials() after every command execution.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS credentials (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    secret TEXT NOT NULL,      -- password OR hash (labelled by secret_type)
+                    secret_type TEXT DEFAULT 'password',  -- 'password' | 'hash'
+                    service TEXT,
+                    host TEXT,
+                    port INTEGER,
+                    source_command TEXT,       -- first 300 chars of the command that found it
+                    discovered_at TIMESTAMP NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions (session_id)
+                )
+            ''')
+
+            # Create scheduled_scans table - recurring scan configurations.
+            # The background scheduler (see core/scheduler.py, wired via main.py)
+            # reads this table every minute and auto-creates sessions when due.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS scheduled_scans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_ip TEXT NOT NULL,
+                    target_domain TEXT,
+                    label TEXT,                   -- human-readable name
+                    schedule_type TEXT NOT NULL,  -- 'daily' | 'weekly' | 'once'
+                    schedule_time TEXT NOT NULL,  -- HH:MM (24h, UTC)
+                    schedule_day INTEGER,         -- 0=Mon..6=Sun for weekly; NULL for others
+                    status TEXT DEFAULT 'active', -- 'active' | 'paused' | 'deleted'
+                    next_run TIMESTAMP,
+                    last_run TIMESTAMP,
+                    last_session_id TEXT,
+                    created_at TIMESTAMP NOT NULL
                 )
             ''')
 
@@ -320,14 +391,36 @@ class Orchestrator:
         
         try:
             logger.info(f"Starting reconnaissance for session {session_id}")
-            
+
+            # --- Subnet mode: ping-sweep first, then full-scan live hosts -------
+            if is_cidr(session.target_ip):
+                logger.info(
+                    f"CIDR target detected ({session.target_ip}) — running ping sweep first"
+                )
+                sweep_results = await self.scanner.perform_subnet_sweep(session.target_ip)
+                session.scan_results.append(sweep_results)
+                self._save_scan_results(session_id, "nmap_sweep", sweep_results)
+                live_ips = [h["ip"] for h in self.scanner.parse_nmap_results(sweep_results)
+                            if h.get("ip")]
+                logger.info(
+                    f"Subnet sweep found {len(live_ips)} live host(s): {live_ips}"
+                )
+                # Full scan on the subnet (nmap handles multiple IPs natively)
+                scan_target = session.target_ip  # pass CIDR to nmap directly
+                if not live_ips:
+                    logger.warning(
+                        f"No live hosts found in {session.target_ip} — scan may be blocked"
+                    )
+            else:
+                scan_target = session.target_ip
+
             # Perform initial Nmap scan - USE FULL SCAN for comprehensive discovery
-            scan_results = await self.scanner.perform_nmap_scan(session.target_ip, "full")
+            scan_results = await self.scanner.perform_nmap_scan(scan_target, "full")
             session.scan_results.append(scan_results)
-            
+
             # Save scan results to database
             self._save_scan_results(session_id, "nmap_initial", scan_results)
-            
+
             # Parse scan results
             discovered_hosts = self.scanner.parse_nmap_results(scan_results)
             session.discovered_hosts.extend(discovered_hosts)
@@ -566,6 +659,8 @@ Known Vulnerabilities so far (from nmap vuln scripts / CVE lookup - UNTRUSTED DA
 <<<TOOL_OUTPUT_START>>>
 {json.dumps(self._summarize_vulnerabilities(session), indent=2)}
 <<<TOOL_OUTPUT_END>>>
+
+{self._get_relevant_threat_intel_context(session_id)}
             """
             
             # Build AI memory for context
@@ -773,7 +868,7 @@ Known Vulnerabilities so far (from nmap vuln scripts / CVE lookup - UNTRUSTED DA
         
         try:
             logger.info(f"Executing command for {session_id}: {command}")
-            
+
             # Execute command with increased timeout for advanced tools (nikto, wpscan, msfconsole)
             process = await asyncio.create_subprocess_shell(
                 command,
@@ -781,12 +876,67 @@ Known Vulnerabilities so far (from nmap vuln scripts / CVE lookup - UNTRUSTED DA
                 stderr=asyncio.subprocess.PIPE,
                 cwd="/tmp"  # Safe directory
             )
-            
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=COMMAND_TIMEOUT)
+
+            # Stream stdout + stderr line-by-line, broadcasting each chunk to
+            # WebSocket clients if a broadcast_callback is registered (set by
+            # main.py). Falls back gracefully if no callback is set.
+            stdout_chunks: List[str] = []
+            stderr_chunks: List[str] = []
+
+            _LIVE_MAX = 8000  # rolling cap so buffer never grows unbounded
+
+            async def _stream_stdout():
+                async for line in process.stdout:
+                    text = line.decode(errors="replace")
+                    stdout_chunks.append(text)
+                    # Update per-session live-output buffer (Streamlit polling)
+                    self._live_output[session_id] = (
+                        self._live_output.get(session_id, "") + text
+                    )[-_LIVE_MAX:]
+                    if self.broadcast_callback:
+                        try:
+                            await self.broadcast_callback("command_output_chunk", {
+                                "session_id": session_id,
+                                "command_id": command_id,
+                                "stream": "stdout",
+                                "chunk": text
+                            })
+                        except Exception:
+                            pass
+
+            async def _stream_stderr():
+                async for line in process.stderr:
+                    text = line.decode(errors="replace")
+                    stderr_chunks.append(text)
+                    self._live_output[session_id] = (
+                        self._live_output.get(session_id, "") + text
+                    )[-_LIVE_MAX:]
+                    if self.broadcast_callback:
+                        try:
+                            await self.broadcast_callback("command_output_chunk", {
+                                "session_id": session_id,
+                                "command_id": command_id,
+                                "stream": "stderr",
+                                "chunk": text
+                            })
+                        except Exception:
+                            pass
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(_stream_stdout(), _stream_stderr()),
+                    timeout=COMMAND_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                logger.warning(f"Command timed out after {COMMAND_TIMEOUT}s for session {session_id}: {command[:80]}")
+
+            await process.wait()
             return_code = process.returncode
-            
-            raw_output = stdout.decode() if stdout else ""
-            raw_error = stderr.decode() if stderr else ""
+
+            raw_output = "".join(stdout_chunks)
+            raw_error = "".join(stderr_chunks)
             
             # Sanitize outputs to remove noise and truncate large outputs
             sanitized_output = self._sanitize_output(raw_output)
@@ -807,7 +957,13 @@ Known Vulnerabilities so far (from nmap vuln scripts / CVE lookup - UNTRUSTED DA
             
             # Save sanitized output to database
             self._save_command_result(session_id, command_id, command, sanitized_output, sanitized_error, return_code)
-            
+
+            # Auto-extract any credentials found in this command's output.
+            self._extract_and_store_credentials(session_id, command, sanitized_output + "\n" + sanitized_error)
+
+            # Clear the live-output buffer now that the command is done.
+            self._live_output.pop(session_id, None)
+
             # Update session status
             session.status = "ready"
             
@@ -927,8 +1083,10 @@ Current session state:
 - Auto-execution depth counter: {session.auto_depth_counter}/{session.max_auto_depth}
 
 CRITICAL RULE: If a Target Domain is provided ({session.target_domain}), you MUST use the domain name in your suggested commands (especially for web tools like gobuster, curl, ffuf, etc.), NEVER the IP address, to ensure Virtual Host and SNI routing work correctly.
+
+{self._get_relevant_threat_intel_context(session_id)}
             """
-            
+
             # Get AI decision for next step, passing memory to AI
             ai_response = await self.ai_connector.ask_ai_async(context, session_id, memory=memory_string)
             
@@ -1229,6 +1387,264 @@ CRITICAL RULE: If a Target Domain is provided ({session.target_domain}), you MUS
         """Get all recorded vulnerability findings for a session (in-memory, fast path)."""
         session = self.sessions.get(session_id)
         return list(session.vulnerabilities) if session else []
+
+    def _extract_and_store_credentials(self, session_id: str, command: str, output: str):
+        """Scan command output for credential finds and persist new ones.
+        Deduplicates on (username, secret). Never raises - failures are logged."""
+        session = self.sessions.get(session_id)
+        if not session or not output:
+            return
+
+        # Infer service + host from command heuristic (best-effort, not critical).
+        service_hint = None
+        host_hint = session.target_ip
+        port_hint = None
+        cmd_lower = command.lower()
+        for svc in ("ssh", "ftp", "http", "smb", "rdp", "telnet", "mysql", "mssql", "vnc"):
+            if svc in cmd_lower:
+                service_hint = svc
+                break
+
+        try:
+            for pattern in _CRED_PATTERNS:
+                for match in pattern.finditer(output):
+                    username = (match.group(1) or "").strip()
+                    secret = (match.group(2) or "").strip()
+                    if not username or not secret or len(username) > 256 or len(secret) > 512:
+                        continue
+                    # Rough heuristic: long hex/dollar strings are hashes, not passwords
+                    is_hash = secret.startswith("$") or (len(secret) >= 32 and all(c in "0123456789abcdefABCDEF" for c in secret))
+                    secret_type = "hash" if is_hash else "password"
+
+                    # Dedup in-memory
+                    already = any(
+                        c.get("username") == username and c.get("secret") == secret
+                        for c in session.credentials
+                    )
+                    if already:
+                        continue
+
+                    record = {
+                        "username": username,
+                        "secret": secret,
+                        "secret_type": secret_type,
+                        "service": service_hint,
+                        "host": host_hint,
+                        "port": port_hint,
+                        "source_command": command[:300],
+                        "discovered_at": datetime.now().isoformat()
+                    }
+                    session.credentials.append(record)
+                    self._save_credential_db(session_id, record)
+                    logger.info(
+                        f"Credential captured for session {session_id}: "
+                        f"user={username!r} type={secret_type} service={service_hint}"
+                    )
+        except Exception as e:
+            logger.warning(f"Credential extraction failed for session {session_id} (non-fatal): {e}")
+
+    def _save_credential_db(self, session_id: str, record: Dict):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO credentials (
+                    session_id, username, secret, secret_type, service, host, port,
+                    source_command, discovered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                session_id, record["username"], record["secret"], record.get("secret_type", "password"),
+                record.get("service"), record.get("host"), record.get("port"),
+                record.get("source_command"), record.get("discovered_at")
+            ))
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.error(f"Failed to save credential to database: {e}")
+
+    def get_credentials(self, session_id: str) -> List[Dict]:
+        """Return in-memory credential list for a session (fast path)."""
+        session = self.sessions.get(session_id)
+        return list(session.credentials) if session else []
+
+    def get_live_output(self, session_id: str) -> str:
+        """Return the current rolling live-output buffer for a session.
+        Empty string when no command is executing. Used by the Streamlit frontend
+        (via GET /api/sessions/{id}/live_output) to poll for streaming output."""
+        return self._live_output.get(session_id, "")
+
+    # ── Scheduled scans ──────────────────────────────────────────────────────
+
+    def _compute_next_run(self, schedule_type: str, schedule_time: str,
+                          schedule_day: Optional[int] = None) -> datetime:
+        """Compute the next UTC run datetime for a schedule spec."""
+        from datetime import timezone
+        now = datetime.utcnow()
+        h, m = [int(x) for x in schedule_time.split(":")]
+        candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+        if schedule_type == "once":
+            return candidate if candidate > now else candidate.replace(day=candidate.day + 1)
+
+        if schedule_type == "daily":
+            if candidate <= now:
+                candidate = candidate.replace(day=candidate.day + 1)
+            return candidate
+
+        if schedule_type == "weekly":
+            target_dow = (schedule_day or 0)  # 0=Mon..6=Sun
+            days_ahead = (target_dow - now.weekday()) % 7
+            if days_ahead == 0 and candidate <= now:
+                days_ahead = 7
+            from datetime import timedelta
+            candidate += timedelta(days=days_ahead)
+            return candidate
+
+        return candidate
+
+    def create_scheduled_scan(self, target_ip: str, schedule_type: str,
+                              schedule_time: str, target_domain: str = "",
+                              label: str = "", schedule_day: Optional[int] = None) -> Dict:
+        """Create a new recurring scan schedule. Returns the created record dict."""
+        if not is_valid_target(target_ip):
+            raise ValueError(f"Invalid target: {target_ip!r}")
+        if schedule_type not in ("daily", "weekly", "once"):
+            raise ValueError("schedule_type must be 'daily', 'weekly', or 'once'")
+        try:
+            h, m = schedule_time.split(":")
+            assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+        except Exception:
+            raise ValueError("schedule_time must be HH:MM (24-hour)")
+
+        next_run = self._compute_next_run(schedule_type, schedule_time, schedule_day)
+        now_str = datetime.utcnow().isoformat()
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO scheduled_scans
+                    (target_ip, target_domain, label, schedule_type, schedule_time,
+                     schedule_day, status, next_run, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            ''', (target_ip, target_domain or None, label or None,
+                  schedule_type, schedule_time, schedule_day,
+                  next_run.isoformat(), now_str))
+            row_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+            logger.info(f"Scheduled scan #{row_id} created: {target_ip} {schedule_type} @ {schedule_time}")
+            return self.get_scheduled_scan(row_id)
+        except sqlite3.Error as e:
+            logger.error(f"Failed to create scheduled scan: {e}")
+            raise
+
+    def get_scheduled_scan(self, scan_id: int) -> Optional[Dict]:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id,target_ip,target_domain,label,schedule_type,schedule_time,"
+                "schedule_day,status,next_run,last_run,last_session_id,created_at "
+                "FROM scheduled_scans WHERE id=?", (scan_id,)
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                return None
+            keys = ["id","target_ip","target_domain","label","schedule_type","schedule_time",
+                    "schedule_day","status","next_run","last_run","last_session_id","created_at"]
+            return dict(zip(keys, row))
+        except sqlite3.Error as e:
+            logger.error(f"get_scheduled_scan({scan_id}) failed: {e}")
+            return None
+
+    def list_scheduled_scans(self, include_deleted: bool = False) -> List[Dict]:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            where = "" if include_deleted else "WHERE status != 'deleted'"
+            cursor.execute(
+                f"SELECT id,target_ip,target_domain,label,schedule_type,schedule_time,"
+                f"schedule_day,status,next_run,last_run,last_session_id,created_at "
+                f"FROM scheduled_scans {where} ORDER BY created_at DESC"
+            )
+            keys = ["id","target_ip","target_domain","label","schedule_type","schedule_time",
+                    "schedule_day","status","next_run","last_run","last_session_id","created_at"]
+            return [dict(zip(keys, row)) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"list_scheduled_scans failed: {e}")
+            return []
+
+    def update_scheduled_scan_status(self, scan_id: int, status: str) -> bool:
+        """Pause, resume, or soft-delete a scheduled scan."""
+        if status not in ("active", "paused", "deleted"):
+            return False
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE scheduled_scans SET status=? WHERE id=?", (status, scan_id))
+            conn.commit(); conn.close()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"update_scheduled_scan_status failed: {e}")
+            return False
+
+    async def run_due_scheduled_scans(self):
+        """Called by the background scheduler every minute. Fires sessions for any
+        active scheduled scan whose next_run is due. Updates last_run and next_run."""
+        now = datetime.utcnow()
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id,target_ip,target_domain,schedule_type,schedule_time,schedule_day "
+                "FROM scheduled_scans "
+                "WHERE status='active' AND next_run <= ?",
+                (now.isoformat(),)
+            )
+            due = cursor.fetchall()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.error(f"run_due_scheduled_scans DB read failed: {e}")
+            return
+
+        for row in due:
+            scan_id, target_ip, target_domain, sched_type, sched_time, sched_day = row
+            try:
+                session_id = self.create_session(
+                    target_ip=target_ip,
+                    target_domain=target_domain,
+                    session_name=f"sched-{scan_id}",
+                    auto_approve=False,
+                    authorization_confirmed=True   # operator set this up → implicit auth
+                )
+                asyncio.create_task(self.start_reconnaissance(session_id))
+                logger.info(
+                    f"Scheduled scan #{scan_id} fired → session {session_id} "
+                    f"for {target_ip}"
+                )
+
+                next_run = (
+                    None if sched_type == "once"
+                    else self._compute_next_run(sched_type, sched_time, sched_day)
+                )
+                new_status = "deleted" if sched_type == "once" else "active"
+
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE scheduled_scans SET last_run=?, next_run=?, "
+                    "last_session_id=?, status=? WHERE id=?",
+                    (now.isoformat(),
+                     next_run.isoformat() if next_run else None,
+                     session_id, new_status, scan_id)
+                )
+                conn.commit(); conn.close()
+            except Exception as e:
+                logger.error(
+                    f"Scheduled scan #{scan_id} failed to fire (non-fatal): {e}"
+                )
 
     def complete_session(self, session_id: str) -> Dict:
         """Mark a session as completed - persists to DB and updates in-memory state."""
@@ -1531,6 +1947,22 @@ CRITICAL RULE: If a Target Domain is provided ({session.target_domain}), you MUS
                         "source_tool": source_tool, "status": status, "discovered_at": discovered_at
                     })
 
+                # Load credentials found in this session
+                cursor.execute('''
+                    SELECT username, secret, secret_type, service, host, port,
+                           source_command, discovered_at
+                    FROM credentials
+                    WHERE session_id = ?
+                    ORDER BY discovered_at
+                ''', (session_id,))
+                for cred_row in cursor.fetchall():
+                    username, secret, secret_type, service, host, port, source_command, discovered_at = cred_row
+                    session.credentials.append({
+                        "username": username, "secret": secret, "secret_type": secret_type,
+                        "service": service, "host": host, "port": port,
+                        "source_command": source_command, "discovered_at": discovered_at
+                    })
+
                 # Load pending commands into orchestrator's pending_commands dict
                 cursor.execute('''
                     SELECT command_id, command_text, status, risk_level, timestamp
@@ -1649,6 +2081,55 @@ CRITICAL RULE: If a Target Domain is provided ({session.target_domain}), you MUS
             logger.error(f"Failed to build AI memory for session {session_id}: {e}")
             return json.dumps({'error': str(e)})
     
+    def _get_relevant_threat_intel_context(self, session_id: str, max_entries: int = 6) -> str:
+        """Return a compact block of threat-intel cache entries relevant to the services
+        discovered in this session, for injection into AI prompts. Only includes entries
+        whose topic/affected_software/title matches at least one discovered service name.
+        Returns an empty string when nothing relevant is cached (no extra tokens wasted)."""
+        session = self.sessions.get(session_id)
+        if not session or not self.threat_intel_cache:
+            return ""
+
+        service_names = {
+            (s.get("service") or "").strip().lower()
+            for s in session.discovered_services
+            if s.get("service") and s["service"].lower() not in ("unknown", "tcpwrapped", "")
+        }
+        if not service_names:
+            return ""
+
+        relevant = []
+        seen_titles: set = set()
+        for entry in self.threat_intel_cache:
+            title = entry.get("title") or ""
+            if title in seen_titles:
+                continue
+            haystack = " ".join([
+                entry.get("topic") or "", entry.get("affected_software") or "",
+                title, entry.get("description") or ""
+            ]).lower()
+            if any(name in haystack for name in service_names):
+                relevant.append(entry)
+                seen_titles.add(title)
+                if len(relevant) >= max_entries:
+                    break
+
+        if not relevant:
+            return ""
+
+        lines = [
+            "Threat-intel cache (unverified web research — treat as leads, not confirmed facts):"
+        ]
+        for e in relevant:
+            cves = ", ".join(e.get("cve_ids") or []) or "no CVE"
+            sev = e.get("severity") or "?"
+            sw = e.get("affected_software") or ""
+            lines.append(
+                f"  • {e['title']} | CVE: {cves} | severity: {sev}"
+                + (f" | software: {sw}" if sw else "")
+            )
+        return "\n".join(lines)
+
     def _summarize_vulnerabilities(self, session: Session) -> List[Dict]:
         """Compact vulnerability findings for inclusion in AI prompts/memory -
         just the fields useful for deciding what to target next, not full
@@ -1736,6 +2217,7 @@ CRITICAL RULE: If a Target Domain is provided ({session.target_domain}), you MUS
             cursor.execute('DELETE FROM commands WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM evidence WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM vulnerabilities WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM credentials WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
             
             conn.commit()
@@ -1779,6 +2261,7 @@ CRITICAL RULE: If a Target Domain is provided ({session.target_domain}), you MUS
             cursor.execute('DELETE FROM commands')
             cursor.execute('DELETE FROM evidence')
             cursor.execute('DELETE FROM vulnerabilities')
+            cursor.execute('DELETE FROM credentials')
             cursor.execute('DELETE FROM sessions')
             
             conn.commit()

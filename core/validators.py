@@ -23,11 +23,23 @@ _HOSTNAME_RE = re.compile(
 )
 
 
+def is_cidr(value: str) -> bool:
+    """Return True if value is a valid IPv4/IPv6 CIDR network (e.g. 192.168.1.0/24).
+    strict=False so host bits set (192.168.1.5/24) are still accepted."""
+    try:
+        net = ipaddress.ip_network(value.strip(), strict=False)
+        # Reject host addresses presented as plain IPs with no prefix — those
+        # are handled by ip_address() in is_valid_target(). A valid CIDR must
+        # contain a "/" character.
+        return "/" in value
+    except ValueError:
+        return False
+
+
 def is_valid_target(value: Optional[str]) -> bool:
-    """Return True if value is a plain IP address or hostname with no shell
-    metacharacters. This intentionally rejects anything that isn't a clean
-    IP/hostname (no slashes, spaces, semicolons, pipes, backticks, etc.), since
-    target strings get interpolated into shell command strings elsewhere.
+    """Return True if value is a plain IP address, hostname, or CIDR network
+    with no shell metacharacters. CIDR notation (192.168.1.0/24) is now
+    accepted to support subnet-level scanning.
     """
     if not value or not isinstance(value, str):
         return False
@@ -40,6 +52,9 @@ def is_valid_target(value: Optional[str]) -> bool:
         return True
     except ValueError:
         pass
+
+    if is_cidr(value):
+        return True
 
     return bool(_HOSTNAME_RE.match(value))
 
@@ -68,6 +83,13 @@ def is_target_in_scope(target: Optional[str], allowlist_str: Optional[str]) -> b
     except ValueError:
         target_ip = None
 
+    # Handle CIDR target: check that the target subnet is contained within
+    # or equal to at least one allowlist entry.
+    try:
+        target_net = ipaddress.ip_network(target, strict=False) if "/" in target else None
+    except ValueError:
+        target_net = None
+
     target_lower = target.lower()
     for entry in entries:
         if target_ip is not None:
@@ -76,6 +98,15 @@ def is_target_in_scope(target: Optional[str], allowlist_str: Optional[str]) -> b
                     return True
             except ValueError:
                 pass  # entry wasn't an IP/CIDR, fall through to hostname checks
+
+        if target_net is not None:
+            try:
+                allowlist_net = ipaddress.ip_network(entry, strict=False)
+                # Target subnet must be a subnet of (or equal to) the allowlist entry
+                if target_net.subnet_of(allowlist_net):
+                    return True
+            except (ValueError, TypeError):
+                pass
 
         entry_lower = entry.lower()
         if entry_lower == target_lower:

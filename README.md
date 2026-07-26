@@ -121,9 +121,8 @@ KMN-CyberSeek Architecture:
 
 ### Prerequisites
 - Python 3.8+
-- Nmap installed (`brew install nmap` on macOS, `apt install nmap` on Ubuntu)
-- Ollama (for local AI) - [Install Ollama](https://ollama.ai)
-- DeepSeek API key (optional, for cloud AI)
+- Nmap (`apt install nmap` on Kali/Debian)
+- An AI backend — either a remote/local [Ollama](https://ollama.ai) instance **or** a [DeepSeek API key](https://platform.deepseek.com)
 
 ### Step 1: Clone Repository
 ```bash
@@ -131,44 +130,25 @@ git clone https://github.com/KhitMinnyo/KMN-CyberSeek.git
 cd KMN-CyberSeek
 ```
 
-### Step 2: Install Dependencies in Virual environment
+### Step 2: Install Dependencies
 ```bash
-python3 -m venv venv # Creating Virtual Environment
-source venv/bin/activate # Activating virtual environment
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
 ### Step 3: Configure Environment
 ```bash
 cp .env.example .env
-# Edit .env with your settings
+# Open .env and set your AI backend (see "AI Configuration" below)
 ```
 
-### Step 4: Install Ollama (Optional - for local AI only)
-**Note**: This step is ONLY required if you plan to use local AI with Ollama. If you're using DeepSeek API with an API key, you can skip this step.
-
+### Step 4: Start
 ```bash
-# macOS/Linux installation
-curl -fsSL https://ollama.ai/install.sh | sh
-
-# Pull DeepSeek model (choose one)
-ollama pull deepseek-coder
-# OR
-ollama pull deepseek-v2
-```
-
-### Step 5: Start the System
-```bash
-# Easy method: Use the startup script (recommended)
 ./start.sh
-
-# Alternative method: Manual startup in separate terminals
-# Terminal 1: Start FastAPI Backend
-python main.py
-
-# Terminal 2: Start Streamlit Frontend
-streamlit run frontend.py
 ```
+
+That's it. The script creates the venv, installs deps, checks ports, and launches both the FastAPI backend and the Streamlit frontend. Press `Ctrl+C` to stop both.
 
 ## 🚀 Quick Start
 
@@ -204,16 +184,39 @@ streamlit run frontend.py
 
 ## 🔧 Configuration
 
-### AI Provider Options
-1. **Local Ollama** (Default): `provider="local"`
-   - Privacy-focused
-   - No internet required
-   - Use `deepseek-coder` or `deepseek-v2` models
+### AI Configuration
 
-2. **DeepSeek API**: `provider="api"`
-   - Higher performance
-   - Requires API key
-   - Set `DEEPSEEK_API_KEY` in .env
+KMN-CyberSeek supports two AI backends, configured via `.env` or the **Settings** page in the UI.
+
+#### Option A — Remote / local Ollama (default)
+
+Ollama does **not** have to run on the same machine as KMN-CyberSeek. The typical setup is:
+
+| Machine | Role |
+|---|---|
+| Kali Linux (VM / bare-metal) | Runs KMN-CyberSeek (backend + frontend) |
+| Mac M-series (host) | Runs Ollama with your chosen model |
+
+1. On your **Mac**, allow Ollama to accept connections from the network:
+   ```bash
+   OLLAMA_HOST=0.0.0.0 ollama serve
+   ```
+2. In `.env` on Kali, point `OLLAMA_URL` at your Mac's LAN IP:
+   ```env
+   AI_PROVIDER=local
+   OLLAMA_URL=http://192.168.1.50:11434   # ← your Mac's IP
+   OLLAMA_MODEL=deepseek-r1:8b
+   ```
+3. That's all. You can also change these live from the **Settings** page without restarting.
+
+> **Model choice** — any model you have available on the Ollama host works. Security-focused options: `deepseek-r1:8b`, `deepseek-coder-v2`, `DeepHat/DeepHat-V1-7B`.
+
+#### Option B — DeepSeek API
+```env
+AI_PROVIDER=api
+DEEPSEEK_API_KEY=sk-...
+DEEPSEEK_MODEL=deepseek-chat
+```
 
 ### Risk Thresholds
 ```python
