@@ -47,11 +47,11 @@ if ! command -v nmap &> /dev/null; then
     echo "   Install with: brew install nmap (macOS) or apt install nmap (Ubuntu)"
 fi
 
-# Check if Ollama is running (for local AI)
-if ! pgrep -x "ollama" > /dev/null; then
-    echo "⚠️  Warning: Ollama is not running. Local AI features will not work."
-    echo "   Start Ollama with: ollama serve"
-fi
+# Check OLLAMA_URL - could be local or a remote machine (e.g. Mac M-series)
+OLLAMA_URL_VAL=$(grep -m1 "^OLLAMA_URL=" .env 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+OLLAMA_URL_VAL="${OLLAMA_URL_VAL:-http://localhost:11434}"
+echo "ℹ️  AI engine URL: ${OLLAMA_URL_VAL}"
+echo "   (Change OLLAMA_URL in .env to point to a remote Ollama instance if needed)"
 
 # Create .env file if it doesn't exist
 if [ ! -f ".env" ]; then
@@ -61,14 +61,23 @@ if [ ! -f ".env" ]; then
     # DO NOT exit here. Let the script continue.
 fi
 
-# Check if ports are available
+# Check if ports are available (works on Kali/Debian with ss, falls back to lsof)
+_port_in_use() {
+    if command -v ss &>/dev/null; then
+        ss -tlnp | grep -q ":$1 "
+    elif command -v lsof &>/dev/null; then
+        lsof -Pi :"$1" -sTCP:LISTEN -t >/dev/null 2>&1
+    else
+        return 1  # can't check, proceed anyway
+    fi
+}
+
 echo "🔍 Checking port availability..."
-if lsof -Pi :8000 -sTCP:LISTEN -t >/dev/null ; then
+if _port_in_use 8000; then
     echo "❌ Port 8000 (FastAPI) is already in use"
     exit 1
 fi
-
-if lsof -Pi :8501 -sTCP:LISTEN -t >/dev/null ; then
+if _port_in_use 8501; then
     echo "❌ Port 8501 (Streamlit) is already in use"
     exit 1
 fi

@@ -299,6 +299,17 @@ def resume_session(session_id: str):
     return None
 
 
+def get_credentials_api(session_id: str):
+    """Fetch captured credentials for a session from the backend."""
+    try:
+        response = api_session.get(f"{API_BASE}/sessions/{session_id}/credentials", timeout=5)
+        if response.status_code == 200:
+            return response.json().get("credentials", [])
+    except Exception as e:
+        logger.error(f"Failed to get credentials: {e}")
+    return []
+
+
 def start_threat_intel_research(topic: str):
     """Kick off AI-directed open-web research for a topic."""
     try:
@@ -320,6 +331,45 @@ def get_threat_intel(topic: str = None):
     except Exception as e:
         logger.error(f"Failed to get threat intel: {e}")
     return []
+
+
+def get_stats_api():
+    try:
+        r = api_session.get(f"{API_BASE}/stats", timeout=5)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        logger.error(f"get_stats_api: {e}")
+    return None
+
+
+def get_schedules_api():
+    try:
+        r = api_session.get(f"{API_BASE}/schedules", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("schedules", [])
+    except Exception as e:
+        logger.error(f"get_schedules_api: {e}")
+    return []
+
+
+def create_schedule_api(payload: dict):
+    try:
+        r = api_session.post(f"{API_BASE}/schedules", json=payload, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        return {"error": r.json().get("detail", r.text)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def update_schedule_status_api(scan_id: int, status: str):
+    try:
+        r = api_session.patch(f"{API_BASE}/schedules/{scan_id}", params={"status": status}, timeout=5)
+        return r.status_code == 200
+    except Exception as e:
+        logger.error(f"update_schedule_status: {e}")
+        return False
 
 
 def get_session_history():
@@ -374,8 +424,10 @@ def main():
         # Navigation menu
         selected = option_menu(
             menu_title="Navigation",
-            options=["Dashboard", "New Session", "Active Sessions", "Command Console", "Threat Intel", "History", "Settings"],
-            icons=["speedometer2", "plus-circle", "list-task", "terminal", "search", "clock-history", "gear"],
+            options=["Dashboard", "New Session", "Active Sessions", "Command Console",
+                     "Threat Intel", "Schedules", "History", "Settings"],
+            icons=["speedometer2", "plus-circle", "list-task", "terminal",
+                   "search", "calendar-check", "clock-history", "gear"],
             menu_icon="cast",
             default_index=0,
             styles={
@@ -419,7 +471,7 @@ def main():
         - Real-time monitoring
         - Manual approval workflow
         
-        **Version:** 1.0.0
+        **Version:** 2.0.0
         """)
     
     # Check if force navigation to active sessions is requested
@@ -438,6 +490,8 @@ def main():
             show_command_console()
         elif selected == "Threat Intel":
             show_threat_intel()
+        elif selected == "Schedules":
+            show_schedules()
         elif selected == "History":
             show_history()
         elif selected == "Settings":
@@ -445,143 +499,105 @@ def main():
 
 
 def show_dashboard():
-    """Dashboard page."""
+    """Dashboard — live metrics + charts from /api/stats."""
     st.markdown("<h1 class='main-header'>📊 Dashboard</h1>", unsafe_allow_html=True)
-    
+
     if not check_backend_health():
         st.error("Backend is not available. Please start the FastAPI server.")
         return
-    
-    # Get sessions data
-    sessions = get_sessions()
-    
-    # Overall statistics
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Total Sessions", len(sessions))
-    
-    with col2:
-        active_sessions = len([s for s in sessions if s.get('status') not in ['completed', 'failed']])
-        st.metric("Active Sessions", active_sessions)
-    
-    with col3:
-        scanning_sessions = len([s for s in sessions if s.get('status') == 'scanning'])
-        st.metric("Scanning Now", scanning_sessions)
-    
-    with col4:
-        pending_commands = len(st.session_state.pending_commands)
-        st.metric("Pending Commands", pending_commands)
-    
-    st.markdown("---")
-    
-    # Recent activity
-    st.markdown("<h3 class='sub-header'>📈 Recent Activity</h3>", unsafe_allow_html=True)
-    
-    if not sessions:
-        st.info("No active sessions. Create a new session to get started.")
+
+    stats = get_stats_api()
+    sessions = get_sessions()  # active in-memory sessions
+
+    # ── Top metrics row ────────────────────────────────────────────────────
+    vuln = stats.get("vuln_distribution", {}) if stats else {}
+    status_dist = stats.get("status_distribution", {}) if stats else {}
+
+    total_sessions = sum(status_dist.values()) if status_dist else len(sessions)
+    total_vulns = sum(vuln.values())
+    scanning_now = len([s for s in sessions if s.get("status") == "scanning"])
+    pending_cmds = len(st.session_state.get("pending_commands", []))
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Total Sessions", total_sessions)
+    m2.metric("Active In-Memory", len(sessions))
+    m3.metric("Scanning Now", scanning_now)
+    m4.metric("Pending Approvals", pending_cmds)
+    m5.metric("Total Vulns", total_vulns)
+    m6.metric("Credentials Found", stats.get("credentials_total", 0) if stats else 0)
+
+    st.divider()
+
+    if not stats:
+        st.warning("Could not load stats from backend.")
+        return
+
+    # ── Charts row 1: vuln distribution + status breakdown ────────────────
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("#### Vulnerability Distribution")
+        vuln_labels = ["High", "Medium", "Low", "Info"]
+        vuln_values = [vuln.get("high", 0), vuln.get("medium", 0), vuln.get("low", 0), vuln.get("info", 0)]
+        if any(vuln_values):
+            import pandas as pd
+            df_vuln = pd.DataFrame({"Risk": vuln_labels, "Count": vuln_values})
+            st.bar_chart(df_vuln.set_index("Risk"))
+        else:
+            st.info("No vulnerability data yet.")
+
+    with c2:
+        st.markdown("#### Session Status Breakdown")
+        if status_dist:
+            import pandas as pd
+            df_status = pd.DataFrame(
+                {"Status": list(status_dist.keys()), "Count": list(status_dist.values())}
+            )
+            st.bar_chart(df_status.set_index("Status"))
+        else:
+            st.info("No session data yet.")
+
+    # ── Charts row 2: sessions per day timeline ───────────────────────────
+    st.markdown("#### Sessions Per Day (Last 14 Days)")
+    spd = stats.get("sessions_per_day", [])
+    if spd:
+        import pandas as pd
+        from datetime import datetime, timedelta
+
+        # Fill in missing days so the timeline is continuous
+        all_days = {
+            (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d"): 0
+            for i in range(13, -1, -1)
+        }
+        for row in spd:
+            all_days[row["day"]] = row["count"]
+        df_spd = pd.DataFrame({"Date": list(all_days.keys()), "Sessions": list(all_days.values())})
+        st.bar_chart(df_spd.set_index("Date"))
     else:
-        # Create tabs for different views
-        tab1, tab2, tab3 = st.tabs(["Session Overview", "Quick Actions", "System Status"])
-        
-        with tab1:
-            # Display session cards
-            for session in sessions:
-                with st.container():
-                    status = session.get('status', 'unknown')
-                    status_class = f"status-{status}"
+        st.info("No session timeline data yet.")
 
-                    st.markdown(f"""
-                    <div class='session-card'>
-                        <div style='display: flex; justify-content: space-between; align-items: center;'>
-                            <div>
-                                <h4 style='margin: 0;'>Session: {session['session_id']}</h4>
-                                <p style='margin: 0; color: #666;'>Target: {session['target_ip']}</p>
-                            </div>
-                            <span class='status-badge {status_class}'>{status.upper()}</span>
-                        </div>
-                        <div style='margin-top: 1rem;'>
-                            <p style='margin: 0;'><strong>Stage:</strong> {session.get('current_stage', 'N/A')}</p>
-                            <p style='margin: 0;'><strong>Hosts Found:</strong> {session.get('discovered_hosts_count', 0)}</p>
-                            <p style='margin: 0;'><strong>Services Found:</strong> {session.get('discovered_services_count', 0)}</p>
-                            <p style='margin: 0;'><strong>Commands Executed:</strong> {session.get('commands_executed_count', 0)}</p>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    # Native Streamlit button for View Details
-                    if st.button("View Details", key=f"view_{session['session_id']}"):
-                        st.session_state.selected_session = session['session_id']
-                        st.session_state.force_nav_to_active = True
-                        st.success("Redirecting to Active Sessions...")
-                        st.rerun()
+    # ── Top targets table ────────────────────────────────────────────────
+    top_targets = stats.get("top_targets", [])
+    if top_targets:
+        st.markdown("#### Top Scanned Targets")
+        import pandas as pd
+        df_top = pd.DataFrame(top_targets)
+        df_top.columns = ["Target", "Session Count"]
+        st.dataframe(df_top, use_container_width=True, hide_index=True)
 
-        with tab2:
-            st.markdown("### ⚡ Quick Actions")
-            
-            # Quick session controls
-            if st.session_state.selected_session:
-                session_details = get_session_details(st.session_state.selected_session)
-                if session_details:
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        if st.button("🔄 Refresh Session", use_container_width=True):
-                            st.rerun()
-                        
-                        if st.button("📊 Generate Report", use_container_width=True):
-                            st.info("Report generation feature coming soon...")
-                    
-                    with col2:
-                        if st.button("🚫 Stop Session", use_container_width=True):
-                            st.warning("Session stop feature coming soon...")
-                        
-                        if st.button("📋 View Evidence", use_container_width=True):
-                            st.info("Evidence viewer coming soon...")
-            
-            # Quick command input
-            st.markdown("### 💻 Quick Command")
-            quick_command = st.text_input("Enter command to execute:", placeholder="nmap -sV 192.168.1.1")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                auto_approve = st.checkbox("Auto-approve (low risk only)")
-            with col2:
-                if st.button("▶️ Execute", use_container_width=True) and quick_command and st.session_state.selected_session:
-                    result = execute_command(st.session_state.selected_session, quick_command, auto_approve)
-                    if result:
-                        st.success(f"Command submitted: {result.get('status')}")
-                    else:
-                        st.error("Failed to execute command")
-        
-        with tab3:
-            st.markdown("### 🖥️ System Status")
-            
-            # Backend status
-            backend_status = {
-                "API Server": "Running" if check_backend_health() else "Stopped",
-                "Database": "Connected",
-                "AI Engine": "Local (Ollama)",
-                "Scanner": "Ready",
-                "WebSocket": "Active"
-            }
-            
-            for component, status in backend_status.items():
-                status_icon = "✅" if "Running" in status or "Connected" in status or "Ready" in status else "❌"
-                st.markdown(f"{status_icon} **{component}:** {status}")
-            
-            # Resource usage (mock data for now)
-            st.markdown("### 📊 Resource Usage")
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("CPU", "15%", "2%")
-            
-            with col2:
-                st.metric("Memory", "42%", "-3%")
-            
-            with col3:
-                st.metric("Disk", "28%", "1%")
+    # ── System status ────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### System Status")
+    components = {
+        "API Server": ("Running", True),
+        "Database": ("Connected", True),
+        "AI Engine": ("Local (Ollama)", True),
+        "Scanner": ("Ready", True),
+    }
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    for col, (name, (label, ok)) in zip([sc1, sc2, sc3, sc4], components.items()):
+        icon = "🟢" if ok else "🔴"
+        col.markdown(f"{icon} **{name}**  \n{label}")
     
 def show_new_session():
     """New session creation page."""
@@ -598,9 +614,10 @@ def show_new_session():
         
         with col1:
             target_ip = st.text_input(
-                "Target IP Address / Domain *",
-                placeholder="192.168.1.1 or example.com",
-                help="Enter the target IP address or domain name"
+                "Target IP / Domain / Subnet *",
+                placeholder="192.168.1.1  or  example.com  or  192.168.1.0/24",
+                help="Single IP, hostname, or CIDR subnet (e.g. 192.168.1.0/24). "
+                     "For subnets, a ping sweep runs first to discover live hosts."
             )
         
         with col2:
@@ -793,8 +810,9 @@ def display_session_details(session_details: Dict):
     st.markdown("---")
     
     # Session tabs
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["📊 Overview", "🔍 Scan Results", "🛡️ Vulnerabilities", "🤖 AI Decisions", "⚡ Commands", "📁 Evidence"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        ["📊 Overview", "🔍 Scan Results", "🛡️ Vulnerabilities", "🤖 AI Decisions",
+         "⚡ Commands", "📁 Evidence", "🔑 Credentials"]
     )
 
     with tab1:
@@ -814,6 +832,9 @@ def display_session_details(session_details: Dict):
 
     with tab6:
         show_evidence(session_details)
+
+    with tab7:
+        show_credentials(session_details)
 
 
 def show_session_overview(session_details: Dict):
@@ -850,6 +871,20 @@ def show_session_overview(session_details: Dict):
             st.rerun()
     elif status in ["scanning", "analyzing", "executing"]:
         st.button(f"⏳ {status.title()} in progress...", disabled=True, use_container_width=True)
+        # Live output - poll the backend for streaming command output
+        if status == "executing":
+            try:
+                live_resp = api_session.get(f"{API_BASE}/sessions/{session_id}/live_output", timeout=3)
+                if live_resp.status_code == 200:
+                    live_data = live_resp.json()
+                    if live_data.get("is_live") and live_data.get("live_output"):
+                        st.markdown("##### 📡 Live Output (streaming)")
+                        st.markdown(
+                            f"<div class='terminal-output'>{live_data['live_output']}</div>",
+                            unsafe_allow_html=True
+                        )
+            except Exception:
+                pass
     else:
         # Only show resume for ready, error, completed
         if st.button("▶️ Force AI Analysis / Resume", type="primary", use_container_width=True):
@@ -857,6 +892,16 @@ def show_session_overview(session_details: Dict):
             st.success("Waking up AI...")
             time.sleep(1)
             st.rerun()
+
+    # Report download
+    report_url = f"{API_BASE}/sessions/{session_id}/report"
+    st.markdown(
+        f'<a href="{report_url}" target="_blank" download>'
+        f'<button style="background:#1565C0;color:white;border:none;padding:0.5rem 1.2rem;'
+        f'border-radius:4px;cursor:pointer;width:100%;margin-bottom:0.5rem">📄 Download DOCX Report</button>'
+        f'</a>',
+        unsafe_allow_html=True
+    )
 
     # Add delete button next to Stop Session
     if st.button("🗑️ Delete This Session", type="primary", use_container_width=True):
@@ -1131,25 +1176,79 @@ def show_commands(session_details: Dict):
 
     command_history = session_details.get("commands_executed", [])
 
-    for cmd in command_history:
+    # ── Search / filter bar ────────────────────────────────────────────────
+    sf1, sf2 = st.columns([3, 1])
+    with sf1:
+        search_kw = st.text_input(
+            "🔍 Search commands & output",
+            placeholder="e.g. 80/tcp, login, hydra …",
+            key=f"cmd_search_{session_details.get('session_id', '')}",
+            label_visibility="collapsed",
+        )
+    with sf2:
+        filter_status = st.selectbox(
+            "Status",
+            ["All", "Success", "Failed"],
+            key=f"cmd_filter_{session_details.get('session_id', '')}",
+            label_visibility="collapsed",
+        )
+
+    # Apply filters
+    filtered = command_history
+    if filter_status == "Success":
+        filtered = [c for c in filtered if c.get("success")]
+    elif filter_status == "Failed":
+        filtered = [c for c in filtered if not c.get("success")]
+    if search_kw:
+        kw_lower = search_kw.lower()
+        filtered = [
+            c for c in filtered
+            if kw_lower in (c.get("command") or "").lower()
+            or kw_lower in (c.get("output") or "").lower()
+            or kw_lower in (c.get("error") or "").lower()
+        ]
+
+    st.caption(f"Showing {len(filtered)} / {len(command_history)} commands")
+
+    for cmd in filtered:
         success = cmd.get("success", False)
         status_icon = "✅" if success else "❌"
         status_label = "success" if success else "failed"
         command_preview = cmd.get("command", "Unknown command")
 
-        with st.expander(f"{status_icon} {command_preview[:50]}..."):
+        with st.expander(f"{status_icon} {command_preview[:80]}"):
             st.markdown(f"**Command:** `{command_preview}`")
             st.markdown(f"**Status:** {status_label}")
             st.markdown(f"**Timestamp:** {cmd.get('timestamp', 'Unknown')}")
             st.markdown(f"**Return Code:** {cmd.get('return_code', 'N/A')}")
             st.markdown("**Output:**")
-            st.code(cmd.get("output") or "No stdout captured.", language="text")
+            output_text = cmd.get("output") or "No stdout captured."
+            # Highlight search keyword in displayed output
+            if search_kw and search_kw.lower() in output_text.lower():
+                # Show a snippet around the first match for large outputs
+                idx = output_text.lower().find(search_kw.lower())
+                start = max(0, idx - 200)
+                end = min(len(output_text), idx + 500)
+                snippet = output_text[start:end]
+                if start > 0:
+                    snippet = "…" + snippet
+                if end < len(output_text):
+                    snippet = snippet + "…"
+                st.code(snippet, language="text")
+                if len(output_text) > 700:
+                    with st.expander("Show full output"):
+                        st.code(output_text, language="text")
+            else:
+                st.code(output_text, language="text")
             if cmd.get("error"):
                 st.markdown("**Error:**")
                 st.code(cmd["error"], language="text")
 
-    if not command_history:
-        st.info("No commands have been executed for this session yet.")
+    if not filtered:
+        if search_kw or filter_status != "All":
+            st.info("No commands match the current filter.")
+        else:
+            st.info("No commands have been executed for this session yet.")
 
     st.markdown("---")
     st.markdown("### 💻 Manual Command Execution")
@@ -1494,6 +1593,57 @@ def show_command_console():
                 st.code("sqlmap -u 'http://{target}/page.php?id=1' --batch", language="bash")
 
 
+def show_credentials(session_details: Dict):
+    """🔑 Credentials tab - auto-captured username/secret pairs from tool output."""
+    session_id = session_details.get("session_id")
+    # Prefer fresh API data (captures anything since the report was last fetched)
+    credentials = get_credentials_api(session_id) if session_id else []
+    # Fall back to whatever came with the session_details dict
+    if not credentials:
+        credentials = session_details.get("credentials", [])
+
+    if not credentials:
+        st.info(
+            "No credentials captured yet. Run brute-force tools (hydra, medusa, ncrack, "
+            "crackmapexec) or credential-dump tools and any found username/password pairs "
+            "will appear here automatically."
+        )
+        return
+
+    passwords = [c for c in credentials if c.get("secret_type") != "hash"]
+    hashes = [c for c in credentials if c.get("secret_type") == "hash"]
+
+    st.success(f"🎯 {len(passwords)} password(s) and {len(hashes)} hash(es) captured")
+
+    if passwords:
+        st.markdown("#### 🔓 Cleartext Passwords")
+        for cred in passwords:
+            service = cred.get("service") or "unknown"
+            host = cred.get("host") or ""
+            st.markdown(f"""
+            <div class='command-card high-risk'>
+                <strong>Username:</strong> <code>{cred['username']}</code> &nbsp;
+                <strong>Password:</strong> <code>{cred['secret']}</code><br>
+                <strong>Service:</strong> {service} &nbsp; <strong>Host:</strong> {host}<br>
+                <small>Captured: {cred.get('discovered_at','?')[:19]}</small>
+            </div>
+            """, unsafe_allow_html=True)
+            if cred.get("source_command"):
+                with st.expander("Source command"):
+                    st.code(cred["source_command"], language="bash")
+
+    if hashes:
+        st.markdown("#### 🔒 Hashes (not yet cracked)")
+        for cred in hashes:
+            st.markdown(f"""
+            <div class='command-card medium-risk'>
+                <strong>Username:</strong> <code>{cred['username']}</code><br>
+                <strong>Hash:</strong> <code style='word-break:break-all'>{cred['secret']}</code><br>
+                <small>Captured: {cred.get('discovered_at','?')[:19]}</small>
+            </div>
+            """, unsafe_allow_html=True)
+
+
 def show_threat_intel():
     """Threat Intel page - AI-directed open-web vulnerability research (core/threat_intel.py).
     Builds a shared local reference cache that future pentest sessions automatically
@@ -1562,6 +1712,113 @@ def show_threat_intel():
 
             if f.get("source_url"):
                 st.markdown(f"**Source:** [{f['source_url']}]({f['source_url']})")
+
+
+def show_schedules():
+    """Scheduled / recurring scans management page."""
+    st.title("🕐 Scheduled Scans")
+
+    # ── Create new schedule ────────────────────────────────────────────────
+    with st.expander("➕ Create New Schedule", expanded=False):
+        with st.form("new_schedule_form", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                sched_target = st.text_input("Target (IP / hostname / CIDR)", placeholder="192.168.1.0/24")
+                sched_freq = st.selectbox("Frequency", ["once", "daily", "weekly"])
+            with col2:
+                sched_day = st.selectbox(
+                    "Day of week (weekly only)",
+                    ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+                )
+                sched_hour = st.number_input("Hour (0–23, local server time)", min_value=0, max_value=23, value=2)
+
+            sched_note = st.text_input("Note / label (optional)", placeholder="Nightly prod sweep")
+            submitted = st.form_submit_button("Schedule Scan")
+
+            if submitted:
+                if not sched_target:
+                    st.error("Target is required.")
+                else:
+                    payload = {
+                        "target": sched_target.strip(),
+                        "frequency": sched_freq,
+                        "day_of_week": sched_day if sched_freq == "weekly" else None,
+                        "hour_of_day": int(sched_hour),
+                        "note": sched_note.strip() or None,
+                    }
+                    result = create_schedule_api(payload)
+                    if "error" in result:
+                        st.error(f"Failed: {result['error']}")
+                    else:
+                        st.success(f"✅ Schedule created (ID {result.get('scan_id', '?')})")
+                        st.rerun()
+
+    st.divider()
+
+    # ── List existing schedules ────────────────────────────────────────────
+    schedules = get_schedules_api()
+
+    if not schedules:
+        st.info("No scheduled scans yet. Create one above.")
+        return
+
+    # Metrics row
+    active_count = sum(1 for s in schedules if s.get("status") == "active")
+    paused_count = sum(1 for s in schedules if s.get("status") == "paused")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total Schedules", len(schedules))
+    m2.metric("Active", active_count)
+    m3.metric("Paused", paused_count)
+
+    st.divider()
+
+    for sched in schedules:
+        sid = sched.get("scan_id") or sched.get("id")
+        target = sched.get("target", "—")
+        freq = sched.get("frequency", "—")
+        day = sched.get("day_of_week") or "—"
+        hour = sched.get("hour_of_day", 0)
+        status = sched.get("status", "active")
+        next_run = sched.get("next_run_at") or "—"
+        last_run = sched.get("last_run_at") or "never"
+        note = sched.get("note") or ""
+
+        label = f"[{status.upper()}] {target}  •  {freq}"
+        if note:
+            label += f"  •  {note}"
+
+        with st.expander(label, expanded=False):
+            c1, c2 = st.columns(2)
+            c1.markdown(f"**Target:** `{target}`")
+            c1.markdown(f"**Frequency:** {freq}" + (f" ({day})" if freq == "weekly" else ""))
+            c1.markdown(f"**Hour:** {hour:02d}:00")
+            c2.markdown(f"**Status:** `{status}`")
+            c2.markdown(f"**Next run:** {next_run}")
+            c2.markdown(f"**Last run:** {last_run}")
+
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                if status == "active":
+                    if st.button("⏸ Pause", key=f"pause_{sid}"):
+                        if update_schedule_status_api(sid, "paused"):
+                            st.success("Paused.")
+                            st.rerun()
+                        else:
+                            st.error("Failed to pause.")
+                else:
+                    if st.button("▶ Resume", key=f"resume_{sid}"):
+                        if update_schedule_status_api(sid, "active"):
+                            st.success("Resumed.")
+                            st.rerun()
+                        else:
+                            st.error("Failed to resume.")
+            with btn_col2:
+                if st.button("🗑 Delete", key=f"del_sched_{sid}"):
+                    if update_schedule_status_api(sid, "deleted"):
+                        st.success("Deleted.")
+                        st.rerun()
+                    else:
+                        st.error("Failed to delete.")
 
 
 def show_history():

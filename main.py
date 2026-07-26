@@ -17,14 +17,14 @@ from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 import uvicorn
 
 from ai.connector import KMN_AI_Connector
 from core.orchestrator import Orchestrator
 from core.scanner import Scanner
-from core.validators import is_valid_target
+from core.validators import is_valid_target, is_cidr
 
 # Configure logging
 logging.basicConfig(
@@ -55,8 +55,9 @@ _OPEN_PATHS = {"/", "/health", "/api/docs", "/api/redoc", "/api/openapi.json"}
 
 app = FastAPI(
     title="KMN-CyberSeek API",
+    on_startup=[],   # populated below after orchestrator is built
     description="AI-Driven Autonomous Red Team Operator Backend",
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
@@ -104,10 +105,33 @@ async def broadcast_message(message_type: str, data: Dict):
         except Exception as e:
             logger.error(f"Failed to send message to WebSocket: {e}")
 
+
+# Wire the broadcast function into the orchestrator so execute_command can stream
+# live output chunks to WebSocket clients (see core/orchestrator.py execute_command).
+orchestrator.broadcast_callback = broadcast_message
+
+
+# --- Background scheduler for recurring scans ----------------------------------
+async def _scheduler_loop():
+    """Tick every 60 seconds, fire any scheduled scans that are due."""
+    while True:
+        try:
+            await orchestrator.run_due_scheduled_scans()
+        except Exception as e:
+            logger.error(f"Scheduler loop error (non-fatal): {e}")
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def _start_scheduler():
+    asyncio.create_task(_scheduler_loop())
+    logger.info("Background scan scheduler started (60s tick)")
+
+
 # Pydantic Models
 class TargetRequest(BaseModel):
     """Target input model."""
-    ip: str = Field(..., description="Target IP address or domain")
+    ip: str = Field(..., description="Target IP address, hostname, or CIDR subnet (e.g. 192.168.1.0/24)")
     domain: Optional[str] = Field(None, description="Optional domain name")
     session_name: Optional[str] = Field(None, description="Custom session name")
     auto_approve: bool = Field(False, description="Auto-approve low/medium risk commands")
@@ -153,6 +177,16 @@ class VulnersSettings(BaseModel):
     """Vulners API key update model (optional CVE enrichment - see core/cve_lookup.py)."""
     api_key: str = ""
 
+class ScheduledScanRequest(BaseModel):
+    """Create or update a scheduled recurring scan."""
+    target_ip: str = Field(..., description="Target IP, hostname, or CIDR subnet")
+    target_domain: str = Field("", description="Optional target domain")
+    label: str = Field("", description="Human-readable label for this schedule")
+    schedule_type: str = Field(..., description="'daily', 'weekly', or 'once'")
+    schedule_time: str = Field(..., description="HH:MM (24h UTC) when the scan should run")
+    schedule_day: Optional[int] = Field(None, description="0=Mon..6=Sun; only for 'weekly'")
+
+
 class ThreatIntelRequest(BaseModel):
     """Request to research a topic on the open web (see core/threat_intel.py)."""
     topic: str = Field(..., min_length=1, max_length=200, description="Topic to research, e.g. 'Apache httpd' or 'latest critical CVEs'")
@@ -163,7 +197,7 @@ async def root():
     """Root endpoint with API information."""
     return {
         "name": "KMN-CyberSeek",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "operational",
         "endpoints": ["/api/docs", "/api/start", "/api/sessions", "/api/ws"],
         "description": "AI-Driven Autonomous Red Team Operator"
@@ -268,6 +302,76 @@ async def get_pending_commands(session_id: str):
     }
 
 
+@app.get("/api/sessions/{session_id}/report")
+async def download_session_report(session_id: str):
+    """Generate and download a DOCX penetration-test report for a session.
+    Requires python-docx (pip install python-docx). Returns the file directly
+    so the browser/client downloads it immediately."""
+    try:
+        report_data = orchestrator.get_session_report(session_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    try:
+        from core.report_generator import generate_report
+    except ImportError as e:
+        raise HTTPException(
+            status_code=501,
+            detail=f"Report generation unavailable: {e}. Install python-docx."
+        )
+
+    try:
+        import tempfile, os
+        out_dir = tempfile.gettempdir()
+        out_path = os.path.join(out_dir, f"kmn_report_{session_id[:12]}.docx")
+        generate_report(report_data, output_path=out_path)
+    except Exception as e:
+        logger.error(f"Report generation failed for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {e}")
+
+    filename = f"kmn_report_{session_id[:12]}.docx"
+    return FileResponse(
+        path=out_path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@app.get("/api/schedules")
+async def list_schedules():
+    """List all non-deleted scheduled scans."""
+    return {"schedules": orchestrator.list_scheduled_scans(), "count": len(orchestrator.list_scheduled_scans())}
+
+
+@app.post("/api/schedules")
+async def create_schedule(req: ScheduledScanRequest):
+    """Create a new recurring scan schedule."""
+    try:
+        record = orchestrator.create_scheduled_scan(
+            target_ip=req.target_ip,
+            target_domain=req.target_domain,
+            label=req.label,
+            schedule_type=req.schedule_type,
+            schedule_time=req.schedule_time,
+            schedule_day=req.schedule_day
+        )
+        return {"status": "created", "schedule": record}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/schedules/{scan_id}")
+async def update_schedule_status(scan_id: int, status: str):
+    """Pause, resume, or delete a scheduled scan. status: active|paused|deleted"""
+    ok = orchestrator.update_scheduled_scan_status(scan_id, status)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Invalid scan_id or status")
+    return {"status": "updated", "scan_id": scan_id, "new_status": status}
+
+
 @app.get("/api/sessions/history")
 async def list_session_history():
     """List ALL sessions from the database including completed and failed ones.
@@ -276,6 +380,76 @@ async def list_session_history():
     summary rows - no scan blobs or command output."""
     history = orchestrator.get_session_history()
     return {"sessions": history, "count": len(history)}
+
+
+@app.get("/api/stats")
+async def get_aggregate_stats():
+    """Aggregate statistics for the dashboard charts.
+    Queries the DB directly so it captures all sessions, not just in-memory active ones.
+    Returns vuln distribution, sessions-per-day (last 14 days), status breakdown,
+    and top targeted hosts."""
+    import sqlite3 as _sqlite3
+    from datetime import datetime as _dt, timedelta as _td
+
+    db_path = orchestrator.db_path
+
+    def _q(sql, params=()):
+        conn = _sqlite3.connect(db_path)
+        conn.row_factory = _sqlite3.Row
+        try:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    # Vulnerability risk distribution
+    vuln_dist = _q(
+        "SELECT risk_level, COUNT(*) as count FROM vulnerabilities GROUP BY risk_level"
+    )
+    vuln_by_risk = {r["risk_level"]: r["count"] for r in vuln_dist}
+
+    # Sessions per day – last 14 days
+    sessions_per_day = _q(
+        """SELECT date(created_at) as day, COUNT(*) as count
+           FROM sessions
+           WHERE created_at >= date('now', '-14 days')
+           GROUP BY day
+           ORDER BY day"""
+    )
+
+    # Status breakdown
+    status_dist = _q(
+        "SELECT status, COUNT(*) as count FROM sessions GROUP BY status"
+    )
+    status_by_name = {r["status"]: r["count"] for r in status_dist}
+
+    # Top 5 most-scanned targets
+    top_targets = _q(
+        """SELECT target_ip, COUNT(*) as count FROM sessions
+           GROUP BY target_ip ORDER BY count DESC LIMIT 5"""
+    )
+
+    # Credentials found total
+    cred_rows = _q("SELECT COUNT(*) as cnt FROM credentials")
+    cred_total = cred_rows[0]["cnt"] if cred_rows else 0
+
+    # Commands executed total
+    cmd_rows = _q("SELECT COUNT(*) as cnt FROM commands")
+    cmd_total = cmd_rows[0]["cnt"] if cmd_rows else 0
+
+    return {
+        "vuln_distribution": {
+            "high": vuln_by_risk.get("high", 0),
+            "medium": vuln_by_risk.get("medium", 0),
+            "low": vuln_by_risk.get("low", 0),
+            "info": vuln_by_risk.get("info", 0),
+        },
+        "sessions_per_day": sessions_per_day,
+        "status_distribution": status_by_name,
+        "top_targets": top_targets,
+        "credentials_total": cred_total,
+        "commands_total": cmd_total,
+    }
 
 
 @app.post("/api/sessions/{session_id}/complete")
@@ -304,6 +478,28 @@ async def get_vulnerabilities(session_id: str):
         "vulnerabilities": vulnerabilities,
         "count": len(vulnerabilities)
     }
+
+
+@app.get("/api/sessions/{session_id}/live_output")
+async def get_live_output(session_id: str):
+    """Return the current streaming command output buffer for a session.
+    Empty string when no command is running. Streamlit frontend polls this at
+    5-second intervals to display live output while a long scan is in progress."""
+    if not orchestrator.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    output = orchestrator.get_live_output(session_id)
+    return {"session_id": session_id, "live_output": output, "is_live": bool(output)}
+
+
+@app.get("/api/sessions/{session_id}/credentials")
+async def get_credentials(session_id: str):
+    """Get all credentials captured for a session (username/password pairs extracted
+    automatically from tool output by core/orchestrator.py _extract_and_store_credentials).
+    Secrets are returned as-is - protect this endpoint with the X-API-Key header."""
+    if not orchestrator.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    creds = orchestrator.get_credentials(session_id)
+    return {"session_id": session_id, "credentials": creds, "count": len(creds)}
 
 
 @app.post("/api/threat-intel/research")
