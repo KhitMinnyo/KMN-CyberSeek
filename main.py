@@ -136,6 +136,12 @@ class TargetRequest(BaseModel):
     session_name: Optional[str] = Field(None, description="Custom session name")
     auto_approve: bool = Field(False, description="Auto-approve low/medium risk commands")
     max_auto_depth: int = Field(5, description="Maximum consecutive auto-executed commands")
+    objective: Optional[str] = Field(
+        None,
+        description="Engagement goal in plain language (e.g. 'get root', 'reach Domain Admin', "
+                    "'find and confirm SQL injection'). Drives the strategist's plan and "
+                    "'objective complete' detection. Defaults to reaching highest privilege.",
+    )
     authorization_confirmed: bool = Field(
         ..., description="Must be true: operator confirms they own this target or have explicit permission to test it"
     )
@@ -282,7 +288,8 @@ async def start_session(target_request: TargetRequest):
             session_name=target_request.session_name,
             auto_approve=target_request.auto_approve,
             max_auto_depth=target_request.max_auto_depth,
-            authorization_confirmed=target_request.authorization_confirmed
+            authorization_confirmed=target_request.authorization_confirmed,
+            objective=target_request.objective,
         )
 
         # Start initial reconnaissance
