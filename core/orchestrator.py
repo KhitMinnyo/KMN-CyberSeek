@@ -4,6 +4,7 @@ Manages penetration testing sessions, coordinates between AI, scanner, and execu
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -83,6 +84,21 @@ _EXPLOIT_SIGNALS = (
     "dumped",                   # credential dump tools (secretsdump, mimikatz)
     "flag{",                    # CTF-style flag capture
 )
+
+
+def _is_local_target(target: str) -> bool:
+    """Return True if target is a private, loopback, or link-local IP address.
+
+    Local/private IPs should not be passed to internet-based OSINT tools
+    (Google Dorks, crt.sh, theHarvester, Shodan, etc.) — those calls would
+    be useless at best and leak the engagement target at worst.
+    Returns False for hostnames/domains (they are always treated as public).
+    """
+    try:
+        addr = ipaddress.ip_address(target)
+        return addr.is_private or addr.is_loopback or addr.is_link_local
+    except ValueError:
+        return False  # it's a hostname — treat as public
 
 
 def _cvss_to_risk(score: Optional[float]) -> str:
@@ -986,8 +1002,20 @@ class Orchestrator:
         logger.info(f"Starting AI analysis for {session_id}")
         
         try:
+            _local_target = _is_local_target(session.target_ip)
+            _target_type_note = (
+                "TARGET TYPE: PRIVATE/LOCAL IP — Do NOT use internet-based OSINT tools "
+                "(Google Dorks, crt.sh, theHarvester, Shodan, whois online, Certificate Transparency). "
+                "These will find nothing and waste time. For OSINT/recon on a local target use only: "
+                "nmap ping-sweep, arp-scan, netdiscover, snmp-check, onesixtyone, nbtscan, enum4linux."
+                if _local_target else
+                "TARGET TYPE: PUBLIC HOST/DOMAIN — full OSINT methodology applies."
+            )
+
             # Prepare context for AI with CRITICAL RULE about domain usage
             context = f"""
+{_target_type_note}
+
 {self._plan_context_block(session)}
 === TARGET CONTEXT ===
 Target IP:     {session.target_ip}
@@ -1059,9 +1087,11 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             _cmd = ai_response.suggested_command
             logger.info(f"AI analysis completed for {session_id}, suggested command: {_cmd}")
 
-            # Kick off execution or queue for approval based on auto_approve + risk.
+            # Kick off execution or queue for approval.
+            # When auto_approve=True the session operator has accepted full autonomy —
+            # treat it identically to FULL_AUTO_MODE (all risk levels auto-execute).
             if _cmd:
-                if FULL_AUTO_MODE or (session.auto_approve and ai_response.risk_level in ["low", "medium"]):
+                if FULL_AUTO_MODE or session.auto_approve:
                     logger.info(f"Auto-executing initial command for session {session_id}: {_cmd[:100]}")
                     asyncio.create_task(self.execute_command(session_id, _cmd))
                 else:
@@ -1440,10 +1470,22 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # Build AI memory for context
             memory_string = self._build_ai_memory(session_id)
             
+            _local_target = _is_local_target(session.target_ip)
+            _target_type_note = (
+                "TARGET TYPE: PRIVATE/LOCAL IP — Do NOT use internet-based OSINT tools "
+                "(Google Dorks, crt.sh, theHarvester, Shodan, whois online, Certificate Transparency). "
+                "These will find nothing and waste time. For OSINT/recon on a local target use only: "
+                "nmap ping-sweep, arp-scan, netdiscover, snmp-check, onesixtyone, nbtscan, enum4linux."
+                if _local_target else
+                "TARGET TYPE: PUBLIC HOST/DOMAIN — full OSINT methodology applies."
+            )
+
             # Prepare context for AI - DIFFERENT PROMPT FOR ERROR RECOVERY VS SUCCESS
             if error:
                 # SELF-HEALING / ERROR RECOVERY MODE
                 context = f"""
+{_target_type_note}
+
 {self._plan_context_block(session)}
 ### SELF-HEALING / ERROR RECOVERY REQUIRED ###
 The previous command failed with an error. Please analyze why it failed and suggest a corrected command.
@@ -1487,6 +1529,8 @@ IMPORTANT: Your suggested command MUST be non-interactive and follow all methodo
             else:
                 # NORMAL SUCCESS MODE - analyze output for next steps
                 context = f"""
+{_target_type_note}
+
 {self._plan_context_block(session)}
 Previous command executed: {command}
 
@@ -1594,26 +1638,18 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         f"[{ai_response.risk_level}] command: {ai_response.suggested_command[:100]}"
                     )
             else:
+                # auto_approve=True means the operator accepts full autonomy for this
+                # session — execute all risk levels (same behaviour as FULL_AUTO_MODE).
                 should_auto_execute = (
                     session.auto_approve and
                     bool(ai_response.suggested_command) and
-                    ai_response.risk_level in ["low", "medium"] and
                     (ai_response.confidence is None or ai_response.confidence >= 0.5)
                 )
 
-                # HARD SAFETY BACKSTOP: never trust the AI's self-reported risk_level alone
-                # for a zero-human-review auto-execution. Re-check against the deterministic
-                # keyword list (requires_approval) and the tool allowlist. This defends against
-                # both AI misclassification and indirect prompt injection from adversarial
-                # target/tool output steering the suggested_command.
-                if should_auto_execute and self.requires_approval(ai_response.suggested_command):
-                    logger.warning(
-                        f"Session {session_id}: AI marked '{ai_response.suggested_command[:60]}' as "
-                        f"{ai_response.risk_level}, but it matches high-risk keywords. Overriding to manual approval."
-                    )
-                    should_auto_execute = False
-                    self.queue_for_approval(session_id, ai_response.suggested_command)
-
+                # Allowlist backstop: block commands that are structurally dangerous
+                # regardless of auto_approve (e.g. interactive shells with no args).
+                # Note: requires_approval() keyword gate is NOT applied here when
+                # auto_approve=True — the operator has explicitly accepted all risk levels.
                 if should_auto_execute:
                     allowlist_rejection = is_allowlisted_command(ai_response.suggested_command)
                     if allowlist_rejection:
@@ -1624,15 +1660,16 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         should_auto_execute = False
                         self.queue_for_approval(session_id, ai_response.suggested_command)
 
-                # Safety mechanism: Check if we've hit max auto depth without critical findings
+                # Depth counter gate: pause auto-execution and require one manual
+                # approval after max_auto_depth consecutive non-critical commands.
+                # This gives the operator a periodic checkpoint even in full-auto mode.
                 if should_auto_execute and session.auto_depth_counter >= session.max_auto_depth:
                     logger.warning(
                         f"Session {session_id} reached max auto-execution depth ({session.max_auto_depth}). "
-                        f"Requiring human approval."
+                        f"Pausing for one manual approval checkpoint."
                     )
                     should_auto_execute = False
                     self.queue_for_approval(session_id, ai_response.suggested_command)
-                    logger.info(f"Command queued for manual approval due to max auto depth: {ai_response.suggested_command[:100]}...")
             
             if should_auto_execute:
                 # Check for critical findings in output to reset auto depth counter

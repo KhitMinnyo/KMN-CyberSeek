@@ -1,7 +1,7 @@
 # KMN-CyberSeek: AI-Driven Autonomous Red Team Operator
 
 ![KMN-CyberSeek Banner](https://img.shields.io/badge/KMN--CyberSeek-AI%20Red%20Team%20Operator-blue)
-![Version](https://img.shields.io/badge/Version-2.0.0-brightgreen)
+![Version](https://img.shields.io/badge/Version-2.1.0-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-green)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104%2B-blue)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.28%2B-red)
