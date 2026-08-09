@@ -25,18 +25,37 @@ def test_rejects_bare_python_and_bash():
 
 def test_requires_approval_high_risk_keywords():
     orch = make_orch()
-    # These each contain a keyword from Orchestrator.requires_approval's list
-    # (hydra, exploit, sudo, hashcat, crack, meterpreter).
-    for cmd in ["hydra -l root ssh://x", "msfconsole -x 'use exploit/x'",
-                "sudo -l", "hashcat -m 0 h w", "crackmapexec smb x",
-                "meterpreter session"]:
-        assert orch.requires_approval(cmd) is True, cmd
+    # Each command contains a genuine high-risk keyword; all must require approval.
+    for cmd in [
+        "hydra -l root ssh://x",          # hydra (word boundary)
+        "msfconsole -x 'use exploit/x'",  # msfconsole (exact) + exploit (word)
+        "sudo -l",                         # sudo (word boundary)
+        "hashcat -m 0 h w",               # hashcat (word boundary)
+        "crackmapexec smb x",             # crackmapexec (exact substr)
+        "meterpreter session",             # meterpreter (exact substr)
+    ]:
+        assert orch.requires_approval(cmd) is True, f"Expected True for: {cmd!r}"
 
 
 def test_low_risk_no_approval():
     orch = make_orch()
     assert orch.requires_approval("nmap -sV 10.0.0.5") is False
     assert orch.requires_approval("whatweb http://x") is False
+
+
+def test_no_false_positives_on_recon_tools():
+    """Fix #4: word-boundary matching must not block recon tools whose names
+    contain high-risk substrings (e.g. 'su' in 'subfinder')."""
+    orch = make_orch()
+    false_positive_candidates = [
+        "subfinder -d example.com",           # 'su' inside 'subfinder'
+        "gobuster dir -u http://x -x php",    # no match
+        "curl -sk https://x/password-reset",  # 'password' not in list
+        "nmap --script ssh-auth-methods 10.x",# 'su' → no match (word boundary)
+        "nuclei -u https://x/assume-role",    # 'su' inside 'assume'
+    ]
+    for cmd in false_positive_candidates:
+        assert orch.requires_approval(cmd) is False, f"False positive for: {cmd!r}"
 
 
 # ── prompt-injection defense in the prompts ──────────────────────────────────
