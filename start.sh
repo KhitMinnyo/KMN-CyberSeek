@@ -47,11 +47,7 @@ if ! command -v nmap &> /dev/null; then
     echo "   Install with: brew install nmap (macOS) or apt install nmap (Ubuntu)"
 fi
 
-# Check OLLAMA_URL - could be local or a remote machine (e.g. Mac M-series)
-OLLAMA_URL_VAL=$(grep -m1 "^OLLAMA_URL=" .env 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
-OLLAMA_URL_VAL="${OLLAMA_URL_VAL:-http://localhost:11434}"
-echo "ℹ️  AI engine URL: ${OLLAMA_URL_VAL}"
-echo "   (Change OLLAMA_URL in .env to point to a remote Ollama instance if needed)"
+echo "ℹ️  AI is optional at startup — configure it from Settings in the web UI."
 
 # Create .env file if it doesn't exist
 if [ ! -f ".env" ]; then
@@ -61,26 +57,26 @@ if [ ! -f ".env" ]; then
     # DO NOT exit here. Let the script continue.
 fi
 
-# Check if ports are available (works on Kali/Debian with ss, falls back to lsof)
-_port_in_use() {
+# Kill whatever is holding a port, then return 0 (so startup continues).
+_kill_port() {
+    local port=$1 pids
     if command -v ss &>/dev/null; then
-        ss -tlnp | grep -q ":$1 "
+        pids=$(ss -tlnp | awk -F'pid=' "/\":${port} \"/{print \$2}" | cut -d',' -f1)
     elif command -v lsof &>/dev/null; then
-        lsof -Pi :"$1" -sTCP:LISTEN -t >/dev/null 2>&1
-    else
-        return 1  # can't check, proceed anyway
+        pids=$(lsof -ti :"$port" 2>/dev/null)
+    fi
+    if [ -n "$pids" ]; then
+        echo "⚠️  Port $port in use — stopping existing process(es): $pids"
+        kill -TERM $pids 2>/dev/null
+        sleep 1
+        kill -KILL $pids 2>/dev/null
+        sleep 1
     fi
 }
 
 echo "🔍 Checking port availability..."
-if _port_in_use 8000; then
-    echo "❌ Port 8000 (FastAPI) is already in use"
-    exit 1
-fi
-if _port_in_use 8501; then
-    echo "❌ Port 8501 (Streamlit) is already in use"
-    exit 1
-fi
+_kill_port 8000
+_kill_port 8501
 
 # Start services
 echo "🚀 Starting services..."
@@ -131,9 +127,9 @@ echo "   Health Check: http://localhost:8000/health"
 echo ""
 echo "📋 Quick Start:"
 echo "   1. Open http://localhost:8501 in your browser"
-echo "   2. Create a new session with target IP/domain"
-echo "   3. Monitor AI-driven reconnaissance and attacks"
-echo "   4. Approve high-risk commands as needed"
+echo "   2. Go to ⚙️  Settings → AI Configuration to set up Ollama or DeepSeek API"
+echo "   3. Create a new session with target IP/domain"
+echo "   4. Monitor AI-driven reconnaissance and approve high-risk commands"
 echo ""
 echo "🛑 Press Ctrl+C to stop all services"
 
