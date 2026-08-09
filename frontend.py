@@ -417,11 +417,29 @@ def main():
         status_color = "🟢" if backend_healthy else "🔴"
         status_text = "Connected" if backend_healthy else "Disconnected"
         st.markdown(f"### Backend Status: {status_color} {status_text}")
-        
+
         if not backend_healthy:
             st.warning("Backend is not available. Please start the FastAPI server.")
             if st.button("🔄 Retry Connection"):
                 st.rerun()
+
+        # AI status — check .env directly (no extra API call needed)
+        if backend_healthy:
+            _ev = dotenv_values(".env")
+            _provider   = _ev.get("AI_PROVIDER", "").strip()
+            _api_key    = _ev.get("DEEPSEEK_API_KEY", "").strip()
+            _ollama_mdl = _ev.get("OLLAMA_MODEL", "").strip()
+            _bad = ("your_deepseek", "your-api-key", "sk-xxx", "placeholder",
+                    "example", "changeme", "insert_key")
+            _api_ok   = (_provider == "api" and _api_key and len(_api_key) > 10
+                         and not any(p in _api_key.lower() for p in _bad))
+            _local_ok = (_provider == "local" and bool(_ollama_mdl))
+            _ai_ready = _api_ok or _local_ok
+            ai_icon   = "🟢" if _ai_ready else "🟡"
+            ai_label  = "AI Ready" if _ai_ready else "AI Not Configured"
+            st.markdown(f"**AI Status:** {ai_icon} {ai_label}")
+            if not _ai_ready:
+                st.caption("⚙️ Settings → AI Configuration")
         
         # Navigation menu
         selected = option_menu(
