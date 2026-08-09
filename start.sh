@@ -54,12 +54,10 @@ if [ ! -f ".env" ]; then
     echo "🔧 Creating .env file..."
     cp .env.example .env 2>/dev/null || touch .env
     echo "⚠️  .env created. You can configure AI settings directly from the Web UI."
-    # DO NOT exit here. Let the script continue.
 fi
 
-# Kill whatever is holding a port.  After killing, verify the port is free.
-# System services (e.g. Apache on :8000) restart themselves — we detect that
-# and tell the user exactly what to do instead of silently failing later.
+# ── Port helpers ─────────────────────────────────────────────────────────────
+
 _port_in_use() {
     if command -v ss &>/dev/null; then
         ss -tlnp | grep -q ":$1 "
@@ -70,54 +68,72 @@ _port_in_use() {
     fi
 }
 
-_kill_port() {
+# Try to kill whoever holds $port (e.g. our own old process).
+_try_kill_port() {
     local port=$1 pids
-    _port_in_use "$port" || return 0          # already free, nothing to do
-
+    _port_in_use "$port" || return 0
     if command -v ss &>/dev/null; then
         pids=$(ss -tlnp | awk -F'pid=' "/\":${port} \"/{print \$2}" | cut -d',' -f1)
     elif command -v lsof &>/dev/null; then
         pids=$(lsof -ti :"$port" 2>/dev/null)
     fi
-
     if [ -n "$pids" ]; then
         echo "⚠️  Port $port in use — stopping existing process(es): $pids"
-        kill -TERM $pids 2>/dev/null
-        sleep 1
-        kill -KILL $pids 2>/dev/null
-        sleep 1
-    fi
-
-    # Verify port is actually free now (system service may have restarted)
-    if _port_in_use "$port"; then
-        echo ""
-        echo "❌  Port $port is still in use after kill attempt."
-        echo "    A system service (e.g. Apache2) may be holding it."
-        echo ""
-        echo "    Fix options:"
-        echo "      1. Stop the service:  sudo systemctl stop apache2"
-        echo "         (or whichever service owns :$port)"
-        echo "      2. Use a different port: add BACKEND_PORT=8080 to .env"
-        echo ""
-        exit 1
+        kill -TERM $pids 2>/dev/null; sleep 1
+        kill -KILL $pids 2>/dev/null; sleep 1
     fi
 }
 
-# Read ports from .env (fallback: 6000 / 8501)
+# Find the first free port at or above $1.
+_find_free_port() {
+    local port=$1
+    while _port_in_use "$port" 2>/dev/null; do
+        port=$((port + 1))
+    done
+    echo "$port"
+}
+
+# Update or append KEY=VALUE in .env (removes duplicate lines first).
+_set_env_val() {
+    local key=$1 val=$2
+    # Remove all existing lines for this key, then append the new value
+    sed -i "/^${key}=/d" .env 2>/dev/null
+    echo "${key}=${val}" >> .env
+}
+
+# ── Read preferred ports from .env ───────────────────────────────────────────
+
 BACKEND_PORT=$(grep -m1 "^BACKEND_PORT=" .env 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'" | tr -d ' ')
 BACKEND_PORT="${BACKEND_PORT:-6000}"
 FRONTEND_PORT=$(grep -m1 "^FRONTEND_PORT=" .env 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'" | tr -d ' ')
 FRONTEND_PORT="${FRONTEND_PORT:-8501}"
-export BACKEND_PORT FRONTEND_PORT
+
+# ── Resolve free ports (auto-switch if system service holds preferred port) ──
 
 echo "🔍 Checking port availability..."
-_kill_port "$BACKEND_PORT"
-_kill_port "$FRONTEND_PORT"
 
-# Start services
+_try_kill_port "$BACKEND_PORT"
+if _port_in_use "$BACKEND_PORT"; then
+    FREE=$(_find_free_port 6000)
+    echo "ℹ️  Port $BACKEND_PORT held by a system service — auto-switching to $FREE"
+    _set_env_val "BACKEND_PORT" "$FREE"
+    BACKEND_PORT=$FREE
+fi
+
+_try_kill_port "$FRONTEND_PORT"
+if _port_in_use "$FRONTEND_PORT"; then
+    FREE=$(_find_free_port 8501)
+    echo "ℹ️  Port $FRONTEND_PORT held by a system service — auto-switching to $FREE"
+    _set_env_val "FRONTEND_PORT" "$FREE"
+    FRONTEND_PORT=$FREE
+fi
+
+export BACKEND_PORT FRONTEND_PORT
+
+# ── Start services ────────────────────────────────────────────────────────────
+
 echo "🚀 Starting services..."
 
-# Function to handle cleanup
 cleanup() {
     echo "🛑 Shutting down services..."
     kill $BACKEND_PID 2>/dev/null
@@ -125,8 +141,6 @@ cleanup() {
     echo "✅ Services stopped"
     exit 0
 }
-
-# Trap SIGINT (Ctrl+C) and SIGTERM
 trap cleanup SIGINT SIGTERM
 
 # Start FastAPI backend
