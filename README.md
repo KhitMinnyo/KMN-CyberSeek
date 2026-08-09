@@ -154,6 +154,30 @@ All session data (scan results, commands, credentials, vulnerabilities, strategi
 - Sessions with **no scan data** restart reconnaissance from scratch.
 - The "Resume" button in the dashboard also manually triggers this for any active session.
 
+### Threat Intel — Background Knowledge Base
+
+The **Threat Intel** page is a standalone research tool that builds a local vulnerability knowledge base over time. It is completely separate from live pentest sessions — it never issues shell commands and cannot affect an active engagement.
+
+**What it does:**
+
+1. You enter a free-text topic — a software name, version, or CVE query (e.g., `Apache httpd 2.4.49`, `WordPress 5.8 plugins`, `latest critical CVEs 2026`).
+2. KMN-CyberSeek searches DuckDuckGo for `{topic} CVE vulnerability`, fetches up to 5 result pages, and sends each page's plain text to the AI using an isolated extraction prompt.
+3. The AI extracts structured findings — CVE IDs, title, description, affected software, severity — and stores them in the local SQLite `threat_intel_cache` table.
+
+**How sessions use the cache:**
+
+Every time a session finishes its initial Nmap scan and discovers services, the orchestrator automatically cross-references those service names (Apache, MySQL, OpenSSH, etc.) against everything in the cache. Matching entries are added to the session's **Vulnerabilities** tab with `source_tool: threat-intel-cache` and `status: unverified`.
+
+At the same time, the orchestrator fires background research tasks for each newly discovered service that isn't already in the cache — so the knowledge base grows automatically without manual input.
+
+**Important: all findings are unverified by design.** Web pages can be wrong, outdated, or deliberately misleading (SEO spam, prompt-injection text aimed at the extraction AI). Treat every Threat Intel result as a **lead to investigate**, not a confirmed vulnerability. Cross-check CVE IDs against [NVD](https://nvd.nist.gov), [Vulners](https://vulners.com), or [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) before acting.
+
+**What to research:** after a scan reveals services, search for those service names and versions. Example searches:
+- `Apache httpd 2.4.49` — finds CVE-2021-41773 (path traversal RCE)
+- `ProFTPD 1.3.5` — finds mod_copy unauthenticated RCE
+- `OpenSSH 7.2p2` — finds username enumeration CVEs
+- `WordPress 5.8 contact form` — finds plugin-specific vulns
+
 ---
 
 ## 📋 Installation
@@ -301,8 +325,10 @@ msfconsole -q -x "use <module>; set RHOSTS <target>; exploit -z"
 | **Evidence** | Structured evidence artefacts (domain recon, OSINT, screenshots) |
 | **Credentials** | Extracted username/secret pairs with source command |
 
-### AI Decisions Tab — Execute Button
-The **Execute this Command** button manually triggers a single AI-suggested command. It appears when `auto_approve=False` (the default). To run commands automatically, enable **Auto-approve** when creating a session or set `FULL_AUTO_MODE=true` in `.env`.
+### AI Decisions Tab
+Shows a compact log of every AI reasoning step. Each row displays the executed command, attack phase, risk level, and result status (✅ success / ❌ failed / ⏳ pending). Expand any row to see full command output. A **Notable Findings** section appears at the top whenever a command's output contains passwords, hashes, CVE mentions, credentials, or shell access indicators.
+
+When **Auto-approve** is enabled (the default when creating a session), commands at all risk levels execute automatically without any manual step. When disabled, commands queue in the **Commands** tab for manual ✅ / ❌ review.
 
 ### Session Timeline
 Tracks the current engagement phase with status icons:
