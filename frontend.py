@@ -410,6 +410,7 @@ def main():
     # Sidebar navigation
     with st.sidebar:
         st.markdown("## 🛡️ KMN-CyberSeek")
+        st.caption("v2.0.0 — AI-Driven Red Team Operator")
         st.markdown("---")
         
         # Backend status

@@ -172,6 +172,12 @@ PHASE 1 — PASSIVE OSINT (zero direct target contact)
   4. theHarvester -d <domain> -l 200 -b google,bing,dnsdumpster,certspotter -f /tmp/harvest_<domain>
   5. Certificate Transparency (effective + passive):
      curl -s "https://crt.sh/?q=%25.<domain>&output=json" | python3 -c "import sys,json; [print(x['name_value']) for x in json.load(sys.stdin)]" 2>/dev/null | sort -u | tee /tmp/crtsh_<domain>.txt
+  6. Google Dorks (passive intelligence, no direct target contact):
+     curl -s "https://www.google.com/search?q=site:<domain>+filetype:pdf+OR+filetype:xlsx+OR+filetype:docx+OR+filetype:pptx" -A "Mozilla/5.0" 2>/dev/null | grep -oP '(?<=href=")[^"]+<domain>[^"]+' | head -20
+     curl -s "https://www.google.com/search?q=site:<domain>+inurl:admin+OR+inurl:login+OR+inurl:portal+OR+inurl:dashboard" -A "Mozilla/5.0" 2>/dev/null | grep -oP 'https?://[^"&]+<domain>[^"&]+' | head -20
+     curl -s "https://www.google.com/search?q=site:<domain>+\"index+of\"+OR+\"parent+directory\"" -A "Mozilla/5.0" 2>/dev/null | grep -oP 'https?://[^"&]+<domain>[^"&]+' | head -20
+     curl -s "https://www.google.com/search?q=\"<domain>\"+ext:sql+OR+ext:bak+OR+ext:env+OR+ext:config+OR+ext:log" -A "Mozilla/5.0" 2>/dev/null | grep -oP 'https?://[^"&]+' | grep -v google | head -20
+     curl -s "https://www.google.com/search?q=site:<domain>+intext:\"password\"+OR+intext:\"api_key\"+OR+intext:\"secret\"" -A "Mozilla/5.0" 2>/dev/null | grep -oP 'https?://[^"&]+<domain>[^"&]+' | head -10
 
 PHASE 2 — ACTIVE SUBDOMAIN ENUMERATION
   1. subfinder -d <domain> -o /tmp/subs_<domain>.txt -silent 2>/dev/null || echo "[subfinder not found, using alternative]"
