@@ -123,7 +123,7 @@ class Session:
         self.current_stage = "reconnaissance"
         # Agentic loop settings
         self.auto_approve = auto_approve
-        self.max_auto_depth = 5  # Maximum consecutive auto-executed commands
+        self.max_auto_depth = 15  # Maximum consecutive auto-executed commands before requiring human review
         self.auto_depth_counter = 0  # Current count of consecutive auto-executed commands
         self.last_auto_success = False  # Track if last auto-execution found something critical
         # Audit trail: operator confirmed authorization to test this target
@@ -1056,12 +1056,17 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             else:
                 session.status = "ready"
             
-            logger.info(f"AI analysis completed for {session_id}, suggested command: {ai_response.suggested_command}")
-            
-            # If low risk, automatically queue for execution
-            if ai_response.risk_level == "low":
-                command_id = self.queue_for_approval(session_id, ai_response.suggested_command)
-                logger.info(f"Low-risk command queued: {command_id}")
+            _cmd = ai_response.suggested_command
+            logger.info(f"AI analysis completed for {session_id}, suggested command: {_cmd}")
+
+            # Kick off execution or queue for approval based on auto_approve + risk.
+            if _cmd:
+                if FULL_AUTO_MODE or (session.auto_approve and ai_response.risk_level in ["low", "medium"]):
+                    logger.info(f"Auto-executing initial command for session {session_id}: {_cmd[:100]}")
+                    asyncio.create_task(self.execute_command(session_id, _cmd))
+                else:
+                    self.queue_for_approval(session_id, _cmd)
+                    logger.info(f"Initial command queued for approval: {_cmd[:100]}")
             
         except Exception as e:
             logger.error(f"AI analysis failed for session {session_id}: {e}")
@@ -1593,7 +1598,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     session.auto_approve and
                     bool(ai_response.suggested_command) and
                     ai_response.risk_level in ["low", "medium"] and
-                    ai_response.confidence and ai_response.confidence > 0.7
+                    (ai_response.confidence is None or ai_response.confidence >= 0.5)
                 )
 
                 # HARD SAFETY BACKSTOP: never trust the AI's self-reported risk_level alone
@@ -1668,7 +1673,13 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         # Mark as approved
         command_data["status"] = "approved"
         command_data["approved_at"] = datetime.now().isoformat()
-        
+
+        # Manual approval is a human override — reset the depth counter so the AI
+        # loop can continue auto-executing from this point instead of stalling.
+        session = self.sessions.get(session_id)
+        if session:
+            session.auto_depth_counter = 0
+
         # Execute the command asynchronously
         asyncio.create_task(self.execute_command(session_id, command_data["command"]))
         
