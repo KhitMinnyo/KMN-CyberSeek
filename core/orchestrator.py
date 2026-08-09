@@ -555,8 +555,10 @@ class Orchestrator:
             else:
                 scan_target = session.target_ip
 
-            # Perform initial Nmap scan - USE FULL SCAN for comprehensive discovery
-            scan_results = await self.scanner.perform_nmap_scan(scan_target, "full")
+            # Initial recon: top-1000-port scan with service detection.
+            # "full" (-p- all 65535 ports) is too slow for internet targets;
+            # the AI will queue deeper scans on interesting ports if needed.
+            scan_results = await self.scanner.perform_nmap_scan(scan_target, "default")
             session.scan_results.append(scan_results)
 
             # Save scan results to database
