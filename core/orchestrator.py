@@ -568,24 +568,11 @@ class Orchestrator:
             # Save scan results to database
             self._save_scan_results(session_id, "nmap_initial", scan_results)
 
-            # Parse scan results
+            # Parse scan results — dedup by IP / (host,port) so a re-scan or
+            # restore never produces duplicate entries in the session lists.
             discovered_hosts = self.scanner.parse_nmap_results(scan_results)
-            session.discovered_hosts.extend(discovered_hosts)
-            
-            # Extract services
-            for host in discovered_hosts:
-                for port in host.get('ports', []):
-                    service = {
-                        'host': host['ip'],
-                        'port': port['port'],
-                        'service': port.get('service', 'unknown'),
-                        'version': port.get('version', ''),
-                        'state': port.get('state', 'open'),
-                        # Explicit test lifecycle: untested -> in_progress ->
-                        # tested -> exploited. Replaces the old substring heuristic.
-                        'test_state': 'untested',
-                    }
-                    session.discovered_services.append(service)
+            self._merge_hosts(session, discovered_hosts)
+            self._merge_services(session, discovered_hosts)
             
             # Update session status
             session.status = "analyzing"
@@ -1728,6 +1715,36 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         
         logger.info(f"Command denied: {command_id}")
     
+    # ── Deduplication helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _merge_hosts(session: "Session", new_hosts: List[Dict]) -> None:
+        """Add hosts to session.discovered_hosts, skipping IPs already present."""
+        existing_ips = {h["ip"] for h in session.discovered_hosts}
+        for host in new_hosts:
+            if host.get("ip") not in existing_ips:
+                session.discovered_hosts.append(host)
+                existing_ips.add(host["ip"])
+
+    @staticmethod
+    def _merge_services(session: "Session", new_hosts: List[Dict]) -> None:
+        """Add services to session.discovered_services, skipping (host,port) pairs
+        already present.  Sets test_state='untested' for brand-new entries."""
+        existing = {(s["host"], s["port"]) for s in session.discovered_services}
+        for host in new_hosts:
+            for port in host.get("ports", []):
+                key = (host["ip"], port["port"])
+                if key not in existing:
+                    session.discovered_services.append({
+                        "host": host["ip"],
+                        "port": port["port"],
+                        "service": port.get("service", "unknown"),
+                        "version": port.get("version", ""),
+                        "state": port.get("state", "open"),
+                        "test_state": "untested",
+                    })
+                    existing.add(key)
+
     def _save_scan_results(self, session_id: str, scan_type: str, scan_data: Dict):
         """Save scan results to database."""
         try:
@@ -2516,21 +2533,13 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         scan_data = json.loads(scan_data_json)
                         session.scan_results.append(scan_data)
                         
-                        # Parse for discovered hosts/services if it's an nmap scan
+                        # Parse for discovered hosts/services if it's an nmap scan.
+                        # Use dedup helpers so multiple nmap_initial rows (e.g.
+                        # from a restart + re-scan) never produce duplicate entries.
                         if scan_type == 'nmap_initial':
                             discovered_hosts = self.scanner.parse_nmap_results(scan_data)
-                            session.discovered_hosts.extend(discovered_hosts)
-                            for host in discovered_hosts:
-                                for port in host.get('ports', []):
-                                    service = {
-                                        'host': host['ip'],
-                                        'port': port['port'],
-                                        'service': port.get('service', 'unknown'),
-                                        'version': port.get('version', ''),
-                                        'state': port.get('state', 'open'),
-                                        'test_state': 'untested',
-                                    }
-                                    session.discovered_services.append(service)
+                            self._merge_hosts(session, discovered_hosts)
+                            self._merge_services(session, discovered_hosts)
                     except json.JSONDecodeError:
                         logger.warning(f"Failed to parse scan data for session {session_id}")
                 
