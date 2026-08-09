@@ -57,20 +57,49 @@ if [ ! -f ".env" ]; then
     # DO NOT exit here. Let the script continue.
 fi
 
-# Kill whatever is holding a port, then return 0 (so startup continues).
+# Kill whatever is holding a port.  After killing, verify the port is free.
+# System services (e.g. Apache on :8000) restart themselves — we detect that
+# and tell the user exactly what to do instead of silently failing later.
+_port_in_use() {
+    if command -v ss &>/dev/null; then
+        ss -tlnp | grep -q ":$1 "
+    elif command -v lsof &>/dev/null; then
+        lsof -Pi :"$1" -sTCP:LISTEN -t >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
 _kill_port() {
     local port=$1 pids
+    _port_in_use "$port" || return 0          # already free, nothing to do
+
     if command -v ss &>/dev/null; then
         pids=$(ss -tlnp | awk -F'pid=' "/\":${port} \"/{print \$2}" | cut -d',' -f1)
     elif command -v lsof &>/dev/null; then
         pids=$(lsof -ti :"$port" 2>/dev/null)
     fi
+
     if [ -n "$pids" ]; then
         echo "⚠️  Port $port in use — stopping existing process(es): $pids"
         kill -TERM $pids 2>/dev/null
         sleep 1
         kill -KILL $pids 2>/dev/null
         sleep 1
+    fi
+
+    # Verify port is actually free now (system service may have restarted)
+    if _port_in_use "$port"; then
+        echo ""
+        echo "❌  Port $port is still in use after kill attempt."
+        echo "    A system service (e.g. Apache2) may be holding it."
+        echo ""
+        echo "    Fix options:"
+        echo "      1. Stop the service:  sudo systemctl stop apache2"
+        echo "         (or whichever service owns :$port)"
+        echo "      2. Use a different port: add BACKEND_PORT=8080 to .env"
+        echo ""
+        exit 1
     fi
 }
 

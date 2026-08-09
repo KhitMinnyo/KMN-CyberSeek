@@ -2307,32 +2307,42 @@ def show_settings():
             maintain_context = st.checkbox("Maintain session context", value=True)
         
         if st.button("💾 Save AI Settings", type="primary"):
-            with st.spinner("Saving configuration..."):
-                payload = {
-                    "provider": ai_provider,
-                    "api_key": api_key if ai_provider == "DeepSeek API" else "",
-                    "model_name": model_name,
-                    "ollama_url": ollama_url if ai_provider == "Local (Ollama)" else "",
-                    "ollama_context_window": ollama_context_window if ai_provider == "Local (Ollama)" else None,
-                }
-                try:
-                    response = api_session.post(f"{API_BASE}/settings/ai", json=payload)
-                    if response.status_code == 200:
-                        info = response.json()
-                        ctx_info = (
-                            f", context: **{info['context_window']:,} tokens**"
-                            if info.get("context_window") else ""
-                        )
-                        st.success(
-                            f"AI settings saved! Now using **{info.get('provider', payload['provider'])}** "
-                            f"with model **{info.get('model', model_name)}**{ctx_info}."
-                        )
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error(f"Failed to save settings: {response.text}")
-                except Exception as e:
-                    st.error(f"Connection error: {e}")
+            if not check_backend_health():
+                st.error(
+                    "⚠️ Backend is not running. Start it first with `./start.sh`, "
+                    "then retry saving settings."
+                )
+            else:
+                with st.spinner("Saving configuration..."):
+                    payload = {
+                        "provider": ai_provider,
+                        "api_key": api_key if ai_provider == "DeepSeek API" else "",
+                        "model_name": model_name,
+                        "ollama_url": ollama_url if ai_provider == "Local (Ollama)" else "",
+                        "ollama_context_window": ollama_context_window if ai_provider == "Local (Ollama)" else None,
+                    }
+                    try:
+                        response = api_session.post(f"{API_BASE}/settings/ai", json=payload)
+                        if response.status_code == 200:
+                            info = response.json()
+                            ctx_info = (
+                                f", context: **{info['context_window']:,} tokens**"
+                                if info.get("context_window") else ""
+                            )
+                            st.success(
+                                f"AI settings saved! Now using **{info.get('provider', payload['provider'])}** "
+                                f"with model **{info.get('model', model_name)}**{ctx_info}."
+                            )
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            try:
+                                detail = response.json().get("detail", response.text)
+                            except Exception:
+                                detail = f"HTTP {response.status_code} — backend may not be running on port 8000"
+                            st.error(f"Failed to save settings: {detail}")
+                    except Exception as e:
+                        st.error(f"Connection error: {e}")
     
     with tab3:
         st.markdown("### 🔒 Security Settings")
