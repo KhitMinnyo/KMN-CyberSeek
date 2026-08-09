@@ -232,7 +232,11 @@ class Orchestrator:
         # Initialize database
         self._init_database()
 
-        # Restore incomplete sessions from database
+        # Restore incomplete sessions from database.
+        # Sessions that were mid-flight (scanning/analyzing/executing) are
+        # queued into self._sessions_to_auto_resume so the caller can restart
+        # their AI loop after the event loop is running (see auto_resume_sessions).
+        self._sessions_to_auto_resume: list = []
         self._restore_sessions()
 
         # Load the threat-intel reference cache
@@ -2639,13 +2643,69 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 # Store session in memory
                 self.sessions[session_id] = session
                 logger.info(f"Restored session {session_id} with {len(session.commands_executed)} commands, {len(session.discovered_services)} services")
-            
+
+                # Queue for auto-resume if the session was mid-flight.
+                # scanning + nmap results exist → skip re-scan, go straight to AI.
+                # analyzing / executing → restart the AI analysis loop.
+                # initialized → nothing to resume (never got started).
+                if status in ("scanning", "analyzing", "executing"):
+                    has_scan_data = bool(session.scan_results or session.discovered_hosts)
+                    self._sessions_to_auto_resume.append({
+                        "session_id": session_id,
+                        "skip_scan": has_scan_data,  # True → jump to AI, False → full recon
+                    })
+
             conn.close()
             logger.info(f"Restored {len(sessions_data)} sessions from database")
             
         except sqlite3.Error as e:
             logger.error(f"Failed to restore sessions from database: {e}")
-    
+
+    async def auto_resume_sessions(self) -> None:
+        """Called once from the FastAPI startup event after the event loop is
+        running.  Resumes any sessions that were mid-flight when the backend
+        last shut down.
+
+        Resume strategy:
+          • skip_scan=True  (session already has nmap data) → jump straight to
+            AI analysis so we don't re-run expensive scans.
+          • skip_scan=False (session was killed before any scan data arrived)
+            → run full start_reconnaissance() from scratch.
+        Nmap scans that were in-flight when the backend died are NOT resumed —
+        they're restarted only when skip_scan is False (i.e. no data was saved).
+        """
+        if not self._sessions_to_auto_resume:
+            return
+
+        logger.info(
+            f"Auto-resuming {len(self._sessions_to_auto_resume)} interrupted session(s)…"
+        )
+        for entry in self._sessions_to_auto_resume:
+            sid        = entry["session_id"]
+            skip_scan  = entry["skip_scan"]
+            session    = self.sessions.get(sid)
+            if not session:
+                continue
+            try:
+                if skip_scan:
+                    # We already have scan data — go straight to AI analysis.
+                    logger.info(
+                        f"Auto-resuming {sid}: scan data found → skipping re-scan, "
+                        "starting AI analysis"
+                    )
+                    session.status = "analyzing"
+                    asyncio.create_task(self._analyze_with_ai(sid))
+                else:
+                    # No scan data at all — restart full reconnaissance.
+                    logger.info(
+                        f"Auto-resuming {sid}: no scan data → restarting reconnaissance"
+                    )
+                    asyncio.create_task(self.start_reconnaissance(sid))
+            except Exception as exc:
+                logger.error(f"Auto-resume failed for session {sid}: {exc}")
+
+        self._sessions_to_auto_resume.clear()
+
     def _create_episode_summary(self, session_id: str) -> str:
         """Build a compact, structured text summary of the last _EPISODE_SIZE
         commands and the current known state.  Called automatically every
