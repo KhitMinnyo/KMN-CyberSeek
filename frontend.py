@@ -485,15 +485,15 @@ def main():
         
         st.markdown("---")
         st.markdown("### ℹ️ About")
-        st.markdown("""
+        st.markdown(f"""
         KMN-CyberSeek is an AI-driven autonomous red team operator.
-        
+
         **Features:**
         - AI-powered reconnaissance
         - Automated attack execution
         - Real-time monitoring
         - Manual approval workflow
-        
+
         **Version:** {APP_VERSION}
         """)
     
