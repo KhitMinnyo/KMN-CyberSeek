@@ -371,16 +371,32 @@ class Scanner:
             # Use Nmap with vulnerability scripts, scoped to known-open ports if given
             port_flag = f"-p {','.join(str(int(p)) for p in ports)} " if ports else ""
             cmd = f"nmap -sV {port_flag}--script vuln {shlex.quote(target)}"
-            
+
             process = await asyncio.create_subprocess_shell(
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd="/tmp"
             )
-            
-            stdout, stderr = await process.communicate()
-            
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=SCAN_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.communicate()
+                logger.warning(
+                    f"Vulnerability scan timed out after {SCAN_TIMEOUT}s for {target} — "
+                    "continuing without NSE vuln findings"
+                )
+                return {
+                    "target": target,
+                    "success": False,
+                    "error": f"Scan timed out after {SCAN_TIMEOUT}s",
+                    "vulnerabilities": [],
+                }
+
             if process.returncode != 0:
                 logger.error(f"Vulnerability scan failed: {stderr.decode()}")
                 return {
@@ -389,12 +405,12 @@ class Scanner:
                     "error": stderr.decode(),
                     "vulnerabilities": []
                 }
-            
+
             raw_output = stdout.decode()
             vulnerabilities = self._parse_vulnerability_output(raw_output)
-            
+
             logger.info(f"Vulnerability scan completed for {target}, found {len(vulnerabilities)} issues")
-            
+
             return {
                 "target": target,
                 "success": True,
@@ -402,7 +418,7 @@ class Scanner:
                 "vulnerabilities": vulnerabilities,
                 "timestamp": self._get_timestamp()
             }
-            
+
         except Exception as e:
             logger.error(f"Vulnerability scan error for {target}: {e}")
             return {

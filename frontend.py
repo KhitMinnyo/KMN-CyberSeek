@@ -1097,11 +1097,16 @@ def show_vulnerabilities(session_details: Dict):
     vulnerabilities = session_details.get("vulnerabilities", [])
 
     if not vulnerabilities:
-        st.info(
-            "No vulnerability findings yet. These are populated automatically after the "
-            "initial scan completes (Nmap vuln scripts, plus CVE lookups if a Vulners API "
-            "key is configured in Settings)."
-        )
+        session_status = session_details.get("status", "")
+        if session_status in ("scanning", "analyzing", "executing"):
+            st.info("⏳ Vulnerability scan in progress — findings will appear here automatically.")
+        else:
+            st.info(
+                "No vulnerability findings for this target. This is normal if the target has "
+                "no services vulnerable to Nmap NSE vuln scripts. "
+                "CVE enrichment via Vulners requires `VULNERS_API_KEY` in Settings. "
+                "Use the **Threat Intel** tab to manually research specific services."
+            )
         return
 
     high = [v for v in vulnerabilities if v.get("risk_level") == "high"]
