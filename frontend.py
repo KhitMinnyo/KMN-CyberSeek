@@ -4,6 +4,8 @@ KMN-CyberSeek Streamlit Frontend
 Web dashboard for AI-driven autonomous red team operations.
 """
 
+APP_VERSION = "2.1.0"
+
 import json
 import logging
 import os
@@ -410,7 +412,7 @@ def main():
     # Sidebar navigation
     with st.sidebar:
         st.markdown("## 🛡️ KMN-CyberSeek")
-        st.caption("v2.1.0 — AI-Driven Red Team Operator")
+        st.caption(f"v{APP_VERSION} — AI-Driven Red Team Operator")
         st.markdown("---")
         
         # Backend status
@@ -492,7 +494,7 @@ def main():
         - Real-time monitoring
         - Manual approval workflow
         
-        **Version:** 2.0.0
+        **Version:** {APP_VERSION}
         """)
     
     # Check if force navigation to active sessions is requested
