@@ -1396,8 +1396,8 @@ def show_commands(session_details: Dict):
     col1, col2, col3 = st.columns([1, 1, 2])
     
     with col1:
-        auto_approve = st.checkbox("Auto-approve")
-    
+        auto_approve = st.checkbox("Auto-approve", value=True)
+
     with col2:
         if st.button("▶️ Execute", use_container_width=True) and manual_command:
             result = execute_command(session_details["session_id"], manual_command, auto_approve)
@@ -1408,9 +1408,9 @@ def show_commands(session_details: Dict):
             else:
                 st.success("Command executed successfully.")
             st.rerun()
-    
+
     with col3:
-        st.caption("Note: High-risk commands will always require manual approval.")
+        st.caption("Uncheck Auto-approve to queue for manual review before execution.")
 
 
 def show_evidence(session_details: Dict):
@@ -1659,7 +1659,8 @@ def show_command_console():
             )
 
         with col2:
-            auto_approve = st.checkbox("Auto-approve", help="Auto-approve low-risk commands")
+            auto_approve = st.checkbox("Auto-approve", value=True,
+                                       help="Execute immediately. Uncheck to queue for manual approval.")
 
         # Execute button
         execute_clicked = st.button("▶️ Execute Command", type="primary", use_container_width=True)
