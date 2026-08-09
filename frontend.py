@@ -1155,44 +1155,85 @@ def show_vulnerabilities(session_details: Dict):
 
 
 def show_ai_decisions(session_details: Dict):
-    """Show AI decisions."""
+    """Show AI command log — compact list with notable findings surfaced."""
     ai_decisions = session_details.get("ai_decisions", [])
+    commands_executed = session_details.get("commands_executed", [])
 
     if not ai_decisions:
         st.info("AI decisions will appear here as the AI analyzes scan results.")
         return
 
-    for index, decision in enumerate(ai_decisions, start=1):
-        suggested_command = decision.get("suggested_command") or "No command suggested"
-        risk_level = str(decision.get("risk_level", "unknown")).lower()
-        confidence = decision.get("confidence")
-        timestamp = decision.get("timestamp", "Unknown time")
-        context = decision.get("context", "analysis")
-        session_id = session_details.get("session_id")
+    # Build lookup: command string -> execution record
+    cmd_lookup: Dict = {}
+    for rec in commands_executed:
+        key = (rec.get("command") or "").strip()
+        if key:
+            cmd_lookup[key] = rec
 
-        with st.expander(f"🤖 Decision {index} • {timestamp} • {risk_level.upper()}"):
-            st.markdown(f"**Context:** {context}")
-            st.markdown("**Reasoning:**")
-            st.code(decision.get("reasoning", "No reasoning available."), language="text")
-            st.markdown("**Suggested Command:**")
-            st.code(suggested_command, language="bash")
-            st.markdown(f"**Risk Level:** {risk_level.upper()}")
-            if confidence is not None:
-                st.markdown(f"**Confidence:** {confidence}")
-            
-            # Add "Execute this Command" button
-            if suggested_command and suggested_command != "No command suggested" and session_id:
-                if st.button("🚀 Execute this Command", key=f"execute_ai_cmd_{session_id}_{index}", use_container_width=True):
-                    with st.spinner(f"Executing AI-suggested command..."):
-                        result = execute_command(session_id, suggested_command, False)
-                        if result:
-                            if result.get('status') == 'pending_approval':
-                                st.warning(f"Command requires approval. Command ID: {result.get('command_id')}")
-                            else:
-                                st.success(f"Command executed successfully!")
-                            st.rerun()
-                        else:
-                            st.error("Failed to execute command.")
+    _notable_kw = [
+        "password", "credential", "hash", "token", "secret", "api_key",
+        "vulnerability", "cve-", "found", "admin", "root", "shell",
+        "exploit", "login successful", "authentication success",
+    ]
+
+    risk_icon = {"low": "🟢", "medium": "🟡", "high": "🔴"}
+
+    # --- Notable findings (top) -------------------------------------------
+    notable = []
+    for dec in ai_decisions:
+        cmd = (dec.get("suggested_command") or "").strip()
+        rec = cmd_lookup.get(cmd)
+        if rec and rec.get("success"):
+            out = ((rec.get("output") or "") + (rec.get("error") or "")).lower()
+            if any(kw in out for kw in _notable_kw):
+                notable.append((dec, rec))
+
+    if notable:
+        st.markdown("### 🔍 Notable Findings")
+        for dec, rec in notable:
+            cmd = dec.get("suggested_command", "")
+            out = (rec.get("output") or "").strip()
+            phase = dec.get("attack_phase", dec.get("context", ""))
+            st.markdown(f"**`{cmd}`** — _{phase}_")
+            st.code(out[:2000] + ("…" if len(out) > 2000 else ""), language="text")
+        st.markdown("---")
+
+    # --- Compact command log ------------------------------------------------
+    st.markdown(f"### 🤖 AI Command Log &nbsp; `{len(ai_decisions)} decisions`")
+
+    for index, decision in enumerate(reversed(ai_decisions), start=1):
+        cmd = (decision.get("suggested_command") or "no command").strip()
+        risk = str(decision.get("risk_level", "unknown")).lower()
+        phase = decision.get("attack_phase", decision.get("context", "—"))
+        ts = (decision.get("timestamp") or "")[:16].replace("T", " ")
+        icon = risk_icon.get(risk, "⚪")
+
+        rec = cmd_lookup.get(cmd)
+        if rec is None:
+            status_icon = "⏳"
+        elif rec.get("success"):
+            status_icon = "✅"
+        else:
+            status_icon = "❌"
+
+        label = (
+            f"{status_icon} {icon} `{cmd[:90]}{'…' if len(cmd) > 90 else ''}`"
+            f" — {phase} &nbsp; `{ts}`"
+        )
+        with st.expander(label, expanded=False):
+            st.caption(f"Risk: **{risk.upper()}**  ·  Phase: **{phase}**  ·  {ts}")
+            if rec is not None:
+                out = (rec.get("output") or "").strip()
+                if out:
+                    st.code(out[:3000] + ("…" if len(out) > 3000 else ""), language="text")
+                elif rec.get("error"):
+                    st.code((rec.get("error") or "")[:1000], language="text")
+                else:
+                    st.caption("_No output captured._")
+            else:
+                st.caption("_Pending execution._")
+            with st.expander("🧠 AI Reasoning", expanded=False):
+                st.text(decision.get("reasoning") or "No reasoning recorded.")
 
 
 def show_commands(session_details: Dict):
