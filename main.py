@@ -318,6 +318,20 @@ async def list_sessions():
     sessions = orchestrator.get_sessions()
     return {"sessions": sessions, "count": len(sessions)}
 
+
+@app.get("/api/sessions/history")
+async def list_session_history():
+    """List ALL sessions from the database including completed and failed ones.
+    Unlike GET /api/sessions (active-only, in-memory), this queries the DB
+    directly so historical sessions survive backend restarts. Returns lightweight
+    summary rows - no scan blobs or command output.
+
+    IMPORTANT: this route MUST be registered before /api/sessions/{session_id}
+    so FastAPI does not treat 'history' as a session_id."""
+    history = orchestrator.get_session_history()
+    return {"sessions": history, "count": len(history)}
+
+
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str):
     """Get details of a specific session."""
@@ -473,16 +487,6 @@ async def update_schedule_status(scan_id: int, status: str):
     if not ok:
         raise HTTPException(status_code=400, detail="Invalid scan_id or status")
     return {"status": "updated", "scan_id": scan_id, "new_status": status}
-
-
-@app.get("/api/sessions/history")
-async def list_session_history():
-    """List ALL sessions from the database including completed and failed ones.
-    Unlike GET /api/sessions (active-only, in-memory), this queries the DB
-    directly so historical sessions survive backend restarts. Returns lightweight
-    summary rows - no scan blobs or command output."""
-    history = orchestrator.get_session_history()
-    return {"sessions": history, "count": len(history)}
 
 
 @app.get("/api/stats")
@@ -671,6 +675,35 @@ async def resume_session(session_id: str):
     orchestrator.sessions[session_id].status = "analyzing"
     asyncio.create_task(orchestrator._analyze_with_ai(session_id))
     return {"status": "success", "message": "AI analysis resumed"}
+
+
+@app.post("/api/sessions/{session_id}/restart")
+async def restart_session(session_id: str):
+    """Restart a session from scratch — clears all scan data and re-runs nmap + AI.
+    Unlike /resume (which continues from existing data), /restart discards all
+    discovered hosts, services, commands, AI decisions, and vulnerabilities and
+    runs the full reconnaissance pipeline again."""
+    if session_id not in orchestrator.sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = orchestrator.sessions[session_id]
+
+    # Clear all accumulated data so the restart is truly from zero
+    session.discovered_hosts.clear()
+    session.discovered_services.clear()
+    session.scan_results.clear()
+    session.commands_executed.clear()
+    session.ai_decisions.clear()
+    session.vulnerabilities.clear()
+    session.credentials.clear()
+    session.auto_depth_counter = 0
+    session.current_stage = "reconnaissance"
+    session.status = "scanning"
+
+    logger.info(f"Restarting session {session_id} from scratch")
+    asyncio.create_task(orchestrator.start_reconnaissance(session_id))
+    return {"status": "success", "message": "Session restarted from scratch"}
+
 
 @app.get("/api/ollama/models")
 async def list_ollama_models():
