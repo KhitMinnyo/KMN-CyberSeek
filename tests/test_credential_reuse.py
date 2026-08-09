@@ -1,7 +1,11 @@
 """Tests for the deterministic credential-reuse trigger. When a credential is
 found it must be sprayed across OTHER services automatically (not left to the LLM
-to remember), skipping the origin service, deduped, and shell-safe."""
+to remember), skipping the origin service, deduped, and shell-safe.
 
+Also covers Fix #1: john _CRED_PATTERNS must have 2 groups so match.group(2) works."""
+
+import re
+from core.orchestrator import _CRED_PATTERNS
 from tests._helpers import make_orch, make_session, svc
 
 
@@ -60,6 +64,25 @@ def test_hash_uses_pass_the_hash_only():
     assert all("-H " in q for q in orch.queued)
     # SSH cannot use an NTLM hash — must not appear
     assert not any(q.startswith("sshpass") for q in orch.queued)
+
+
+def test_cred_patterns_all_have_two_groups():
+    """Fix #1: every pattern in _CRED_PATTERNS must have exactly 2 capture groups
+    (username, secret) so match.group(2) never raises IndexError."""
+    for pattern in _CRED_PATTERNS:
+        assert pattern.groups == 2, (
+            f"Pattern {pattern.pattern!r} has {pattern.groups} group(s); expected 2"
+        )
+
+
+def test_john_pattern_extracts_hash_and_password():
+    """Fix #1: verify the john --show pattern actually captures (hash, cracked_pw)."""
+    john_output = "5f4dcc3b5aa765d61d8327deb882cf99 (password123)"
+    john_pattern = _CRED_PATTERNS[-2]   # john is second-to-last
+    m = john_pattern.search(john_output)
+    assert m is not None, "john pattern should match"
+    assert m.group(1) == "5f4dcc3b5aa765d61d8327deb882cf99"
+    assert m.group(2) == "password123"
 
 
 def test_secret_is_shell_quoted():

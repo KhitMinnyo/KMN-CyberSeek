@@ -30,8 +30,8 @@ _CRED_PATTERNS: List[re.Pattern] = [
     re.compile(r'\[\+\]\s+[\w.\-]+\\(\w+):(\S+)', re.IGNORECASE),
     # nmap NSE http-auth-finder / http-brute style: username: admin  password: secret
     re.compile(r'username[:\s]+(\S+)[,\s]+password[:\s]+(\S+)', re.IGNORECASE),
-    # john/hashcat cracked: HASH (PASSWORD) or hash:password
-    re.compile(r'^\S+\s+\((.+?)\)\s*$', re.MULTILINE),   # john --show style
+    # john/hashcat cracked: HASH (PASSWORD) — two groups: (hash, cracked_password)
+    re.compile(r'^(\S+)\s+\((.+?)\)\s*$', re.MULTILINE),  # john --show style
     re.compile(r'^([^:]+):([^:]+):\d+:\d+:::',  re.MULTILINE),  # /etc/shadow dump - user:hash
 ]
 
@@ -65,11 +65,23 @@ _SERVICE_STATE_ORDER: Dict[str, int] = {
 
 # Output signals that a service was not merely probed but actually compromised /
 # yielded sensitive data — used to promote a service straight to 'exploited'.
+#
+# These are intentionally NARROW. Broad words like "password", "hash", "200 ok",
+# and "database" were removed because they appear in normal recon output (web login
+# pages, whatweb CMS detection, HTTP status lines) and would incorrectly mark
+# services as exploited after routine enumeration.
 _EXPLOIT_SIGNALS = (
-    "meterpreter", "session opened", "session 1", "shell opened", "command shell",
-    "uid=", "whoami", "pwn3d", "root@", "administrator", "reverse shell",
-    "password", "credential", "hash", "dumped", "logged in", "authentication successful",
-    "access granted", "200 ok", "database", "flag{",
+    "meterpreter",
+    "session opened",
+    "session 1 opened",
+    "shell opened",
+    "command shell session",
+    "uid=0",                    # root shell (not generic uid=www-data etc.)
+    "pwn3d",                    # crackmapexec success marker
+    "root@",                    # root prompt in captured output
+    "reverse shell",
+    "dumped",                   # credential dump tools (secretsdump, mimikatz)
+    "flag{",                    # CTF-style flag capture
 )
 
 
@@ -259,6 +271,21 @@ class Orchestrator:
                 cursor.execute("ALTER TABLE sessions ADD COLUMN authorization_confirmed BOOLEAN DEFAULT FALSE")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+
+            # Strategic layer columns (Phase 1 — added as migration so existing DBs upgrade).
+            _strategic_cols = [
+                ("objective",              "TEXT DEFAULT ''"),
+                ("strategic_plan",         "TEXT DEFAULT '[]'"),
+                ("reflections",            "TEXT DEFAULT '[]'"),
+                ("objective_progress",     "REAL DEFAULT 0.0"),
+                ("objective_progress_note","TEXT DEFAULT ''"),
+                ("objective_complete",     "BOOLEAN DEFAULT FALSE"),
+            ]
+            for col_name, col_def in _strategic_cols:
+                try:
+                    cursor.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_def}")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
             
             # Create scan results table
             cursor.execute('''
@@ -1048,18 +1075,34 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             session.status = "failed"
     
     def requires_approval(self, command: str) -> bool:
-        """Determine if a command requires manual approval."""
-        high_risk_keywords = [
-            "exploit", "brute", "crack", "hashcat", "john", "hydra",
-            "meterpreter", "reverse_shell", "shell", "privilege",
-            "sudo", "su", "rm -rf", "format", "wipe", "dd if="
-        ]
-        
+        """Determine if a command requires manual approval.
+
+        Single-word keywords use \\b word-boundary matching to avoid false
+        positives from substrings (e.g. 'su' inside 'subfinder', 'john'
+        inside 'johnsmith'). Multi-character patterns that are inherently
+        specific (rm -rf, dd if=, crackmapexec) keep exact substring matching.
+        """
         command_lower = command.lower()
-        for keyword in high_risk_keywords:
-            if keyword in command_lower:
+
+        # Exact substring patterns — specific enough that substring match is fine.
+        exact_patterns = [
+            "rm -rf", "dd if=", "reverse_shell", "crackmapexec",
+            "msfconsole", "meterpreter",
+        ]
+        for pat in exact_patterns:
+            if pat in command_lower:
                 return True
-        
+
+        # Word-boundary patterns — avoids 'su' → 'subfinder', 'shell' → URL path.
+        word_patterns = [
+            r"\bexploit\b", r"\bbrute\b", r"\bhashcat\b", r"\bjohn\b",
+            r"\bhydra\b", r"\bsudo\b", r"\bprivilege\b", r"\bwipe\b",
+            r"\bformat\b",
+        ]
+        for pat in word_patterns:
+            if re.search(pat, command_lower):
+                return True
+
         return False
 
     def _check_command_safety(self, command: str) -> Optional[str]:
@@ -2059,12 +2102,13 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         h, m = [int(x) for x in schedule_time.split(":")]
         candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
 
+        from datetime import timedelta as _td
         if schedule_type == "once":
-            return candidate if candidate > now else candidate.replace(day=candidate.day + 1)
+            return candidate if candidate > now else candidate + _td(days=1)
 
         if schedule_type == "daily":
             if candidate <= now:
-                candidate = candidate.replace(day=candidate.day + 1)
+                candidate = candidate + _td(days=1)
             return candidate
 
         if schedule_type == "weekly":
@@ -2402,9 +2446,18 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            # Fetch all sessions that are not completed or failed
+            # Fetch all sessions that are not completed or failed.
+            # Include strategic layer columns (added by migration above; COALESCE
+            # guards against older DBs that don't have them yet).
             cursor.execute('''
-                SELECT session_id, target_ip, target_domain, status, current_stage, auto_approve, authorization_confirmed
+                SELECT session_id, target_ip, target_domain, status, current_stage,
+                       auto_approve, authorization_confirmed,
+                       COALESCE(objective, ''),
+                       COALESCE(strategic_plan, '[]'),
+                       COALESCE(reflections, '[]'),
+                       COALESCE(objective_progress, 0.0),
+                       COALESCE(objective_progress_note, ''),
+                       COALESCE(objective_complete, 0)
                 FROM sessions
                 WHERE status NOT IN ('completed', 'failed')
                 ORDER BY created_at DESC
@@ -2413,12 +2466,34 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             sessions_data = cursor.fetchall()
 
             for session_row in sessions_data:
-                session_id, target_ip, target_domain, status, current_stage, auto_approve, authorization_confirmed = session_row
+                (session_id, target_ip, target_domain, status, current_stage,
+                 auto_approve, authorization_confirmed,
+                 db_objective, db_plan_json, db_reflections_json,
+                 db_progress, db_progress_note, db_complete) = session_row
 
                 # Create session object
                 session = Session(session_id, target_ip, target_domain, auto_approve, bool(authorization_confirmed))
                 session.status = status
                 session.current_stage = current_stage
+
+                # Restore strategic layer state persisted by _save_strategic_state.
+                if db_objective:
+                    session.objective = db_objective
+                try:
+                    plan = json.loads(db_plan_json)
+                    if isinstance(plan, list):
+                        session.strategic_plan = plan
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                try:
+                    refs = json.loads(db_reflections_json)
+                    if isinstance(refs, list):
+                        session.reflections = refs
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                session.objective_progress = float(db_progress or 0.0)
+                session.objective_progress_note = db_progress_note or ""
+                session.objective_complete = bool(db_complete)
                 
                 # Load scan results
                 cursor.execute('''
@@ -2819,6 +2894,40 @@ Web apps: {webapps}
             f"Strategist updated session {session_id}: progress={session.objective_progress:.2f}, "
             f"plan_steps={len(session.strategic_plan)}, complete={session.objective_complete}"
         )
+        # Persist the updated strategic state so it survives an app restart.
+        self._save_strategic_state(session_id, session)
+
+    def _save_strategic_state(self, session_id: str, session: "Session"):
+        """Persist the strategic layer fields to the DB so they survive a restart.
+        No-op when db_path is not set (e.g. in unit-test stubs without a real DB)."""
+        db_path = getattr(self, "db_path", None)
+        if not db_path:
+            return
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE sessions SET
+                    objective              = ?,
+                    strategic_plan        = ?,
+                    reflections           = ?,
+                    objective_progress    = ?,
+                    objective_progress_note = ?,
+                    objective_complete    = ?
+                WHERE session_id = ?
+            ''', (
+                session.objective,
+                json.dumps(session.strategic_plan),
+                json.dumps(session.reflections[-20:]),   # bound just like in-memory
+                session.objective_progress,
+                session.objective_progress_note,
+                session.objective_complete,
+                session_id,
+            ))
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.error(f"Failed to save strategic state for session {session_id}: {e}")
 
     async def _vet_command(self, session_id: str, command: str, reasoning: str) -> Dict:
         """Run the VERIFIER (self-critique) pass on a proposed command before it

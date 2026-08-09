@@ -6,7 +6,6 @@ Supports both local Ollama (DeepSeek models) and DeepSeek API
 import json
 import logging
 import os
-from datetime import datetime
 from typing import Dict, List, Optional, Any
 
 from dotenv import load_dotenv
@@ -106,9 +105,6 @@ class KMN_AI_Connector:
         self.local_model = local_model or os.getenv("OLLAMA_MODEL") or "deepseek-r1:8b"
         self.api_model = api_model or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
         
-        # Session history for context
-        self.session_history: Dict[str, List[Dict]] = {}
-
         # ── Context-window budget ─────────────────────────────────────────────
         # Read from env; user should set this to their Ollama model's num_ctx.
         # Common values: 4096 (small models), 8192 (mid), 32768 (large).
@@ -221,10 +217,11 @@ class KMN_AI_Connector:
 
         return full_prompt
     
-    def ask_ai_local(self, prompt: str, session_id: Optional[str] = None) -> AIResponse:
+    def ask_ai_local(self, prompt: str, session_id: Optional[str] = None,
+                     memory: Optional[str] = None) -> AIResponse:
         """Query local Ollama instance."""
         try:
-            full_prompt = self._prepare_prompt(prompt)
+            full_prompt = self._prepare_prompt(prompt, memory=memory)
             
             payload = {
                 "model": self.local_model,
@@ -274,23 +271,42 @@ class KMN_AI_Connector:
             raise ConnectionError(f"Failed to connect to local Ollama: {e}")
     
     async def ask_ai_api(self, prompt: str, session_id: Optional[str] = None, memory: Optional[str] = None) -> AIResponse:
-        """Query DeepSeek API."""
+        """Query DeepSeek API.
+
+        System prompt goes in the `system` role (not buried in the user message)
+        so the model gives it maximum weight. Memory + context go in `user`.
+        """
         if not self.api_key:
             raise ValueError("DeepSeek API key is required for API provider")
-        
+
         try:
-            full_prompt = self._prepare_prompt(prompt, memory=memory)
-            
+            from .prompts import SYSTEM_PROMPT
+
+            # ── Memory block (trimmed to API budget) ─────────────────────────
+            mem_block = ""
+            if memory:
+                mem_budget = 10_000  # API has large context
+                trimmed = memory[:mem_budget]
+                if len(memory) > mem_budget:
+                    trimmed += "\n... [memory trimmed for context budget]"
+                mem_block = f"\n\n=== SESSION MEMORY ===\n{trimmed}"
+
+            user_content = (
+                f"{mem_block}"
+                f"\n\nCurrent Context:\n{prompt}"
+                f"\n\nRespond with valid raw JSON only — no markdown, no extra text."
+            )
+
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json"
             }
-            
+
             messages = [
-                {"role": "system", "content": "You are KMN-CyberSeek, an AI red team operator."},
-                {"role": "user", "content": full_prompt}
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content}
             ]
-            
+
             payload = {
                 "model": self.api_model,
                 "messages": messages,
@@ -360,11 +376,11 @@ class KMN_AI_Connector:
             import asyncio
             from concurrent.futures import ThreadPoolExecutor
             
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             with ThreadPoolExecutor() as executor:
                 return await loop.run_in_executor(
-                    executor, 
-                    lambda: self.ask_ai_local(prompt, session_id)
+                    executor,
+                    lambda: self.ask_ai_local(prompt, session_id, memory)
                 )
     
     async def ask_raw_async(self, system_prompt: str, user_prompt: str) -> Optional[Any]:
@@ -385,7 +401,7 @@ class KMN_AI_Connector:
                 import asyncio
                 from concurrent.futures import ThreadPoolExecutor
 
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 with ThreadPoolExecutor() as executor:
                     return await loop.run_in_executor(
                         executor, lambda: self._ask_raw_local(system_prompt, user_prompt)
@@ -449,30 +465,6 @@ class KMN_AI_Connector:
         except json.JSONDecodeError:
             logger.warning(f"ask_raw_async: failed to parse JSON from model response: {text[:200]}")
             return None
-
-    def add_to_history(self, session_id: str, role: str, content: str):
-        """Add message to session history for context."""
-        if session_id not in self.session_history:
-            self.session_history[session_id] = []
-        
-        self.session_history[session_id].append({
-            "role": role,
-            "content": content,
-            "timestamp": str(datetime.now())
-        })
-        
-        # Keep only last 20 messages to avoid context overflow
-        if len(self.session_history[session_id]) > 20:
-            self.session_history[session_id] = self.session_history[session_id][-20:]
-    
-    def get_session_history(self, session_id: str) -> List[Dict]:
-        """Get conversation history for a session."""
-        return self.session_history.get(session_id, [])
-    
-    def clear_session_history(self, session_id: str):
-        """Clear conversation history for a session."""
-        if session_id in self.session_history:
-            del self.session_history[session_id]
 
 
 # Helper function for backward compatibility

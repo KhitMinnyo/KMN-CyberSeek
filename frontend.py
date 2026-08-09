@@ -992,6 +992,47 @@ def show_session_overview(session_details: Dict):
         status_icon = "✅" if item["status"] == "completed" else "🔄" if item["status"] == "in_progress" else "⏳"
         st.markdown(f"{status_icon} **{item['time']}** - {item['event']}")
 
+    # ── Strategic Layer Panel ──────────────────────────────────────────────────
+    objective = session_details.get("objective", "")
+    progress  = session_details.get("objective_progress", 0.0)
+    prog_note = session_details.get("objective_progress_note", "")
+    complete  = session_details.get("objective_complete", False)
+    plan      = session_details.get("strategic_plan", [])
+    refs      = session_details.get("reflections", [])
+
+    if objective or plan or refs:
+        st.markdown("---")
+        st.markdown("### 🧠 Strategic Layer (AI Planner)")
+
+        # Objective + progress bar
+        if objective:
+            if complete:
+                st.success(f"✅ **OBJECTIVE COMPLETE** — {objective}")
+            else:
+                st.info(f"🎯 **Objective:** {objective}")
+            pct = int(progress * 100)
+            st.progress(progress, text=f"Progress: {pct}% — {prog_note or 'n/a'}")
+
+        # Strategic plan steps
+        if plan:
+            st.markdown("**Current Plan:**")
+            for i, step in enumerate(plan, 1):
+                step_status = step.get("status", "pending")
+                icon = "✅" if step_status == "done" else "🔄" if step_status == "in_progress" else "⏳"
+                rationale = step.get("rationale", "")
+                st.markdown(
+                    f"{icon} **{i}.** {step.get('step', '')}  \n"
+                    + (f"  ↳ *{rationale}*" if rationale else ""),
+                    unsafe_allow_html=False,
+                )
+
+        # Latest reflection
+        if refs:
+            with st.expander("💬 Latest Strategist Reflection"):
+                # Show last 3 reflections newest-first
+                for r in reversed(refs[-3:]):
+                    st.markdown(f"- {r}")
+
 
 def show_scan_results(session_details: Dict):
     """Show scan results."""
