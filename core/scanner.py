@@ -59,22 +59,28 @@ class Scanner:
         if not is_valid_target(target):
             return _invalid_target_result(target)
 
-        # Define scan profiles (updated with Windows ports and vulnerabilities)
+        # Scan timeout: default 300s, configurable via SCAN_TIMEOUT env var.
+        # -p- (all 65535 ports) on internet targets can run for hours — we cap
+        # each subprocess call so a slow/filtered target never blocks forever.
+        import os as _os
+        SCAN_TIMEOUT = int(_os.getenv("SCAN_TIMEOUT", "300"))
+
+        # Define scan profiles.
+        # "full" previously used -p- (all 65535 ports) which takes hours on
+        # internet targets. Replaced with --top-ports 5000 + aggressive timing
+        # for a thorough-but-bounded scan. Use "allports" if you truly need -p-.
         scan_profiles = {
-            "quick": "-T4 -F",  # Fast scan, only top 100 ports
-            "default": "-sV -sC -O --top-ports 1000",  # Service version, default scripts, OS detection, top 1000 ports
-            "full": "-sV -sC -O -p-",  # Full scan with scripts, OS detection, all ports
-            "stealth": "-sS -sV --top-ports 100",  # Stealth SYN scan
-            "vuln": "-sV --script vuln --top-ports 1000",  # Vulnerability scan on top 1000 ports
+            "quick":    "-T4 -F --open",                               # top 100, fast
+            "default":  "-T4 -sV -sC --top-ports 1000 --open",        # top 1000 + scripts
+            "full":     "-T4 -sV -sC --top-ports 5000 --open",        # top 5000 (bounded)
+            "stealth":  "-sS -T2 -sV --top-ports 1000 --open",        # stealth SYN
+            "vuln":     "-T4 -sV --script vuln --top-ports 1000",      # vuln NSE
+            "allports": "-T4 -sV -sC -p- --open",                     # all 65535 (slow!)
         }
-        
+
         scan_options = scan_profiles.get(scan_type, scan_profiles["default"])
-        
+
         try:
-            # Run Nmap scan asynchronously
-            loop = asyncio.get_event_loop()
-            
-            # Use subprocess for better control and async execution
             # target is validated above; shlex.quote is defense-in-depth against injection.
             cmd = f"nmap {scan_options} {shlex.quote(target)}"
 
@@ -85,7 +91,21 @@ class Scanner:
                 cwd="/tmp"
             )
 
-            stdout, stderr = await process.communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=SCAN_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.communicate()
+                logger.warning(f"Nmap scan timed out after {SCAN_TIMEOUT}s for {target}")
+                return {
+                    "target": target,
+                    "success": False,
+                    "error": f"Scan timed out after {SCAN_TIMEOUT}s. Use a quicker scan type or increase SCAN_TIMEOUT in .env.",
+                    "raw_output": "",
+                    "parsed_results": {}
+                }
 
             if process.returncode != 0:
                 logger.error(f"Nmap scan failed: {stderr.decode()}")
