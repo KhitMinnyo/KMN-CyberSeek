@@ -886,13 +886,14 @@ def show_session_overview(session_details: Dict):
 
     status = session_details.get("status", "").lower()
 
-    if status == "initialized":
-        if st.button("🚀 Start Initial Scan", type="primary", use_container_width=True):
-            api_session.post(f"{API_BASE}/sessions/{session_id}/start")
-            st.rerun()
-    elif status in ["scanning", "analyzing", "executing"]:
+    in_progress = status in ("scanning", "analyzing", "executing")
+    has_data = (
+        session_details.get("discovered_hosts_count", 0) > 0
+        or session_details.get("commands_executed_count", 0) > 0
+    )
+
+    if in_progress:
         st.button(f"⏳ {status.title()} in progress...", disabled=True, use_container_width=True)
-        # Live output - poll the backend for streaming command output
         if status == "executing":
             try:
                 live_resp = api_session.get(f"{API_BASE}/sessions/{session_id}/live_output", timeout=3)
@@ -907,14 +908,39 @@ def show_session_overview(session_details: Dict):
             except Exception:
                 pass
     else:
-        # Only show resume for ready, error, completed
-        if st.button("▶️ Force AI Analysis / Resume", type="primary", use_container_width=True):
-            api_session.post(f"{API_BASE}/sessions/{session_id}/resume")
-            st.success("Waking up AI...")
-            time.sleep(1)
-            st.rerun()
+        btn_col1, btn_col2, btn_col3 = st.columns(3)
 
-    # Report download — use api_session so X-API-Key header is included
+        with btn_col1:
+            if status == "initialized" and not has_data:
+                label, tip = "🚀 Start", "Run initial nmap scan and begin AI analysis"
+                endpoint = f"{API_BASE}/sessions/{session_id}/start"
+            else:
+                label, tip = "▶️ Resume", "Continue AI analysis from current scan data (no re-scan)"
+                endpoint = f"{API_BASE}/sessions/{session_id}/resume"
+            if st.button(label, help=tip, type="primary", use_container_width=True):
+                api_session.post(endpoint)
+                time.sleep(0.5)
+                st.rerun()
+
+        with btn_col2:
+            if st.button("🔄 Restart", help="Clear all data and re-run nmap scan from scratch",
+                         use_container_width=True):
+                api_session.post(f"{API_BASE}/sessions/{session_id}/restart")
+                time.sleep(0.5)
+                st.rerun()
+
+        with btn_col3:
+            if st.button("🗑️ Delete", help="Permanently delete this session and all its data",
+                         use_container_width=True):
+                response = api_session.delete(f"{API_BASE}/sessions/{session_id}")
+                if response.status_code == 200:
+                    st.session_state.selected_session = None
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error(f"Failed to delete session: {response.status_code}")
+
+    # Report download
     if st.button("📄 Download DOCX Report", use_container_width=True):
         with st.spinner("Generating report…"):
             try:
@@ -931,17 +957,6 @@ def show_session_overview(session_details: Dict):
                     st.error(f"Report generation failed ({resp.status_code}): {resp.text[:200]}")
             except Exception as e:
                 st.error(f"Could not reach backend: {e}")
-
-    # Add delete button next to Stop Session
-    if st.button("🗑️ Delete This Session", type="primary", use_container_width=True):
-        response = api_session.delete(f"{API_BASE}/sessions/{session_id}")
-        if response.status_code == 200:
-            st.session_state.selected_session = None
-            st.success("Session deleted successfully!")
-            time.sleep(1)
-            st.rerun()
-        else:
-            st.error(f"Failed to delete session: {response.status_code}")
     
     # Session timeline - dynamically determined based on current_stage
     st.markdown("### 📅 Session Timeline")
@@ -2136,16 +2151,31 @@ def show_history():
                 """, unsafe_allow_html=True)
 
             with col_r:
-                # If the session is still active in memory we can switch to it or complete it
+                sid = s['session_id']
                 if s.get("active_in_memory"):
-                    if st.button("📂 Open", key=f"open_{s['session_id']}"):
-                        st.session_state.selected_session = s['session_id']
+                    if st.button("📂 Open", key=f"open_{sid}"):
+                        st.session_state.selected_session = sid
                         st.session_state.force_nav_to_active = True
                         st.rerun()
 
+                    if status not in ("scanning", "analyzing", "executing"):
+                        if st.button("▶️ Resume", key=f"resume_{sid}",
+                                     help="Continue AI analysis from current data"):
+                            api_session.post(f"{API_BASE}/sessions/{sid}/resume")
+                            st.success("Resumed.")
+                            time.sleep(0.5)
+                            st.rerun()
+
+                        if st.button("🔄 Restart", key=f"restart_{sid}",
+                                     help="Re-run nmap scan from scratch"):
+                            api_session.post(f"{API_BASE}/sessions/{sid}/restart")
+                            st.success("Restarting...")
+                            time.sleep(0.5)
+                            st.rerun()
+
                     if status not in ("completed", "failed"):
-                        if st.button("✅ Mark Complete", key=f"complete_{s['session_id']}"):
-                            result = complete_session(s['session_id'])
+                        if st.button("✅ Mark Complete", key=f"complete_{sid}"):
+                            result = complete_session(sid)
                             if result.get("status") == "success":
                                 st.success("Session marked as completed.")
                             else:
