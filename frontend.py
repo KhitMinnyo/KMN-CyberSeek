@@ -974,35 +974,31 @@ def show_session_overview(session_details: Dict):
             break
     
     for i, stage in enumerate(stages):
-        # Determine time label
+        # Determine status first, then derive label from it
         if i == 0:
-            time_label = session_details.get('created_at', 'N/A')
-        elif current_stage_index is not None and i == current_stage_index:
-            time_label = "Now"
-        else:
-            time_label = "Next"
-        
-        # Determine status
-        if i == 0:  # Session created is always completed
             status = "completed"
         elif current_stage_index is None:
-            # No current stage found - check if we should default to reconnaissance
             if i == 1 and session_details.get('discovered_hosts_count', 0) > 0:
-                # We have scan results but no stage set, assume reconnaissance is in progress
                 status = "in_progress"
-                time_label = "Now"
             else:
                 status = "pending"
         elif i < current_stage_index:
-            # Stage comes before current stage
             status = "completed"
         elif i == current_stage_index:
-            # This is the current stage
             status = "in_progress"
         else:
-            # Stage comes after current stage
             status = "pending"
-        
+
+        # Derive time label from status
+        if i == 0:
+            time_label = session_details.get('created_at', 'N/A')
+        elif status == "completed":
+            time_label = "Done"
+        elif status == "in_progress":
+            time_label = "Now"
+        else:
+            time_label = "Next"
+
         timeline_data.append({
             "time": time_label,
             "event": stage["event"],
