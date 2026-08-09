@@ -126,6 +126,9 @@ async def _scheduler_loop():
 async def _start_scheduler():
     asyncio.create_task(_scheduler_loop())
     logger.info("Background scan scheduler started (60s tick)")
+    # Resume any sessions that were mid-flight when the backend last shut down.
+    # Runs after the event loop is up so asyncio.create_task() works inside.
+    await orchestrator.auto_resume_sessions()
 
 
 # Pydantic Models
