@@ -1014,7 +1014,7 @@ def start_operation():
     # to 0.0.0.0 exposes that to the whole network - only do so deliberately via
     # BACKEND_HOST in .env, and keep API_AUTH_TOKEN secret if you do.
     host = os.getenv("BACKEND_HOST", "127.0.0.1")
-    port = int(os.getenv("BACKEND_PORT", "8000"))
+    port = int(os.getenv("BACKEND_PORT", "6000"))
 
     logger.info("Starting KMN-CyberSeek backend server...")
     logger.info(f"API Documentation: http://localhost:{port}/api/docs")

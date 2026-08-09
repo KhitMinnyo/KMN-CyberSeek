@@ -21,8 +21,10 @@ from streamlit_option_menu import option_menu
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Backend API configuration
-BACKEND_URL = "http://localhost:8000"
+# Backend API configuration — reads BACKEND_PORT from .env so changing the
+# port in one place (.env or start.sh) is enough; no need to edit this file.
+_backend_port = int(os.getenv("BACKEND_PORT", "6000"))
+BACKEND_URL = f"http://localhost:{_backend_port}"
 API_BASE = f"{BACKEND_URL}/api"
 
 

@@ -103,9 +103,16 @@ _kill_port() {
     fi
 }
 
+# Read ports from .env (fallback: 6000 / 8501)
+BACKEND_PORT=$(grep -m1 "^BACKEND_PORT=" .env 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'" | tr -d ' ')
+BACKEND_PORT="${BACKEND_PORT:-6000}"
+FRONTEND_PORT=$(grep -m1 "^FRONTEND_PORT=" .env 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'" | tr -d ' ')
+FRONTEND_PORT="${FRONTEND_PORT:-8501}"
+export BACKEND_PORT FRONTEND_PORT
+
 echo "🔍 Checking port availability..."
-_kill_port 8000
-_kill_port 8501
+_kill_port "$BACKEND_PORT"
+_kill_port "$FRONTEND_PORT"
 
 # Start services
 echo "🚀 Starting services..."
@@ -123,8 +130,8 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 # Start FastAPI backend
-echo "🔧 Starting FastAPI backend on http://localhost:8000"
-echo "📚 API Documentation: http://localhost:8000/api/docs"
+echo "🔧 Starting FastAPI backend on http://localhost:${BACKEND_PORT}"
+echo "📚 API Documentation: http://localhost:${BACKEND_PORT}/api/docs"
 python3 main.py &
 BACKEND_PID=$!
 
@@ -132,15 +139,15 @@ BACKEND_PID=$!
 sleep 5
 
 # Check if backend started successfully
-if ! curl -s http://localhost:8000/health > /dev/null; then
+if ! curl -s "http://localhost:${BACKEND_PORT}/health" > /dev/null; then
     echo "❌ Backend failed to start"
     kill $BACKEND_PID 2>/dev/null
     exit 1
 fi
 
 # Start Streamlit frontend
-echo "🎨 Starting Streamlit frontend on http://localhost:8501"
-streamlit run frontend.py --server.port 8501 --server.headless true &
+echo "🎨 Starting Streamlit frontend on http://localhost:${FRONTEND_PORT}"
+streamlit run frontend.py --server.port "$FRONTEND_PORT" --server.headless true &
 FRONTEND_PID=$!
 
 # Wait for frontend to start
@@ -150,12 +157,12 @@ echo ""
 echo "✅ KMN-CyberSeek started successfully!"
 echo ""
 echo "🌐 Access Points:"
-echo "   Dashboard:    http://localhost:8501"
-echo "   API Docs:     http://localhost:8000/api/docs"
-echo "   Health Check: http://localhost:8000/health"
+echo "   Dashboard:    http://localhost:${FRONTEND_PORT}"
+echo "   API Docs:     http://localhost:${BACKEND_PORT}/api/docs"
+echo "   Health Check: http://localhost:${BACKEND_PORT}/health"
 echo ""
 echo "📋 Quick Start:"
-echo "   1. Open http://localhost:8501 in your browser"
+echo "   1. Open http://localhost:${FRONTEND_PORT} in your browser"
 echo "   2. Go to ⚙️  Settings → AI Configuration to set up Ollama or DeepSeek API"
 echo "   3. Create a new session with target IP/domain"
 echo "   4. Monitor AI-driven reconnaissance and approve high-risk commands"
