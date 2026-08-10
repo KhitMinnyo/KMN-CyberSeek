@@ -4,6 +4,53 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.1.2] — 2026-08-10
+
+### Added
+- **Shell Session Manager** (`core/shell_manager.py`) — new module managing persistent Metasploit `multi/handler` processes.
+  - `MsfHandlerProcess`: long-running `msfconsole` subprocess with `stdin=PIPE` for command injection and stdout monitoring for session-opened events.
+  - `ShellSession`: tracks one active meterpreter/shell session with full command history (last 100 commands).
+  - `ShellManager`: per-pentest-session container for all handlers.
+  - Echo-marker output capture with `CMD_OUTPUT_TIMEOUT` (20 s).
+  - `get_local_ip()` helper auto-detects LHOST suggestion.
+  - `COMMON_PAYLOADS` list covers Windows/Linux x86/x64 meterpreter and shell payloads.
+
+- **Shell API endpoints** (main.py):
+  - `POST /api/sessions/{id}/shells/handler` — start listener
+  - `DELETE /api/sessions/{id}/shells/handler/{handler_id}` — stop listener
+  - `GET /api/sessions/{id}/shells/handlers` — list live + DB-persisted handlers
+  - `GET /api/sessions/{id}/shells` — list active shell sessions
+  - `POST /api/sessions/{id}/shells/{handler_id}/{msf_id}/exec` — run command in session
+  - `GET /api/sessions/{id}/shells/{handler_id}/{msf_id}/history` — command history
+  - `GET /api/shells/local-ip` — LHOST suggestion
+
+- **🐚 Shells tab** (Active Sessions, tab 8):
+  - Listener management: LHOST/LPORT/payload form with auto-detected LHOST and live msfvenom command preview.
+  - Active session panel: quick-action buttons (whoami, sysinfo, ipconfig, ps), free-form command input, output display, command history.
+  - Usage guide with meterpreter command reference.
+  - Session count badge on tab label.
+
+- **AI shell awareness** — active shell sessions injected into `_analyze_with_ai()` context so the AI uses existing shells for post-exploitation instead of re-exploiting.
+
+- **DB tables**: `shell_handlers` (persists LHOST/LPORT/payload for restart), `shell_sessions_log` (session history).
+
+- **Threat Intel page — Structured Vulnerability Database section** — pulls from `vulnerabilities` table across all sessions. Filterable by source (NVD, searchsploit, nmap-vuln-script, Vulners), risk level, and service substring. Source trust badges, CVSS scores, NVD/ExploitDB deep-links.
+
+- **Global `/api/vulnerabilities` endpoint** — cross-session vulnerability query with optional filters.
+
+- **Action-required banners on Overview tab** — orange banner with inline ✅/❌ approve/deny buttons for pending commands; yellow warning for loop-prevention decisions.
+
+### Fixed
+- **Anti-loop guardrail bypassed by flag/suffix variations** — previous exact-match check was evaded by appending `2>&1 | tee /tmp/...` or changing `-R` to `-r`. New `_norm_cmd()` strips output-redirection suffixes and normalises before comparison. Window expanded from last-5 to last-8 commands.
+- **Stage stagnation not detected** — added second check: if 8+ consecutive AI decisions share the same `attack_phase` without advancing, auto-execution halts with a `loop_prevention` decision.
+- **Reset AI left vulnerability analysis incomplete** — `restart_session` cleared `session.vulnerabilities` in memory but did not: (a) delete DB rows, (b) clear NSE/NVD/searchsploit completion markers, or (c) re-trigger `_run_vulnerability_analysis()`. All three now happen on Reset AI.
+- **Vulnerabilities tab always empty after Reset AI** — consequence of the above; fixed by the same changes.
+- **Vulnerabilities tab empty message mentioned Vulners only** — updated to accurately describe the free sources (Nmap NSE, NIST NVD, local searchsploit).
+- **Session control buttons hidden while executing** — Reset AI, Delete, Full Rescan were inside the `else` branch of `if in_progress`, making them invisible during active execution. Now always visible; only Resume/Start are hidden while the AI loop is running (to prevent duplicate spawning).
+- **README bloat** — removed Key Features, How It Works, API Reference, Project Structure from README.md. Extracted to `features.md`. Created `change_log.md`.
+
+---
+
 ## [2.1.1] — 2026-08-10
 
 ### Added
