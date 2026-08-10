@@ -974,149 +974,220 @@ class Orchestrator:
             self._parse_and_store_api_endpoints(session, command, output)
 
     async def _run_vulnerability_analysis(self, session_id: str):
-        """Run NSE vuln-script scanning + best-effort CVE enrichment (Vulners) for
-        a session's discovered services, storing structured findings via
-        add_vulnerability(). Designed to never raise: any failure here just means
-        fewer findings get recorded - it must not block the rest of the pipeline,
-        since the AI can still reason from raw service/version data alone.
+        """Vulnerability analysis pipeline — per-port NSE + searchsploit + NVD + Vulners + threat-intel.
+
+        Design principles:
+        - Every scan step records a completion marker in scan_results even when it
+          finds nothing, so a backend restart never re-runs expensive work.
+        - _scan_already_done() checks that marker before each step → true resume.
+        - add_vulnerability() deduplicates by (host, port, name) so overlapping
+          results from different sources never create duplicate DB rows.
+        - All failures are non-fatal; a failure in one step never blocks others.
         """
         session = self.sessions.get(session_id)
         if not session:
             return
 
-        # --- Nmap NSE 'vuln' script category, scoped to known-open ports ---
-        try:
-            open_ports = sorted({
-                port['port'] for host in session.discovered_hosts
-                for port in host.get('ports', [])
-                if port.get('state') == 'open'
-            })
+        # Collect open ports and build a port→service lookup once.
+        open_ports = sorted({
+            p['port'] for h in session.discovered_hosts
+            for p in h.get('ports', [])
+            if p.get('state') == 'open'
+        })
+        port_to_service: Dict[int, Dict] = {
+            s['port']: s for s in session.discovered_services
+        }
 
-            if open_ports:
-                logger.info(f"Running targeted vulnerability scan for session {session_id} on ports {open_ports}")
-                vuln_scan_results = await self.scanner.perform_vulnerability_scan(session.target_ip, ports=open_ports)
-                session.scan_results.append(vuln_scan_results)
-                self._save_scan_results(session_id, "nmap_vuln", vuln_scan_results)
-
-                for finding in vuln_scan_results.get("vulnerabilities", []):
-                    finding_ports = finding.get("ports") or open_ports
-                    for port in finding_ports:
-                        matched_service = next(
-                            (s for s in session.discovered_services if s.get('port') == port), {}
-                        )
+        # ── 1. Per-port nmap NSE vuln scan ───────────────────────────────────
+        # Each port is scanned individually with its own timeout so a single slow
+        # port (e.g. a heavily filtered SMB) cannot starve all others.
+        if open_ports:
+            logger.info(
+                f"[{session_id}] Per-port NSE vuln scan: {len(open_ports)} port(s) — "
+                f"{[p for p in open_ports if not self._scan_already_done(session_id, f'nmap_vuln_p{p}')]}"
+                f" pending (already done: "
+                f"{[p for p in open_ports if self._scan_already_done(session_id, f'nmap_vuln_p{p}')]})"
+            )
+            for port in open_ports:
+                marker = f"nmap_vuln_p{port}"
+                if self._scan_already_done(session_id, marker):
+                    logger.info(f"[{session_id}] Port {port} NSE vuln scan already done — skipping")
+                    continue
+                try:
+                    result = await self.scanner.perform_vulnerability_scan_port(
+                        session.target_ip, port
+                    )
+                    # Save marker FIRST (even on timeout/failure) to prevent re-run.
+                    self._save_scan_results(session_id, marker, {
+                        "port": port, "success": result.get("success"),
+                        "vuln_count": len(result.get("vulnerabilities", []))
+                    })
+                    svc = port_to_service.get(port, {})
+                    for finding in result.get("vulnerabilities", []):
                         self.add_vulnerability(session_id, {
                             "host": session.target_ip,
                             "port": port,
-                            "service": matched_service.get("service"),
-                            "service_version": matched_service.get("version"),
+                            "service": svc.get("service"),
+                            "service_version": svc.get("version"),
                             "name": finding.get("name"),
-                            "description": finding.get("description"),
+                            "description": finding.get("description", ""),
                             "risk_level": finding.get("risk", "unknown"),
                             "cve_ids": finding.get("cve_ids", []),
                             "reference_urls": finding.get("references", []),
-                            "source_tool": "nmap-vuln-script"
+                            "source_tool": "nmap-vuln-script",
                         })
-            else:
-                logger.info(f"No open ports found for session {session_id}, skipping vuln-script scan")
-        except Exception as e:
-            logger.warning(f"NSE vulnerability scan failed for session {session_id} (continuing without it): {e}")
+                except Exception as e:
+                    logger.warning(f"[{session_id}] NSE scan failed for port {port}: {e}")
+                    # Still record the marker to avoid infinite retry on a broken port.
+                    try:
+                        self._save_scan_results(session_id, marker,
+                                                {"port": port, "success": False, "error": str(e)})
+                    except Exception:
+                        pass
+        else:
+            logger.info(f"[{session_id}] No open ports — skipping NSE vuln scan")
 
-        # --- ExploitDB / searchsploit lookup (local, no API key required) ---
-        # Runs per service with a known version. searchsploit is a fast local
-        # binary query against the local ExploitDB copy — zero network latency,
-        # no key needed. Missing binary → silently skipped (non-fatal).
-        for service in session.discovered_services:
-            service_name = service.get('service', '') or ''
-            version = service.get('version', '') or ''
-            if not service_name or service_name.lower() in ('unknown', ''):
+        # ── 2. Per-service searchsploit (ExploitDB, local, no key) ───────────
+        import asyncio as _asyncio
+        for svc in session.discovered_services:
+            svc_name = (svc.get('service') or '').strip()
+            version  = (svc.get('version') or '').strip()
+            if not svc_name or svc_name.lower() in ('unknown', ''):
+                continue
+            # Normalise key: lowercase, max 60 chars to stay within any index limit.
+            _svc_key = f"{svc_name.lower()}_{version.lower()}"[:55]
+            marker = f"ss_{_svc_key}"
+            if self._scan_already_done(session_id, marker):
                 continue
             try:
-                ss_hits = await self.scanner.searchsploit_lookup(service_name, version)
+                ss_hits = await self.scanner.searchsploit_lookup(svc_name, version)
+                self._save_scan_results(session_id, marker,
+                                        {"service": svc_name, "version": version,
+                                         "hits": len(ss_hits)})
                 for hit in ss_hits:
+                    _path = hit.get("path", "")
+                    _eid  = _path.rsplit("/", 1)[-1].split(".")[0] if _path else ""
                     self.add_vulnerability(session_id, {
-                        "host": service.get('host', session.target_ip),
-                        "port": service.get('port'),
-                        "service": service_name,
+                        "host": svc.get('host', session.target_ip),
+                        "port": svc.get('port'),
+                        "service": svc_name,
                         "service_version": version,
                         "name": hit["title"],
-                        "description": f"ExploitDB: {hit['path']}",
+                        "description": f"ExploitDB path: {_path}",
                         "risk_level": "high",
                         "cve_ids": hit.get("cve_ids", []),
                         "reference_urls": [
-                            f"https://www.exploit-db.com/exploits/{hit['path'].rsplit('/', 1)[-1].split('.')[0]}"
-                        ] if hit.get("path") else [],
+                            f"https://www.exploit-db.com/exploits/{_eid}"
+                        ] if _eid else [],
                         "source_tool": "searchsploit",
                         "status": "unverified",
                     })
             except Exception as e:
-                logger.warning(f"searchsploit lookup error for {service_name} {version}: {e}")
+                logger.warning(f"[{session_id}] searchsploit error for {svc_name} {version}: {e}")
 
-        # --- Best-effort CVE enrichment via Vulners (optional, needs VULNERS_API_KEY) ---
-        # Runs for every service with a known version regardless of NSE findings above,
-        # since NSE only covers a fixed set of known checks and can miss CVEs a
-        # database lookup would catch. NOTE: must not early-return here - the
-        # threat-intel cross-reference step below has to run either way.
-        if not cve_lookup.is_configured():
-            logger.info(f"VULNERS_API_KEY not configured - skipping CVE enrichment for session {session_id}")
-        else:
-            for service in session.discovered_services:
-                service_name = service.get('service', '') or ''
-                version = service.get('version', '') or ''
-                if not version or service_name.lower() in ('unknown', ''):
-                    continue
-                try:
-                    hits = await cve_lookup.lookup_cves(service_name, version)
-                except Exception as e:
-                    logger.warning(f"Vulners lookup crashed unexpectedly for {service_name} {version} (continuing): {e}")
-                    continue
-
-                for hit in hits:
+        # ── 3. Per-service NVD (NIST) CVE lookup — free, no key required ─────
+        _nvd_delay = 0.7  # 5 req/30s without key → ~6s/5 req; 0.7s is safe
+        for svc in session.discovered_services:
+            svc_name = (svc.get('service') or '').strip()
+            version  = (svc.get('version') or '').strip()
+            if not svc_name or not version or svc_name.lower() in ('unknown', ''):
+                continue
+            _svc_key = f"{svc_name.lower()}_{version.lower()}"[:55]
+            marker = f"nvd_{_svc_key}"
+            if self._scan_already_done(session_id, marker):
+                continue
+            try:
+                nvd_hits = await cve_lookup.lookup_cves_nvd(svc_name, version)
+                self._save_scan_results(session_id, marker,
+                                        {"service": svc_name, "version": version,
+                                         "hits": len(nvd_hits)})
+                for hit in nvd_hits:
                     self.add_vulnerability(session_id, {
-                        "host": service.get('host', session.target_ip),
-                        "port": service.get('port'),
-                        "service": service_name,
+                        "host": svc.get('host', session.target_ip),
+                        "port": svc.get('port'),
+                        "service": svc_name,
                         "service_version": version,
                         "name": hit.get("title") or hit.get("cve_id") or "Unnamed CVE",
                         "description": hit.get("description", ""),
                         "risk_level": _cvss_to_risk(hit.get("cvss_score")),
-                        "cve_ids": hit.get("cve_ids") or ([hit["cve_id"]] if hit.get("cve_id") else []),
+                        "cve_ids": hit.get("cve_ids") or [],
                         "cvss_score": hit.get("cvss_score"),
                         "reference_urls": [hit["url"]] if hit.get("url") else [],
-                        "source_tool": "vulners"
+                        "source_tool": "nvd",
                     })
+                await _asyncio.sleep(_nvd_delay)   # respect NVD rate limit
+            except Exception as e:
+                logger.warning(f"[{session_id}] NVD lookup error for {svc_name} {version}: {e}")
 
-        # --- Cross-reference the shared threat-intel cache (core/threat_intel.py) ---
-        # This is what makes the local database "get better over time": findings
-        # gathered from open-web research on a past occasion (for this service or
-        # a similar one) surface here too. Marked unverified/lower-confidence since
-        # it came from unstructured web scraping, not a structured feed - an
-        # operator should treat these as leads, not confirmed findings.
+        # ── 4. Vulners CVE lookup (optional, needs VULNERS_API_KEY) ──────────
+        if not cve_lookup.is_configured():
+            logger.info(f"[{session_id}] VULNERS_API_KEY not set — skipping Vulners CVE enrichment")
+        else:
+            for svc in session.discovered_services:
+                svc_name = (svc.get('service') or '').strip()
+                version  = (svc.get('version') or '').strip()
+                if not version or svc_name.lower() in ('unknown', ''):
+                    continue
+                _svc_key = f"{svc_name.lower()}_{version.lower()}"[:55]
+                marker = f"vul_{_svc_key}"
+                if self._scan_already_done(session_id, marker):
+                    continue
+                try:
+                    hits = await cve_lookup.lookup_cves(svc_name, version)
+                    self._save_scan_results(session_id, marker,
+                                            {"service": svc_name, "version": version,
+                                             "hits": len(hits)})
+                    for hit in hits:
+                        self.add_vulnerability(session_id, {
+                            "host": svc.get('host', session.target_ip),
+                            "port": svc.get('port'),
+                            "service": svc_name,
+                            "service_version": version,
+                            "name": hit.get("title") or hit.get("cve_id") or "Unnamed CVE",
+                            "description": hit.get("description", ""),
+                            "risk_level": _cvss_to_risk(hit.get("cvss_score")),
+                            "cve_ids": hit.get("cve_ids") or ([hit["cve_id"]] if hit.get("cve_id") else []),
+                            "cvss_score": hit.get("cvss_score"),
+                            "reference_urls": [hit["url"]] if hit.get("url") else [],
+                            "source_tool": "vulners",
+                        })
+                except Exception as e:
+                    logger.warning(f"[{session_id}] Vulners error for {svc_name} {version}: {e}")
+
+        # ── 5. Threat-intel cache cross-reference ────────────────────────────
+        # Findings from prior web research sessions for the same service names.
+        # Marked unverified — treat as leads, not confirmed findings.
         try:
-            for service in session.discovered_services:
-                service_name = (service.get('service') or '').strip().lower()
-                if not service_name or service_name == 'unknown':
+            for svc in session.discovered_services:
+                svc_name = (svc.get('service') or '').strip().lower()
+                if not svc_name or svc_name == 'unknown':
                     continue
                 for cached in self.threat_intel_cache:
                     haystack = " ".join([
                         cached.get("affected_software", ""), cached.get("title", ""),
-                        cached.get("description", ""), cached.get("topic", "")
+                        cached.get("description", ""), cached.get("topic", ""),
                     ]).lower()
-                    if service_name in haystack:
+                    if svc_name in haystack:
                         self.add_vulnerability(session_id, {
-                            "host": service.get('host', session.target_ip),
-                            "port": service.get('port'),
-                            "service": service.get('service'),
-                            "service_version": service.get('version'),
+                            "host": svc.get('host', session.target_ip),
+                            "port": svc.get('port'),
+                            "service": svc.get('service'),
+                            "service_version": svc.get('version'),
                             "name": cached.get("title") or "Unnamed finding (web research)",
                             "description": cached.get("description", ""),
                             "risk_level": "unknown",
                             "cve_ids": cached.get("cve_ids", []),
                             "reference_urls": [cached["source_url"]] if cached.get("source_url") else [],
                             "source_tool": "threat-intel-cache",
-                            "status": "unverified"
+                            "status": "unverified",
                         })
         except Exception as e:
-            logger.warning(f"Threat-intel cross-reference failed for session {session_id} (non-fatal): {e}")
+            logger.warning(f"[{session_id}] Threat-intel cross-reference failed (non-fatal): {e}")
+
+        logger.info(
+            f"[{session_id}] Vulnerability analysis complete — "
+            f"{len(session.vulnerabilities)} total finding(s) recorded"
+        )
 
     async def _analyze_with_ai(self, session_id: str):
         """Analyze scan results with AI."""
@@ -2091,6 +2162,26 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             conn.close()
         except sqlite3.Error as e:
             logger.error(f"Failed to save scan results to database: {e}")
+
+    def _scan_already_done(self, session_id: str, scan_type_key: str) -> bool:
+        """Return True if this exact scan step has already been recorded.
+
+        Used as a dedup gate before every per-port / per-service vuln lookup:
+        even if a scan found zero results we record a completion marker, so a
+        backend restart never re-runs expensive work that already finished.
+        The key format is arbitrary (e.g. 'nmap_vuln_p445', 'ss_openssh_8.2',
+        'nvd_apache_2.4.49') — callers own the naming scheme.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT 1 FROM scan_results WHERE session_id=? AND scan_type=? LIMIT 1",
+                (session_id, scan_type_key),
+            ).fetchone()
+            conn.close()
+            return bool(row)
+        except sqlite3.Error:
+            return False
 
     def _save_session_status(self, session_id: str, session) -> None:
         """Persist current_stage and status to the sessions table.

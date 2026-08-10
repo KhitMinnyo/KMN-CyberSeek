@@ -34,6 +34,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 VULNERS_API_URL = "https://vulners.com/api/v3/search/lucene/"
+NVD_API_URL     = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 _CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 
 # Keep this conservative: enrichment runs once per discovered service on every
@@ -161,5 +162,91 @@ def _parse_response(data: Dict, max_results: int) -> List[Dict]:
             "published": source.get("published", ""),
             "url": source.get("href", "") or (f"https://vulners.com/cve/{cve_ids[0]}" if cve_ids else "")
         })
+
+
+async def lookup_cves_nvd(
+    service: str,
+    version: str,
+    max_results: int = 5,
+) -> List[Dict]:
+    """Query the NIST National Vulnerability Database (NVD) API v2 for CVEs
+    matching a service + version string.
+
+    No API key required (public endpoint). Rate limit: 5 requests / 30 s
+    without a key, 50 / 30 s with NVD_API_KEY in the environment. Callers
+    are responsible for spacing out requests; this function does NOT sleep.
+
+    Returns a list of dicts with the same shape as lookup_cves() so callers
+    can treat both sources uniformly:
+        {"cve_id", "cve_ids", "title", "description", "cvss_score",
+         "published", "url"}
+
+    Always returns [] on any error — never raises.
+    """
+    if not service:
+        return []
+
+    query = f"{service} {version}".strip()
+    nvd_key = os.getenv("NVD_API_KEY", "").strip() or None
+    headers = {"apiKey": nvd_key} if nvd_key else {}
+
+    try:
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+            resp = await client.get(
+                NVD_API_URL,
+                params={"keywordSearch": query, "resultsPerPage": max_results},
+                headers=headers,
+            )
+        if resp.status_code != 200:
+            logger.warning(f"NVD API returned HTTP {resp.status_code} for {query!r}")
+            return []
+
+        data = resp.json()
+        vulnerabilities = data.get("vulnerabilities", [])
+        results: List[Dict] = []
+
+        for item in vulnerabilities:
+            cve_obj = item.get("cve", {})
+            cve_id  = cve_obj.get("id", "")
+
+            # Description — prefer English
+            descriptions = cve_obj.get("descriptions", [])
+            desc = next(
+                (d["value"] for d in descriptions if d.get("lang") == "en"),
+                next((d["value"] for d in descriptions), ""),
+            )
+
+            # CVSS score — try v3.1, then v3.0, then v2
+            cvss_score: Optional[float] = None
+            metrics = cve_obj.get("metrics", {})
+            for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                metric_list = metrics.get(key, [])
+                if metric_list:
+                    try:
+                        cvss_score = float(
+                            metric_list[0].get("cvssData", {}).get("baseScore", 0) or 0
+                        )
+                        break
+                    except (TypeError, ValueError):
+                        pass
+
+            published = cve_obj.get("published", "")[:10]  # YYYY-MM-DD
+
+            results.append({
+                "cve_id":      cve_id,
+                "cve_ids":     [cve_id] if cve_id else [],
+                "title":       cve_id,
+                "description": desc[:500],
+                "cvss_score":  cvss_score,
+                "published":   published,
+                "url":         f"https://nvd.nist.gov/vuln/detail/{cve_id}" if cve_id else "",
+            })
+
+        logger.info(f"NVD lookup: {len(results)} CVE(s) for {query!r}")
+        return results
+
+    except Exception as e:
+        logger.warning(f"NVD lookup failed for {query!r}: {e}")
+        return []
 
     return results
