@@ -679,9 +679,13 @@ class Orchestrator:
             self._merge_hosts(session, discovered_hosts)
             self._merge_services(session, discovered_hosts)
             
-            # Update session status
+            # Nmap done: move to enumeration (the next logical step after port scanning).
+            # Vulnerability analysis runs as a background task and does not block
+            # enumeration commands — the AI will advance through vulnerability_analysis
+            # naturally as it proposes vuln-specific commands.
             session.status = "analyzing"
-            session.current_stage = "vulnerability_analysis"
+            session.current_stage = "enumeration"
+            self._save_session_status(session_id, session)
 
             # Auto-trigger threat-intel background research for any service names
             # not yet in the cache. This is the "database gets better over time
@@ -705,6 +709,7 @@ class Orchestrator:
             logger.error(f"Reconnaissance failed for session {session_id}: {e}")
             session.status = "failed"
             session.current_stage = "error"
+            self._save_session_status(session_id, session)
 
     def _schedule_auto_threat_intel(self, session_id: str):
         """Fire background threat-intel research tasks for each unique service
@@ -1222,7 +1227,10 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 session.status = "executing"
             else:
                 session.status = "ready"
-            
+
+            # Persist stage + status so a restart resumes from the correct point.
+            self._save_session_status(session_id, session)
+
             _cmd = ai_response.suggested_command
             logger.info(f"AI analysis completed for {session_id}, suggested command: {_cmd}")
 
@@ -1240,7 +1248,8 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         except Exception as e:
             logger.error(f"AI analysis failed for session {session_id}: {e}")
             session.status = "failed"
-    
+            self._save_session_status(session_id, session)
+
     def requires_approval(self, command: str) -> bool:
         """Determine if a command requires manual approval.
 
@@ -1655,6 +1664,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                     f"Session {session_id}: objective complete — halting agentic loop."
                 )
                 session.status = "completed"
+                self._save_session_status(session_id, session)
                 return command_record
 
             # If successful, analyze sanitized output with AI for next steps
@@ -1671,6 +1681,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         except Exception as e:
             logger.error(f"Command execution failed for {session_id}: {e}")
             session.status = "failed"
+            self._save_session_status(session_id, session)
             return {
                 "command_id": command_id,
                 "command": command,
@@ -1843,7 +1854,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             else:
                 logger.info(f"Session {session_id}: stage held at {session.current_stage} (AI proposed: {ai_response.attack_phase})")
             session.current_stage = new_stage
-            
+            self._save_session_status(session_id, session)
+
             # ANTI-LOOP GUARDRAIL: Check if the AI suggested a command we recently executed
             recent_commands = [cmd.get('command', '').strip() for cmd in session.commands_executed[-5:]]
             if ai_response.suggested_command and ai_response.suggested_command.strip() in recent_commands:
@@ -2079,8 +2091,27 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             conn.close()
         except sqlite3.Error as e:
             logger.error(f"Failed to save scan results to database: {e}")
-    
-    def _save_command_result(self, session_id: str, command_id: str, command: str, 
+
+    def _save_session_status(self, session_id: str, session) -> None:
+        """Persist current_stage and status to the sessions table.
+
+        Called at every stage or status transition so that backend restarts
+        always resume from the correct point rather than defaulting back to
+        the initial 'reconnaissance'/'initialized' values written at INSERT time.
+        Non-fatal — a failure here is logged but never propagates.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "UPDATE sessions SET current_stage = ?, status = ? WHERE session_id = ?",
+                (session.current_stage, session.status, session_id),
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to persist session status for {session_id}: {e}")
+
+    def _save_command_result(self, session_id: str, command_id: str, command: str,
                            output: str, error: str, return_code: int):
         """Save command execution result to database."""
         try:
