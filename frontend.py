@@ -883,6 +883,48 @@ def show_session_overview(session_details: Dict):
 
     st.markdown("---")
 
+    # ── ACTION REQUIRED banner — shown before anything else so operator sees it immediately ──
+    pending_cmds = get_pending_commands(session_id) if session_id else []
+    if pending_cmds:
+        st.markdown(
+            "<div style='background:#7b3f00;border:2px solid #ff8c00;border-radius:8px;"
+            "padding:14px 18px;margin-bottom:16px'>"
+            "<span style='font-size:1.2rem;font-weight:700;color:#ffd580'>🔔 ACTION REQUIRED — Command Awaiting Approval</span>"
+            "</div>",
+            unsafe_allow_html=True
+        )
+        for _pc in pending_cmds:
+            _risk = (_pc.get("risk_level") or ("high" if _pc.get("requires_approval") else "medium")).upper()
+            _risk_color = "#e53935" if _risk == "HIGH" else "#fb8c00" if _risk == "MEDIUM" else "#43a047"
+            st.markdown(
+                f"<div style='background:#1a1a2e;border-left:4px solid {_risk_color};"
+                f"padding:10px 14px;border-radius:4px;margin:6px 0;font-family:monospace'>"
+                f"<span style='color:{_risk_color};font-weight:700'>[{_risk}]</span> "
+                f"<span style='color:#e0e0e0'>{_pc.get('command','')}</span></div>",
+                unsafe_allow_html=True
+            )
+            _ac, _dc = st.columns([1, 1])
+            with _ac:
+                if st.button(f"✅ Approve", key=f"ov_approve_{_pc['command_id']}",
+                             use_container_width=True, type="primary"):
+                    approve_command(session_id, _pc["command_id"])
+                    st.rerun()
+            with _dc:
+                if st.button(f"❌ Deny", key=f"ov_deny_{_pc['command_id']}",
+                             use_container_width=True):
+                    deny_command(session_id, _pc["command_id"])
+                    st.rerun()
+        st.markdown("")
+
+    # ── AI loop detection: last ai_decision has context=loop_prevention ──
+    ai_decisions = session_details.get("ai_decisions", [])
+    if ai_decisions and ai_decisions[-1].get("context") == "loop_prevention":
+        st.warning(
+            "⚠️ **AI Loop Detected** — the AI tried to repeat a command it already ran. "
+            "Auto-execution paused. Run a different command manually via the **Command Console**, "
+            "or click **Reset AI** to restart analysis from the current scan data."
+        )
+
     # Check if session is in analyzing state and show loading indicator
     if session_details.get("status") == "analyzing":
         st.info("⏳ **AI is analyzing vulnerabilities and formulating the attack plan...**")
