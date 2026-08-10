@@ -1031,51 +1031,59 @@ def show_session_overview(session_details: Dict):
         {"event": "Credential Reuse",      "stage_key": "credential_reuse"},
     ]
     
-    # Determine status for each stage based on current_stage
-    timeline_data = []
-    
-    # Find the index of the current stage in the stages array
+    # Build a set of stages that the AI actually worked on — a stage is "done"
+    # only if at least one AI decision has that attack_phase, AND it comes before
+    # the current stage.  Prevents the timeline from showing Done for stages that
+    # were skipped by a bad AI attack_phase jump.
+    ai_decisions = session_details.get("ai_decisions", [])
+    worked_stages = {d.get("attack_phase", "").lower() for d in ai_decisions if d.get("attack_phase")}
+
+    # Find current stage index
     current_stage_index = None
     for i, stage in enumerate(stages):
         if current_stage == stage["stage_key"]:
             current_stage_index = i
             break
-    
+
+    timeline_data = []
     for i, stage in enumerate(stages):
-        # Determine status first, then derive label from it
         if i == 0:
+            # "Session created" is always done
             status = "completed"
         elif current_stage_index is None:
-            if i == 1 and session_details.get('discovered_hosts_count', 0) > 0:
-                status = "in_progress"
-            else:
-                status = "pending"
+            status = "in_progress" if (i == 1 and session_details.get('discovered_hosts_count', 0) > 0) else "pending"
         elif i < current_stage_index:
-            status = "completed"
+            # Only mark as completed if the AI actually ran decisions in this stage.
+            # Stages that were "passed through" without any decisions show as skipped.
+            status = "completed" if stage["stage_key"] in worked_stages else "skipped"
         elif i == current_stage_index:
             status = "in_progress"
         else:
             status = "pending"
 
-        # Derive time label from status
         if i == 0:
             time_label = session_details.get('created_at', 'N/A')
         elif status == "completed":
             time_label = "Done"
+        elif status == "skipped":
+            time_label = "—"
         elif status == "in_progress":
             time_label = "Now"
         else:
             time_label = "Next"
 
-        timeline_data.append({
-            "time": time_label,
-            "event": stage["event"],
-            "status": status
-        })
-    
+        timeline_data.append({"time": time_label, "event": stage["event"], "status": status})
+
     for item in timeline_data:
-        status_icon = "✅" if item["status"] == "completed" else "🔄" if item["status"] == "in_progress" else "⏳"
-        st.markdown(f"{status_icon} **{item['time']}** - {item['event']}")
+        if item["status"] == "completed":
+            icon = "✅"
+        elif item["status"] == "in_progress":
+            icon = "🔄"
+        elif item["status"] == "skipped":
+            icon = "⚡"   # skipped/fast-forwarded by AI
+        else:
+            icon = "⏳"
+        st.markdown(f"{icon} **{item['time']}** - {item['event']}")
 
     # ── Strategic Layer Panel ──────────────────────────────────────────────────
     objective = session_details.get("objective", "")
