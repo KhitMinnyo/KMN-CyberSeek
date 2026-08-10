@@ -11,6 +11,7 @@ CORE RULES (non-negotiable):
 5. Test EVERY discovered credential against ALL other services immediately.
 6. If Target Domain is set, use it for all web tools (VHost/SNI). Use IP only for nmap/masscan.
 7. After gaining a shell: run whoami, ip addr, sudo -l, find SUID binaries, check crons — all at once.
+8. STDIN IS CLOSED — commands CANNOT receive interactive input. All credentials MUST be embedded in command flags (never -N or anonymous when credentials are available). See CREDENTIAL EMBEDDING RULES in context.
 
 RISK LEVELS:
   low:    nmap, whois, dig, curl -I, whatweb, subfinder, httpx, gobuster dns
@@ -212,9 +213,21 @@ PHASE 6 — CLOUD / INFRASTRUCTURE (if indicators present)
   SSRF to metadata (if SSRF found): curl -s http://169.254.169.254/latest/meta-data/ && curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/
 
 === NON-INTERACTIVE EXECUTION — ABSOLUTE REQUIREMENT ===
+STDIN IS CLOSED. Commands CANNOT receive keyboard input at runtime. Any prompt for a password or confirmation will hang forever and time out.
 EVERY command must run to completion without user interaction:
   CORRECT: wpscan --url <x> --batch | msfconsole -q -x "use ...; exploit -z" | sqlmap --batch | hydra ... -t 4
-  WRONG:   msfconsole (alone) | mysql (alone without -e) | python3 (REPL mode) | any command that opens a prompt
+  WRONG:   msfconsole (alone) | mysql (alone without -e) | python3 (REPL mode) | smbclient -N (when creds exist) | any command that opens a prompt
+
+CREDENTIAL EMBEDDING — MANDATORY when credentials are available (see DISCOVERED CREDENTIALS in context):
+  smbclient:       smbclient //ip/share -U 'user%pass'    ← NEVER use -N when creds are known
+  enum4linux:      enum4linux -u user -p pass -a ip
+  enum4linux-ng:   enum4linux-ng -u user -p pass -A ip
+  crackmapexec:    crackmapexec smb ip -u user -p pass
+  rpcclient:       rpcclient -U 'user%pass' ip
+  evil-winrm:      evil-winrm -i ip -u user -p pass
+  ssh (password):  sshpass -p 'pass' ssh -o StrictHostKeyChecking=no user@ip
+  mysql:           mysql -h ip -u user -ppass -e "show databases;"
+  impacket tools:  psexec.py user:pass@ip  /  secretsdump.py user:pass@ip
 
 === RISK LEVELS ===
   LOW:    nmap, whois, dig, curl -I, whatweb, subfinder, gobuster dns, httpx, theHarvester, dnsx
