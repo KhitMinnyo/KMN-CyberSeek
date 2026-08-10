@@ -715,6 +715,12 @@ async def restart_session(session_id: str):
     session.current_stage = "reconnaissance"
     session.status = "analyzing"
 
+    import sqlite3 as _sqlite3
+    _conn = _sqlite3.connect(orchestrator.db_path)
+    _conn.execute('DELETE FROM ai_decisions WHERE session_id = ?', (session_id,))
+    _conn.commit()
+    _conn.close()
+
     logger.info(f"Smart restart for session {session_id} — keeping scan data, resetting AI state")
     asyncio.create_task(orchestrator._analyze_with_ai(session_id))
     return {"status": "success", "message": "AI state reset — re-analyzing existing scan data"}
@@ -744,6 +750,12 @@ async def rescan_session(session_id: str):
     session.auto_depth_counter = 0
     session.current_stage = "reconnaissance"
     session.status = "scanning"
+
+    import sqlite3 as _sqlite3
+    _conn = _sqlite3.connect(orchestrator.db_path)
+    _conn.execute('DELETE FROM ai_decisions WHERE session_id = ?', (session_id,))
+    _conn.commit()
+    _conn.close()
 
     logger.info(f"Full rescan for session {session_id} — all data cleared")
     asyncio.create_task(orchestrator.start_reconnaissance(session_id))
