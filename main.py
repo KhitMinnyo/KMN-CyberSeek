@@ -667,12 +667,23 @@ async def analyze_with_ai(session_id: str):
 
 @app.post("/api/sessions/{session_id}/resume")
 async def resume_session(session_id: str):
-    """Manually resume AI analysis for a session."""
+    """Manually resume AI analysis for a session.
+
+    Idempotent: if the session is already active (scanning/analyzing/executing/ready),
+    returns 200 without spawning a duplicate analysis task.  Clicking Resume on an
+    already-running session is a no-op rather than a source of duplicate commands.
+    """
     if session_id not in orchestrator.sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
+    session = orchestrator.sessions[session_id]
+    already_active = session.status in ("scanning", "analyzing", "executing", "ready")
+    if already_active:
+        logger.info(f"Resume called on already-active session {session_id} (status={session.status}) — no-op")
+        return {"status": "already_running", "message": f"Session is already active (status: {session.status})"}
+
     logger.info(f"Manual resume triggered for {session_id}")
-    orchestrator.sessions[session_id].status = "analyzing"
+    session.status = "analyzing"
     asyncio.create_task(orchestrator._analyze_with_ai(session_id))
     return {"status": "success", "message": "AI analysis resumed"}
 

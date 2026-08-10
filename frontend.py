@@ -888,14 +888,21 @@ def show_session_overview(session_details: Dict):
 
     status = session_details.get("status", "").lower()
 
-    in_progress = status in ("scanning", "analyzing", "executing")
+    # "ready" = AI autonomous loop is active (commands executing via auto-approve).
+    # Showing Resume while "ready" is misleading and dangerous — a second click
+    # spawns a duplicate _analyze_with_ai() task, doubling queued commands.
+    in_progress = status in ("scanning", "analyzing", "executing", "ready")
     has_data = (
         session_details.get("discovered_hosts_count", 0) > 0
         or session_details.get("commands_executed_count", 0) > 0
     )
 
     if in_progress:
-        st.button(f"⏳ {status.title()} in progress...", disabled=True, use_container_width=True)
+        if status == "ready":
+            st.button("🟢 Session Active — AI is running autonomously",
+                      disabled=True, use_container_width=True)
+        else:
+            st.button(f"⏳ {status.title()} in progress...", disabled=True, use_container_width=True)
         if status == "executing":
             try:
                 live_resp = api_session.get(f"{API_BASE}/sessions/{session_id}/live_output", timeout=3)
