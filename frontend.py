@@ -2300,20 +2300,23 @@ def show_docs():
     h_col, lang_col = st.columns([5, 1])
     with h_col:
         st.markdown("<h1 class='main-header'>📖 Documentation</h1>", unsafe_allow_html=True)
+    if "docs_lang" not in st.session_state:
+        st.session_state["docs_lang"] = "en"
+
     with lang_col:
         st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
-        if "docs_lang" not in st.session_state:
-            st.session_state["docs_lang"] = "en"
         cur = st.session_state["docs_lang"]
         c1, c2 = st.columns(2)
         with c1:
             if st.button("🇬🇧 EN", use_container_width=True,
-                         type="primary" if cur == "en" else "secondary"):
-                st.session_state["docs_lang"] = "en"; st.rerun()
+                         type="primary" if cur == "en" else "secondary",
+                         key="docs_lang_en"):
+                st.session_state["docs_lang"] = "en"
         with c2:
             if st.button("🇲🇲 MY", use_container_width=True,
-                         type="primary" if cur == "my" else "secondary"):
-                st.session_state["docs_lang"] = "my"; st.rerun()
+                         type="primary" if cur == "my" else "secondary",
+                         key="docs_lang_my"):
+                st.session_state["docs_lang"] = "my"
 
     lang = st.session_state["docs_lang"]
 
@@ -2458,8 +2461,8 @@ FastAPI Backend  (port 6000)
             _doc_card("OFF (default)", "Command တိုင်း manual review queue သို့ ဦးစွာ ဆောင်ရွက်မည်။", accent="#c62828")
             _doc_card("ON", "Risk level အားလုံး (LOW / MEDIUM / HIGH) ကို သတိပေးချက်မပေဘဲ auto-execute လုပ်မည်။", accent="#4caf50")
             st.info("Auto-approve setting မည်သို့ပင်ဖြစ်စေ safeguard နှစ်ခု ကျင့်သုံးသည်:\n\n"
-                    "1. **Allowlist gate** — အန္တရာယ်ရှိသော command များကို အမြဲ block ပြီး manual review သို့ ပို့သည်။\n\n"
-                    "2. **Depth checkpoint** — auto command ၁၅ ကြိမ်ဆက်တိုက် run ပြီးပါက manual approval တစ်ကြိမ် လိုသည်။")
+                    "1. Allowlist gate — အန္တရာယ်ရှိသော command များကို အမြဲ block ပြီး manual review သို့ ပို့သည်။\n\n"
+                    "2. Depth checkpoint — auto command ၁၅ ကြိမ်ဆက်တိုက် run ပြီးပါက manual approval တစ်ကြိမ် လိုသည်။")
 
     # ── AI & Commands ──────────────────────────────────────────────────────────
     with tab_ai:
@@ -2513,7 +2516,7 @@ FastAPI Backend  (port 6000)
                     'site:<domain> "index of" | "parent directory"\n'
                     '"<domain>" ext:sql|bak|env|config|log\n'
                     'site:<domain> intext:"password"|"api_key"|"secret"', language="text")
-            st.info("OSINT / Google Dorks သည် **domain target** များအတွက်သာ run သည်။ "
+            st.info("OSINT / Google Dorks သည် domain target များအတွက်သာ run သည်။ "
                     "Private IP (10.x, 192.168.x) များကို auto-skip လုပ်သည်။")
 
     # ── Threat Intel ───────────────────────────────────────────────────────────
@@ -2558,7 +2561,7 @@ FastAPI Backend  (port 6000)
             ], 1):
                 _doc_card(f"{i}. {step[0]}", step[1], accent="#1976d2")
 
-            st.warning("**Threat Intel result များသည် verify မပြုရသေး** — web page များ မှားနိုင်သည် သို့မဟုတ် ဟောင်းနေနိုင်သည်။ "
+            st.warning("Threat Intel result များသည် verify မပြုရသေး — web page များ မှားနိုင်သည် သို့မဟုတ် ဟောင်းနေနိုင်သည်။ "
                        "CVE ID တိုင်းကို NVD, Vulners, CISA KEV တွင် cross-check ပြုပြီးမှ လုပ်ဆောင်ပါ။")
 
             _doc_section("ရှာဖွေသင့်သော topic များ")
@@ -2635,7 +2638,7 @@ FastAPI Backend  (port 6000)
             _doc_card("qwen2.5:14b — Recommended", "<b>Base:</b> Qwen2.5 14B (Alibaba) &nbsp;|&nbsp; <b>14.7B parameters</b><br>"
                       "✅ Parameter 2 ဆ → JSON reliability ကောင်း &nbsp;&nbsp; ✅ Reasoning ကောင်း → stage-skip လျော့သည်<br>"
                       "❌ Cybersecurity specialized မဟုတ် &nbsp;&nbsp; ❌ RAM ~11 GB လိုသည်", accent="#4caf50")
-            st.success("**qwen2.5:14b ကိုသုံးပါ။** Session fail ၏ အကြောင်းအရင်း #1 မှာ JSON error နှင့် stage advancement ဖြစ်သည် — "
+            st.success("qwen2.5:14b ကိုသုံးပါ။ Session fail ၏ အကြောင်းအရင်း #1 မှာ JSON error နှင့် stage advancement ဖြစ်သည် — "
                        "ဒါနှစ်ခုလုံး reasoning ပြဿနာဖြစ်ပြီး ကြီးသော model ဖြင့် ဖြေရှင်းနိုင်သည်။")
 
             _doc_section("Hardware Recommendation")
