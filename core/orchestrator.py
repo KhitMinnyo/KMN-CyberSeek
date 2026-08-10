@@ -690,10 +690,11 @@ class Orchestrator:
             # Runs as fire-and-forget background tasks so it never delays the scan.
             self._schedule_auto_threat_intel(session_id)
 
-            # Run vulnerability scanning + CVE enrichment BEFORE AI analysis so its
-            # first pass is grounded in real findings instead of guessing from
-            # service/version strings alone.
-            await self._run_vulnerability_analysis(session_id)
+            # Vulnerability scanning runs in the background so it never blocks AI
+            # analysis from starting.  Findings land in session.vulnerabilities as they
+            # arrive — subsequent AI iterations (triggered after each command) will
+            # see them automatically.  Any failure here is non-fatal and logged.
+            asyncio.create_task(self._run_vulnerability_analysis(session_id))
 
             logger.info(f"Scan complete. Triggering AI analysis for session {session_id}")
 
@@ -1014,6 +1015,36 @@ class Orchestrator:
                 logger.info(f"No open ports found for session {session_id}, skipping vuln-script scan")
         except Exception as e:
             logger.warning(f"NSE vulnerability scan failed for session {session_id} (continuing without it): {e}")
+
+        # --- ExploitDB / searchsploit lookup (local, no API key required) ---
+        # Runs per service with a known version. searchsploit is a fast local
+        # binary query against the local ExploitDB copy — zero network latency,
+        # no key needed. Missing binary → silently skipped (non-fatal).
+        for service in session.discovered_services:
+            service_name = service.get('service', '') or ''
+            version = service.get('version', '') or ''
+            if not service_name or service_name.lower() in ('unknown', ''):
+                continue
+            try:
+                ss_hits = await self.scanner.searchsploit_lookup(service_name, version)
+                for hit in ss_hits:
+                    self.add_vulnerability(session_id, {
+                        "host": service.get('host', session.target_ip),
+                        "port": service.get('port'),
+                        "service": service_name,
+                        "service_version": version,
+                        "name": hit["title"],
+                        "description": f"ExploitDB: {hit['path']}",
+                        "risk_level": "high",
+                        "cve_ids": hit.get("cve_ids", []),
+                        "reference_urls": [
+                            f"https://www.exploit-db.com/exploits/{hit['path'].rsplit('/', 1)[-1].split('.')[0]}"
+                        ] if hit.get("path") else [],
+                        "source_tool": "searchsploit",
+                        "status": "unverified",
+                    })
+            except Exception as e:
+                logger.warning(f"searchsploit lookup error for {service_name} {version}: {e}")
 
         # --- Best-effort CVE enrichment via Vulners (optional, needs VULNERS_API_KEY) ---
         # Runs for every service with a known version regardless of NSE findings above,

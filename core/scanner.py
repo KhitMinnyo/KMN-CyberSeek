@@ -350,7 +350,13 @@ class Scanner:
 
     async def perform_vulnerability_scan(self, target: str, ports: Optional[List[int]] = None) -> Dict:
         """
-        Perform basic vulnerability scan using Nmap's 'vuln' NSE script category.
+        Perform targeted vulnerability scan using a curated subset of Nmap NSE scripts.
+
+        Uses "vuln and not intrusive" category (skips slow/destructive scripts) plus a
+        per-script timeout cap so a single hanging script cannot stall the whole scan.
+        A dedicated VULN_SCAN_TIMEOUT env var (default 120s) controls the total wall-clock
+        limit — kept separate from the general SCAN_TIMEOUT so recon scans and vuln scans
+        can be tuned independently.
 
         Args:
             target: IP address or domain
@@ -362,15 +368,24 @@ class Scanner:
         Returns:
             Vulnerability scan results
         """
+        import os as _os
+        VULN_SCAN_TIMEOUT = int(_os.getenv("VULN_SCAN_TIMEOUT", "120"))
+
         logger.info(f"Starting vulnerability scan on {target}" + (f" (ports: {ports})" if ports else ""))
 
         if not is_valid_target(target):
             return _invalid_target_result(target, {"vulnerabilities": []})
 
         try:
-            # Use Nmap with vulnerability scripts, scoped to known-open ports if given
+            # "vuln and not intrusive" skips slow/noisy/destructive scripts.
+            # --script-timeout 30 caps any single script so a hung check cannot
+            # block the whole scan. -T4 aggressive timing keeps service probing fast.
             port_flag = f"-p {','.join(str(int(p)) for p in ports)} " if ports else ""
-            cmd = f"nmap -sV {port_flag}--script vuln {shlex.quote(target)}"
+            cmd = (
+                f"nmap -sV -T4 {port_flag}"
+                f'--script "vuln and not intrusive" --script-timeout 30 '
+                f"{shlex.quote(target)}"
+            )
 
             process = await asyncio.create_subprocess_shell(
                 cmd,
@@ -381,19 +396,19 @@ class Scanner:
 
             try:
                 stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=SCAN_TIMEOUT
+                    process.communicate(), timeout=VULN_SCAN_TIMEOUT
                 )
             except asyncio.TimeoutError:
                 process.kill()
                 await process.communicate()
                 logger.warning(
-                    f"Vulnerability scan timed out after {SCAN_TIMEOUT}s for {target} — "
+                    f"Vulnerability scan timed out after {VULN_SCAN_TIMEOUT}s for {target} — "
                     "continuing without NSE vuln findings"
                 )
                 return {
                     "target": target,
                     "success": False,
-                    "error": f"Scan timed out after {SCAN_TIMEOUT}s",
+                    "error": f"Scan timed out after {VULN_SCAN_TIMEOUT}s",
                     "vulnerabilities": [],
                 }
 
@@ -428,6 +443,61 @@ class Scanner:
                 "vulnerabilities": []
             }
     
+    async def searchsploit_lookup(self, service: str, version: str) -> List[Dict]:
+        """
+        Query the local ExploitDB via `searchsploit` for exploits matching a
+        service + version string.  Returns an empty list (never raises) when
+        searchsploit is not installed or the query returns nothing.
+
+        Each hit is returned as:
+            {"title": str, "path": str, "type": str, "cve_ids": List[str]}
+
+        where `path` is the ExploitDB relative path (e.g.
+        "exploits/linux/remote/12345.py") and `type` is "exploit" or "shellcode".
+        """
+        if not service:
+            return []
+        query = f"{service} {version}".strip()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "searchsploit", "--json", "-t", query,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                logger.warning(f"searchsploit timed out for query: {query!r}")
+                return []
+
+            if proc.returncode != 0 or not stdout:
+                return []
+
+            data = json.loads(stdout.decode())
+            hits = []
+            for entry in data.get("RESULTS_EXPLOIT", []) + data.get("RESULTS_SHELLCODE", []):
+                title = entry.get("Title", "")
+                path  = entry.get("Path", "")
+                etype = "shellcode" if "shellcode" in path.lower() else "exploit"
+                cves  = _CVE_ID_RE.findall(title + " " + path)
+                hits.append({
+                    "title": title,
+                    "path": path,
+                    "type": etype,
+                    "cve_ids": [c.upper() for c in dict.fromkeys(cves)],
+                })
+            logger.info(f"searchsploit: {len(hits)} hits for {query!r}")
+            return hits
+
+        except FileNotFoundError:
+            # searchsploit not installed — silently skip
+            return []
+        except Exception as e:
+            logger.warning(f"searchsploit lookup failed for {query!r}: {e}")
+            return []
+
     def _parse_vulnerability_output(self, output: str) -> List[Dict]:
         """Parse vulnerability scan output."""
         vulnerabilities = []
