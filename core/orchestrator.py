@@ -469,6 +469,25 @@ class Orchestrator:
                 )
             ''')
 
+            # AI decisions table — persists every reasoning step so the history
+            # survives backend restarts.  Separate from 'commands' because not
+            # every decision results in a command (loop-prevention, critique-reject,
+            # strategist-completion records have no suggested command).
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS ai_decisions (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id  TEXT NOT NULL,
+                    timestamp   TEXT NOT NULL,
+                    reasoning   TEXT,
+                    suggested_command TEXT,
+                    risk_level  TEXT,
+                    confidence  REAL,
+                    attack_phase TEXT,
+                    context     TEXT,
+                    FOREIGN KEY (session_id) REFERENCES sessions (session_id)
+                )
+            ''')
+
             conn.commit()
             conn.close()
             logger.info(f"Database initialized at {self.db_path}")
@@ -476,6 +495,37 @@ class Orchestrator:
         except sqlite3.Error as e:
             logger.error(f"Failed to initialize database: {e}")
     
+    def _save_ai_decision(self, session_id: str, decision: Dict) -> None:
+        """Persist a single AI decision record to the database.
+
+        Non-fatal: a write failure is logged as a warning and never propagates
+        to the caller — the in-memory list is the source of truth during the
+        session; the DB copy is for restart-recovery only.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO ai_decisions
+                       (session_id, timestamp, reasoning, suggested_command,
+                        risk_level, confidence, attack_phase, context)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    decision.get("timestamp", datetime.now().isoformat()),
+                    decision.get("reasoning", ""),
+                    decision.get("suggested_command", ""),
+                    decision.get("risk_level", ""),
+                    decision.get("confidence"),
+                    decision.get("attack_phase"),
+                    decision.get("context"),
+                ),
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to persist AI decision for session {session_id}: {e}")
+
     def create_session(self, target_ip: str, target_domain: Optional[str] = None,
                       session_name: Optional[str] = None, auto_approve: bool = False,
                       max_auto_depth: int = 5, authorization_confirmed: bool = False,
@@ -1112,6 +1162,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             }
             
             session.ai_decisions.append(decision)
+            self._save_ai_decision(session_id, decision)
 
             # Advance stage: gate prevents regression and limits skipping to 1 step.
             new_stage = _advance_stage(session.current_stage, ai_response.attack_phase)
@@ -1650,6 +1701,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             }
 
             session.ai_decisions.append(decision)
+            self._save_ai_decision(session_id, decision)
 
             # Advance stage: gate prevents regression and limits skip to 1 step.
             new_stage = _advance_stage(session.current_stage, ai_response.attack_phase)
@@ -1668,14 +1720,16 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 session.auto_depth_counter = session.max_auto_depth # Force manual intervention
                 
                 # Add a pseudo-decision indicating the loop
-                session.ai_decisions.append({
+                _d = {
                     "timestamp": datetime.now().isoformat(),
                     "reasoning": "SYSTEM OVERRIDE: AI attempted to repeat a previous command. Auto-execution halted to prevent infinite loop. Manual intervention required.",
                     "suggested_command": "",
                     "risk_level": "high",
                     "confidence": 1.0,
                     "context": "loop_prevention"
-                })
+                }
+                session.ai_decisions.append(_d)
+                self._save_ai_decision(session_id, _d)
                 return # Exit early, do not execute
             
             # Check if we should auto-execute the suggested command (Agentic Loop).
@@ -1699,14 +1753,16 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         )
                         should_auto_execute = False
                         self.queue_for_approval(session_id, ai_response.suggested_command)
-                        session.ai_decisions.append({
+                        _d = {
                             "timestamp": datetime.now().isoformat(),
                             "reasoning": f"CRITIQUE REJECTED auto-exec: {vet['reason']}",
                             "suggested_command": ai_response.suggested_command,
                             "risk_level": "high",
                             "confidence": 1.0,
                             "context": "self_critique_reject",
-                        })
+                        }
+                        session.ai_decisions.append(_d)
+                        self._save_ai_decision(session_id, _d)
                     elif vet["verdict"] == "revise" and vet["command"] != ai_response.suggested_command:
                         logger.info(
                             f"Session {session_id}: critique REVISED command to "
@@ -2184,7 +2240,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             session._reuse_dispatched.add(fp)
 
             # Record the rationale as an AI decision so it shows in the UI trail.
-            session.ai_decisions.append({
+            _d = {
                 "timestamp": datetime.now().isoformat(),
                 "reasoning": (
                     f"CREDENTIAL REUSE (deterministic): testing "
@@ -2195,7 +2251,9 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 "risk_level": "high",
                 "confidence": 0.9,
                 "context": "credential_reuse",
-            })
+            }
+            session.ai_decisions.append(_d)
+            self._save_ai_decision(session_id, _d)
 
             if FULL_AUTO_MODE:
                 try:
@@ -2762,6 +2820,30 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         "source_command": source_command, "discovered_at": discovered_at
                     })
 
+                # Load AI decisions for this session
+                cursor.execute('''
+                    SELECT timestamp, reasoning, suggested_command, risk_level,
+                           confidence, attack_phase, context
+                    FROM ai_decisions
+                    WHERE session_id = ?
+                    ORDER BY id
+                ''', (session_id,))
+                for dec_row in cursor.fetchall():
+                    ts, reasoning, cmd, risk, conf, phase, ctx = dec_row
+                    _dec = {
+                        "timestamp": ts,
+                        "reasoning": reasoning or "",
+                        "suggested_command": cmd or "",
+                        "risk_level": risk or "",
+                    }
+                    if conf is not None:
+                        _dec["confidence"] = conf
+                    if phase:
+                        _dec["attack_phase"] = phase
+                    if ctx:
+                        _dec["context"] = ctx
+                    session.ai_decisions.append(_dec)
+
                 # Load pending commands into orchestrator's pending_commands dict
                 cursor.execute('''
                     SELECT command_id, command_text, status, risk_level, timestamp
@@ -3072,14 +3154,16 @@ Web apps: {webapps}
         reason = str(result.get("completion_reason", "")).strip()
         if complete and reason and session.objective_progress >= 0.85:
             session.objective_complete = True
-            session.ai_decisions.append({
+            _d = {
                 "timestamp": datetime.now().isoformat(),
                 "reasoning": f"OBJECTIVE COMPLETE (strategist): {reason}",
                 "suggested_command": "",
                 "risk_level": "low",
                 "confidence": session.objective_progress,
                 "context": "strategist_completion",
-            })
+            }
+            session.ai_decisions.append(_d)
+            self._save_ai_decision(session_id, _d)
             self.add_evidence(session_id, "objective_complete", {
                 "objective": session.objective,
                 "reason": reason,
@@ -3593,6 +3677,7 @@ Web apps: {webapps}
             cursor.execute('DELETE FROM evidence WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM vulnerabilities WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM credentials WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM ai_decisions WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
             
             conn.commit()
@@ -3637,6 +3722,7 @@ Web apps: {webapps}
             cursor.execute('DELETE FROM evidence')
             cursor.execute('DELETE FROM vulnerabilities')
             cursor.execute('DELETE FROM credentials')
+            cursor.execute('DELETE FROM ai_decisions')
             cursor.execute('DELETE FROM sessions')
             
             conn.commit()
