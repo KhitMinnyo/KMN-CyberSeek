@@ -1022,14 +1022,31 @@ def show_session_overview(session_details: Dict):
                     st.rerun()
         st.markdown("")
 
-    # ── AI loop detection: last ai_decision has context=loop_prevention ──
+    # ── AI loop / auto-pivot status ───────────────────────────────────────────
     ai_decisions = session_details.get("ai_decisions", [])
-    if ai_decisions and ai_decisions[-1].get("context") == "loop_prevention":
-        st.warning(
-            "⚠️ **AI Loop Detected** — the AI tried to repeat a command it already ran. "
-            "Auto-execution paused. Run a different command manually via the **Command Console**, "
-            "or click **Reset AI** to restart analysis from the current scan data."
+    exhausted_services = session_details.get("exhausted_services", [])
+    _last_ctx = ai_decisions[-1].get("context") if ai_decisions else ""
+
+    if _last_ctx == "pivot_limit_reached":
+        st.error(
+            "🛑 **Auto-pivot limit reached** — all known attack vectors have been "
+            "exhausted without success. Manual review required. Use **Command Console** "
+            "to try a specific technique, or **Full Rescan** to reset."
         )
+    elif _last_ctx == "auto_pivot":
+        if exhausted_services:
+            st.info(
+                f"🔄 **Auto-pivoting** — exhausted: `{'`, `'.join(exhausted_services)}`. "
+                "AI is selecting a new attack vector automatically."
+            )
+    elif _last_ctx == "loop_prevention":
+        st.warning(
+            "⚠️ **AI Loop Detected** — pivoting to next attack vector automatically. "
+            "If the session doesn't continue within a few seconds, click **Resume**."
+        )
+
+    if exhausted_services:
+        st.caption(f"🚫 Exhausted vectors (AI will skip): {', '.join(f'`{s}`' for s in exhausted_services)}")
 
     # Check if session is in analyzing state and show loading indicator
     if session_details.get("status") == "analyzing":
@@ -1449,9 +1466,20 @@ def show_ai_decisions(session_details: Dict):
         else:
             status_icon = "❌"
 
+        _ctx = decision.get("context", "")
+        _ctx_badge = ""
+        if _ctx == "loop_prevention":
+            _ctx_badge = " 🔁 loop"
+        elif _ctx == "auto_pivot":
+            _ctx_badge = " 🔄 pivot"
+        elif _ctx == "pivot_limit_reached":
+            _ctx_badge = " 🛑 pivot-limit"
+        elif _ctx == "self_critique_reject":
+            _ctx_badge = " 🛡 vetoed"
+
         label = (
             f"{status_icon} {icon} `{cmd[:90]}{'…' if len(cmd) > 90 else ''}`"
-            f" — {phase} &nbsp; `{ts}`"
+            f" — {phase}{_ctx_badge} &nbsp; `{ts}`"
         )
         with st.expander(label, expanded=False):
             st.caption(f"Risk: **{risk.upper()}**  ·  Phase: **{phase}**  ·  {ts}")
