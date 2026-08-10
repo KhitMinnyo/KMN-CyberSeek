@@ -448,9 +448,9 @@ def main():
         selected = option_menu(
             menu_title="Navigation",
             options=["Dashboard", "New Session", "Active Sessions", "Command Console",
-                     "Threat Intel", "Schedules", "History", "Settings"],
+                     "Threat Intel", "Schedules", "History", "Docs", "Settings"],
             icons=["speedometer2", "plus-circle", "list-task", "terminal",
-                   "search", "calendar-check", "clock-history", "gear"],
+                   "search", "calendar-check", "clock-history", "book", "gear"],
             menu_icon="cast",
             default_index=0,
             styles={
@@ -517,6 +517,8 @@ def main():
             show_schedules()
         elif selected == "History":
             show_history()
+        elif selected == "Docs":
+            show_docs()
         elif selected == "Settings":
             show_settings()
 
@@ -2257,6 +2259,428 @@ def show_history():
                             else:
                                 st.error(result.get("message", "Failed to complete session."))
                             st.rerun()
+
+
+def show_docs():
+    """In-app documentation page."""
+    st.markdown("<h1 class='main-header'>📖 Documentation</h1>", unsafe_allow_html=True)
+    st.caption("Everything you need to know to operate KMN-CyberSeek effectively.")
+
+    tab_gs, tab_session, tab_ai, tab_ti, tab_ollama, tab_trouble = st.tabs([
+        "🚀 Getting Started",
+        "📋 Session Guide",
+        "🤖 AI & Commands",
+        "🕸️ Threat Intel",
+        "🧠 Ollama Models",
+        "🔧 Troubleshooting",
+    ])
+
+    # ── Getting Started ────────────────────────────────────────────────────────
+    with tab_gs:
+        st.markdown("## Quick Start")
+        st.markdown("""
+1. Run `./start.sh` — starts the FastAPI backend (port 6000) and Streamlit frontend (port 8501).
+2. Open **Settings → AI Configuration** — connect Ollama or enter a DeepSeek API key.
+3. Click **New Session** — enter a target IP or domain and confirm authorization.
+4. Watch the session progress through phases in the **Session Timeline**.
+5. Review results in the **Vulnerabilities**, **AI Decisions**, and **Credentials** tabs.
+""")
+
+        st.markdown("## System Architecture")
+        st.code("""
+┌─────────────────────────────────────────────────┐
+│        Streamlit Frontend  (port 8501)           │
+│       Real-time Dashboard & Operator Controls    │
+└─────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────┐
+│        FastAPI Backend  (port 6000)              │
+│  Orchestrator │ Scanner │ AI Connector │ SQLite  │
+└─────────────────────────────────────────────────┘
+        │                │                │
+        ▼                ▼                ▼
+  ┌──────────┐   ┌──────────────┐   ┌──────────┐
+  │ AI Engine│   │ Nmap/Scanner │   │Shell Exec│
+  │ Ollama / │   │ NSE Scripts  │   │(Kali env)│
+  │DeepSeek  │   └──────────────┘   └──────────┘
+  └──────────┘
+""", language="text")
+
+        st.markdown("## Attack Chain — Phase Order")
+        phase_data = {
+            "Phase": ["osint", "reconnaissance", "enumeration", "vulnerability_analysis",
+                      "exploitation", "post_exploitation", "privilege_escalation",
+                      "lateral_movement", "credential_reuse"],
+            "What happens": [
+                "Passive intel: whois, dig, theHarvester, crt.sh, Google Dorks (domain targets only)",
+                "Active scanning: Nmap top-1000 ports with service/version detection",
+                "Subdomain, endpoint, user, and share enumeration",
+                "CVE mapping, nuclei, nikto, sqlmap",
+                "Exploit execution via Metasploit or standalone tools",
+                "Shell stabilisation, local data collection",
+                "linpeas, sudo -l, SUID checks, kernel exploits",
+                "Pivoting to adjacent hosts using found credentials",
+                "Credential spraying, pass-the-hash, Kerberoasting across all services",
+            ]
+        }
+        st.dataframe(phase_data, use_container_width=True, hide_index=True)
+
+        st.info("**Local IP targets** (10.x, 192.168.x, 172.16–31.x): OSINT phase is automatically skipped — "
+                "Google Dorks and web searches return nothing useful for private addresses.")
+
+    # ── Session Guide ──────────────────────────────────────────────────────────
+    with tab_session:
+        st.markdown("## Session Buttons — What Each Does")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("### ▶️ Resume")
+            st.markdown("Continues AI analysis from the current state — no re-scan. "
+                        "Use when session paused or stopped normally.")
+
+            st.markdown("### 🔄 Reset AI")
+            st.markdown("Keeps all nmap **scan data** (discovered hosts, services, ports). "
+                        "Clears AI decisions, commands, vulnerabilities. Re-runs AI analysis "
+                        "from the existing scan. **Use when AI went off-track or session failed "
+                        "within hours of last scan.**")
+
+        with col2:
+            st.markdown("### 🔁 Full Rescan")
+            st.markdown("Clears **everything** — scan data + AI. Runs nmap from scratch. "
+                        "Use when days have passed and port state may have changed.")
+
+            st.markdown("### 🗑️ Delete")
+            st.markdown("Permanently removes the session and all its data from the database.")
+
+        st.markdown("---")
+        st.markdown("## Session Tabs")
+        tabs_info = [
+            ("📊 Overview", "Session Timeline, button controls, Strategic Layer AI planner with objective + progress."),
+            ("🔍 Scan Results", "All discovered hosts, open ports, running services with version info."),
+            ("🛡️ Vulnerabilities", "CVEs and weaknesses found — from scanner, threat intel cache, and AI analysis."),
+            ("🤖 AI Decisions", "Every AI reasoning step: what the AI was thinking, which command it chose and why, notable findings highlighted."),
+            ("⚡ Commands", "Full command history with output. Pending approval queue shown here when manual review needed."),
+            ("📁 Evidence", "Raw tool output saved as evidence: screenshots, file listings, service banners."),
+            ("🔑 Credentials", "Extracted credentials: usernames, passwords, hashes — auto-parsed from john, hashcat, hydra output."),
+        ]
+        for tab_name, desc in tabs_info:
+            st.markdown(f"**{tab_name}** — {desc}")
+
+        st.markdown("---")
+        st.markdown("## Session Timeline — Status Icons")
+        st.markdown("""
+| Icon | Meaning |
+|------|---------|
+| ✅ Done | Stage completed — AI decisions exist for this phase |
+| 🔄 Now | Current active stage |
+| ⚡ — | Stage was skipped (AI jumped past it without working through it) |
+| ⏳ Next | Not yet reached |
+""")
+
+        st.markdown("## Auto-Approve Explained")
+        st.markdown("""
+**Auto-approve** (checkbox in New Session form and Command Console) gives the AI full autonomy for the session:
+
+- **OFF (default)**: all commands go to the pending queue for manual review.
+- **ON**: all risk levels (LOW / MEDIUM / HIGH) execute automatically.
+
+Two safeguards always apply regardless of auto-approve setting:
+1. **Allowlist gate** — structurally dangerous commands (bare interactive shells, etc.) are always blocked and routed to manual review.
+2. **Depth checkpoint** — after 15 consecutive auto-executed commands, one manual approval is required before continuing. This gives the operator a periodic review point.
+""")
+
+    # ── AI & Commands ──────────────────────────────────────────────────────────
+    with tab_ai:
+        st.markdown("## Risk Classification")
+        st.markdown("""
+Every AI-suggested command is classified **deterministically** (keyword + regex rules — not left to the LLM):
+
+| Level | Description | Auto-execute? |
+|-------|-------------|---------------|
+| 🟢 LOW | Read-only / passive — no observable impact. `nmap`, `curl -I`, `whois`, `dig`, `whatweb` | ✅ Yes (auto-approve) |
+| 🟡 MEDIUM | Active — leaves traces but causes no damage. `nikto`, `gobuster`, `nuclei`, `sqlmap --dbs` | ✅ Yes (auto-approve) |
+| 🔴 HIGH | Destructive / irreversible — may crash services or exfiltrate data. `hydra`, `msfconsole`, `sqlmap --dump`, `hashcat` | ⚠️ Requires manual approval unless auto-approve on |
+""")
+
+        st.markdown("## Strategic Layer (AI Planner)")
+        st.markdown("""
+The Strategic Layer runs **separately from the tactical command loop**. Every 5 commands, it steps back and:
+
+1. Evaluates overall objective progress (0–100%).
+2. Updates the multi-step plan (what to do next, what's been exhausted).
+3. Writes a reflection note about the engagement state.
+4. Declares **objective complete** when root / SYSTEM / Domain Admin is reached — this halts the agentic loop.
+
+**Progress % updates every 5 commands** (strategist interval). If progress looks frozen, wait for the next command to complete.
+""")
+
+        st.markdown("## AI Decisions Tab — Notable Findings")
+        st.markdown("""
+The AI Decisions tab highlights **notable findings** at the top — commands whose output contained keywords like:
+`password`, `hash`, `CVE`, `shell`, `admin`, `root`, `credential`, `exploit`, `vulnerable`
+
+These are the high-value results worth reviewing immediately.
+The full list (most recent first) shows every AI reasoning step with command, output, and risk level.
+""")
+
+        st.markdown("## Command Console")
+        st.markdown("""
+The **Command Console** lets you manually enter and execute arbitrary commands against the session target — outside the AI loop. Useful for:
+
+- Running a specific tool the AI hasn't tried
+- Quickly verifying a finding
+- Injecting a command result into the session context
+
+**Auto-approve checked by default** — uncheck to route the command to the pending queue first.
+""")
+
+        st.markdown("## OSINT — Google Dorks")
+        st.code("""
+site:<domain> filetype:pdf|xlsx|docx|pptx|sql|bak|env|config|log
+site:<domain> inurl:admin|login|portal|dashboard
+site:<domain> "index of" | "parent directory"
+"<domain>" ext:sql|bak|env|config|log
+site:<domain> intext:"password"|"api_key"|"secret"
+""", language="text")
+        st.info("OSINT / Google Dorks only run for **domain targets**. Private/local IPs (10.x, 192.168.x) "
+                "skip OSINT automatically — web searches return nothing useful for internal addresses.")
+
+    # ── Threat Intel ───────────────────────────────────────────────────────────
+    with tab_ti:
+        st.markdown("## What is Threat Intel?")
+        st.markdown("""
+The **Threat Intel** page is a standalone research tool that builds a **local vulnerability knowledge base** over time.
+It is completely separate from live pentest sessions — it never issues shell commands and cannot affect an active engagement.
+""")
+
+        st.markdown("## How It Works")
+        st.markdown("""
+1. Enter a free-text topic — software name, version, or CVE query (e.g., `Apache httpd 2.4.49`, `GlassFish 4.1`, `latest critical CVEs 2026`).
+2. KMN-CyberSeek searches **DuckDuckGo** for `{topic} CVE vulnerability`, fetches up to 5 result pages.
+3. Each page's plain text is sent to the AI using an **isolated extraction prompt** (separate from the pentest AI).
+4. The AI extracts structured findings — CVE IDs, title, description, affected software, severity.
+5. Findings are stored in the local SQLite `threat_intel_cache` table with `verified=False`.
+""")
+
+        st.markdown("## How Sessions Use the Cache")
+        st.markdown("""
+- After every nmap scan, the orchestrator **cross-references discovered service names** against the cache.
+- Matching entries are added to the session's Vulnerabilities tab as `source_tool: threat-intel-cache` / `status: unverified`.
+- Background research tasks fire automatically for newly discovered services not yet in the cache — the knowledge base grows on its own.
+""")
+
+        st.warning("**All Threat Intel findings are unverified by design.** "
+                   "Web pages can be wrong, outdated, or deliberately misleading. "
+                   "Treat every result as a lead to investigate — cross-check CVE IDs against "
+                   "NVD, Vulners, or CISA KEV before acting.")
+
+        st.markdown("## What to Research")
+        st.markdown("""
+After a scan reveals services, search for those service names and versions:
+
+| Topic to search | Example finding |
+|----------------|----------------|
+| `Apache httpd 2.4.49` | CVE-2021-41773 path traversal RCE |
+| `ProFTPD 1.3.5` | mod_copy unauthenticated RCE |
+| `OpenSSH 7.2p2` | Username enumeration CVE |
+| `GlassFish 4.1` | CVE-2017-1000028 unauthenticated RCE |
+| `Tomcat 7.0` | CVE-2020-1938 Ghostcat AJP RCE |
+""")
+
+    # ── Ollama Models ──────────────────────────────────────────────────────────
+    with tab_ollama:
+        st.markdown("## What the AI Needs to Do Well")
+        st.markdown("""
+KMN-CyberSeek depends on the model for three things, in order of importance:
+
+1. **Structured JSON output** — every AI response must be valid JSON. A model that garbles this causes parse failures and halts the session.
+2. **Multi-step reasoning** — the model must plan a full attack chain without skipping phases after 3 commands.
+3. **Security command vocabulary** — knows nmap flags, CVE identifiers, Metasploit modules, GlassFish/Tomcat/SMB quirks.
+""")
+
+        st.markdown("## DeepHat vs qwen2.5 — Which to Use?")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("### DeepHat V1-7B")
+            st.markdown("""
+**Base:** Qwen2.5-Coder-7B fine-tuned on cybersecurity data
+**Size:** 7.61B parameters
+**Context:** 32,768 tokens default
+
+✅ Security vocabulary excellent out of the box
+✅ Understands CVE IDs, exploit frameworks natively
+✅ Smaller — faster on limited hardware
+
+❌ 7B = weaker reasoning — prone to stage-skipping
+❌ JSON compliance inconsistent → parse errors
+❌ NOT fully uncensored (usage restrictions in license)
+""")
+
+        with col2:
+            st.markdown("### qwen2.5:14b ✅ Recommended")
+            st.markdown("""
+**Base:** Qwen2.5 14B (Alibaba)
+**Size:** 14.7B parameters
+**Context:** 32,768 tokens
+
+✅ 2× parameters → significantly better JSON reliability
+✅ Better multi-step reasoning → fewer stage-skip bugs
+✅ Understands security commands well
+✅ More resistant to hallucinating progress
+
+❌ Not cybersecurity-specialized (general model)
+❌ Requires ~11 GB RAM
+""")
+
+        st.success("**Use qwen2.5:14b as primary.** "
+                   "The #1 cause of session failures is bad JSON output and premature stage advancement — "
+                   "both are reasoning problems that a larger model solves better than a specialized smaller one.")
+
+        st.markdown("## Hardware Recommendations")
+        hw_data = {
+            "Hardware": ["M2 Mac Mini 24GB (current)", "M2 Mac Mini 24GB (current)", "M4 Pro 64GB (upcoming)", "M4 Pro 64GB (upcoming)"],
+            "Model": ["qwen2.5:14b ⭐", "deepseek-r1:14b", "qwen2.5:72b ⭐", "deepseek-r1:70b"],
+            "Disk": ["~9 GB", "~9 GB", "~42 GB", "~40 GB"],
+            "Context (recommended)": ["32,768", "32,768", "65,536", "32,768"],
+            "RAM usage": ["~11 GB", "~11 GB", "~45 GB", "~42 GB"],
+        }
+        st.dataframe(hw_data, use_container_width=True, hide_index=True)
+
+        st.markdown("## Quick Setup")
+        col_m2, col_m4 = st.columns(2)
+        with col_m2:
+            st.markdown("**M2 Mac Mini 24GB**")
+            st.code("ollama pull qwen2.5:14b", language="bash")
+            st.markdown("Settings → AI Configuration:  \nModel: `qwen2.5:14b`  \nContext: `32768`")
+        with col_m4:
+            st.markdown("**M4 Pro 64GB**")
+            st.code("ollama pull qwen2.5:72b", language="bash")
+            st.markdown("Settings → AI Configuration:  \nModel: `qwen2.5:72b`  \nContext: `65536`")
+
+        st.markdown("## Context Window — Why It Matters")
+        st.markdown("""
+Local models have a fixed context window. When session history exceeds it, the model silently forgets old content — causing:
+
+- Repeated commands (forgot it already tried that)
+- Stage regression (forgot it was in exploitation, reverts to recon)
+- Hallucinated progress (confused about what actually ran)
+
+**Built-in mitigations in KMN-CyberSeek:**
+- Episode summaries — every N commands, old history is compressed into a structured summary and re-injected.
+- Configurable context window — **Settings → AI Configuration → Context window** directly controls Ollama's `num_ctx`.
+""")
+        ctx_data = {
+            "Model size": ["7–8B", "13–14B", "32B", "70–72B"],
+            "Safe context window": ["16,384", "32,768", "32,768–65,536", "65,536–131,072"],
+        }
+        st.dataframe(ctx_data, use_container_width=True, hide_index=True)
+
+    # ── Troubleshooting ────────────────────────────────────────────────────────
+    with tab_trouble:
+        st.markdown("## Common Issues")
+
+        issues = [
+            (
+                "Session status shows FAILED but terminal still has activity",
+                "Asyncio tasks queued before the failure finish running after status changed. "
+                "This is normal — the backend drains the queue then stops. "
+                "Wait a few seconds, refresh the page. Use **Reset AI** to restart analysis.",
+            ),
+            (
+                "`echo 'AI response parsing error'` appears in command history",
+                "The AI returned invalid JSON (model cut off mid-response, or wrapped output in markdown). "
+                "This is now fixed — the session halts cleanly on parse failure instead of running a fake echo command. "
+                "If you see this on an old session, do a **Reset AI**. "
+                "Switching to a larger model (qwen2.5:14b) significantly reduces parse failures.",
+            ),
+            (
+                "Session Timeline shows all stages ✅ Done after only 5 commands",
+                "Old bug: AI jumped to `credential_reuse` attack_phase immediately, making all prior stages appear done. "
+                "Fixed — the stage gate now prevents advancing more than 1 phase per AI decision. "
+                "Do a **Reset AI** on affected sessions.",
+            ),
+            (
+                "Progress % stuck at 5% and not increasing",
+                "The Strategic Layer (AI Planner) runs every 5 completed commands. "
+                "If 5 commands haven't finished yet, progress won't update. "
+                "Wait for the next batch of 5, or do a **Reset AI** to trigger a fresh strategist pass.",
+            ),
+            (
+                "Resume button showing when session is actively running",
+                "Session status was `ready` (AI autonomous loop active) but Resume was showing. "
+                "Fixed — `ready` status now shows '🟢 Session Active' instead of the Resume button. "
+                "Update and restart the frontend.",
+            ),
+            (
+                "Pending commands piling up / approve button doesn't clear the queue",
+                "Two possible causes: (1) auto_approve is off — commands go to queue by design. "
+                "(2) max auto-depth reached (15 consecutive commands) — one manual approval resets the counter. "
+                "Check the Commands tab and approve pending items.",
+            ),
+            (
+                "AI keeps suggesting the same command repeatedly",
+                "Context window overflow — the model forgot it already ran that command. "
+                "Increase the context window in Settings (try 32768 or 65536). "
+                "Also try switching to a larger model (14B+).",
+            ),
+            (
+                "Session History shows 'No sessions recorded yet'",
+                "Fixed in recent version — was caused by FastAPI route order bug where "
+                "`/api/sessions/{id}` matched before `/api/sessions/history`. "
+                "Update to latest and restart the backend.",
+            ),
+            (
+                "OSINT running on local/private IP targets",
+                "Fixed — private IPs (10.x, 192.168.x, 172.16–31.x, localhost) now skip "
+                "internet-based OSINT automatically. The AI context note explains to the model "
+                "why Google Dorks won't work on private addresses.",
+            ),
+            (
+                "Backend not starting / port conflict",
+                "`start.sh` automatically detects port conflicts and finds the next free port. "
+                "Check the terminal output for the actual port being used. "
+                "You can also set `BACKEND_PORT` and `FRONTEND_PORT` in `.env`.",
+            ),
+        ]
+
+        for title, detail in issues:
+            with st.expander(f"❓ {title}"):
+                st.markdown(detail)
+
+        st.markdown("---")
+        st.markdown("## Port Configuration")
+        st.code("""
+# .env
+BACKEND_PORT=6000    # FastAPI backend
+FRONTEND_PORT=8501   # Streamlit frontend
+""", language="ini")
+
+        st.markdown("## API Reference (key endpoints)")
+        api_data = {
+            "Method": ["POST", "GET", "POST", "POST", "POST", "POST", "DELETE", "GET"],
+            "Endpoint": [
+                "/api/sessions",
+                "/api/sessions/history",
+                "/api/sessions/{id}/resume",
+                "/api/sessions/{id}/restart",
+                "/api/sessions/{id}/rescan",
+                "/api/sessions/{id}/approve/{cmd_id}",
+                "/api/sessions/{id}",
+                "/api/stats",
+            ],
+            "Description": [
+                "Create new session",
+                "List all sessions from DB",
+                "Resume AI analysis (idempotent — safe to call on running session)",
+                "Reset AI state, keep scan data",
+                "Full rescan — clear everything, re-run nmap",
+                "Approve a pending command",
+                "Delete session",
+                "Dashboard stats",
+            ],
+        }
+        st.dataframe(api_data, use_container_width=True, hide_index=True)
 
 
 def show_settings():
