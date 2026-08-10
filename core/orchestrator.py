@@ -1650,6 +1650,10 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 # regardless of auto_approve (e.g. interactive shells with no args).
                 # Note: requires_approval() keyword gate is NOT applied here when
                 # auto_approve=True — the operator has explicitly accepted all risk levels.
+                #
+                # _queued_already tracks whether queue_for_approval has already been called
+                # so the final else block does NOT double-queue the same command.
+                _queued_already = False
                 if should_auto_execute:
                     allowlist_rejection = is_allowlisted_command(ai_response.suggested_command)
                     if allowlist_rejection:
@@ -1658,6 +1662,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                             f"{ai_response.suggested_command[:100]}"
                         )
                         should_auto_execute = False
+                        _queued_already = True
                         self.queue_for_approval(session_id, ai_response.suggested_command)
 
                 # Depth counter gate: pause auto-execution and require one manual
@@ -1669,31 +1674,29 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         f"Pausing for one manual approval checkpoint."
                     )
                     should_auto_execute = False
+                    _queued_already = True
                     self.queue_for_approval(session_id, ai_response.suggested_command)
-            
+
             if should_auto_execute:
                 # Check for critical findings in output to reset auto depth counter
                 output_lower = output.lower()
                 critical_keywords = ["vulnerable", "exploit", "password", "credential", "access", "login", "admin", "shell", "root"]
                 found_critical = any(keyword in output_lower for keyword in critical_keywords)
-                
+
                 if found_critical:
-                    # Reset counter on critical finding
                     session.auto_depth_counter = 0
                     session.last_auto_success = True
                     logger.info(f"Critical finding detected in output, resetting auto depth counter for session {session_id}")
                 else:
-                    # Increment counter for non-critical execution
                     session.auto_depth_counter += 1
                     session.last_auto_success = False
-                
-                # Auto-execute the command
+
                 logger.info(f"Auto-executing command for session {session_id} (depth: {session.auto_depth_counter}): {ai_response.suggested_command[:100]}...")
                 asyncio.create_task(self.execute_command(session_id, ai_response.suggested_command))
-            else:
-                # Queue for approval based on risk level (original behavior)
-                if ai_response.risk_level == "low":
-                    self.queue_for_approval(session_id, ai_response.suggested_command)
+            elif not _queued_already:
+                # Manual mode (auto_approve=False, FULL_AUTO_MODE=False) and no prior queue call.
+                # Queue for operator review regardless of risk level — don't silently drop commands.
+                self.queue_for_approval(session_id, ai_response.suggested_command)
             
         except Exception as e:
             logger.error(f"Failed to process command output: {e}")

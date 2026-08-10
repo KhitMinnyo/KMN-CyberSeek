@@ -832,10 +832,14 @@ def display_session_details(session_details: Dict):
 
     st.markdown("---")
     
-    # Session tabs
+    # Session tabs — show pending command count on Commands tab so operator
+    # knows when manual approval is needed without opening the tab first.
+    pending_count = len(session_details.get("pending_commands", []))
+    cmd_tab_label = f"⚡ Commands ({pending_count} pending)" if pending_count > 0 else "⚡ Commands"
+
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         ["📊 Overview", "🔍 Scan Results", "🛡️ Vulnerabilities", "🤖 AI Decisions",
-         "⚡ Commands", "📁 Evidence", "🔑 Credentials"]
+         cmd_tab_label, "📁 Evidence", "🔑 Credentials"]
     )
 
     with tab1:
