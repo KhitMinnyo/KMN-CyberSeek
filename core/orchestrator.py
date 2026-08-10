@@ -1145,6 +1145,21 @@ Discovered Hosts: {len(session.discovered_hosts)}
 Discovered Services: {len(session.discovered_services)}
 Credentials Found: {len(session.credentials)}
 
+=== DISCOVERED CREDENTIALS (embed directly in command flags — NEVER rely on interactive prompts) ===
+{self._format_credentials_for_ai(session)}
+CREDENTIAL EMBEDDING RULES:
+- smbclient:          smbclient //ip/share -U 'user%pass'   (drop -N when creds are available)
+- enum4linux:         enum4linux -u user -p pass -a ip
+- enum4linux-ng:      enum4linux-ng -u user -p pass -A ip
+- crackmapexec/nxc:   crackmapexec smb ip -u user -p pass
+- rpcclient:          rpcclient -U 'user%pass' ip
+- evil-winrm:         evil-winrm -i ip -u user -p pass
+- ssh:                sshpass -p 'pass' ssh user@ip OR ssh -i keyfile user@ip
+- mysql:              mysql -h ip -u user -ppass (no space before pass)
+- mssql (impacket):   mssqlclient.py user:pass@ip
+- ftp:                ftp -n ip <<< $'user user\\npass pass\\n...'
+If NO credentials found: use null/anonymous session flags (-N, -U "", anonymous).
+
 === DOMAIN / WEB ATTACK SURFACE ===
 Discovered Subdomains ({len(session.discovered_subdomains)}):
 {', '.join(session.discovered_subdomains[:40]) or 'None yet — run subfinder/gobuster dns if domain target'}
@@ -1377,6 +1392,87 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         logger.info(f"Command queued for approval: {command_id}")
         return command_id
     
+    def _inject_credentials(self, command: str, session) -> str:
+        """Rewrite a command to embed known credentials so it runs non-interactively.
+
+        When the session has discovered credentials, this rewrites common tool
+        invocations to use them via command-line flags instead of relying on
+        interactive prompts (which are broken now that stdin=DEVNULL).
+
+        Only the first suitable credential is used (target-IP match preferred,
+        otherwise any credential). Returns the original command unchanged if no
+        credential is available or the tool pattern is not recognised.
+        """
+        if not session.credentials:
+            return command
+
+        # Prefer creds that match the target host; fall back to any available.
+        creds_for_target = [
+            c for c in session.credentials
+            if session.target_ip in (c.get('host', ''), c.get('service', ''), '')
+        ]
+        cred = (creds_for_target or session.credentials)[0]
+        user = (cred.get('username') or '').strip()
+        passwd = (cred.get('secret') or '').strip()
+
+        if not user:
+            return command
+
+        # ── smbclient ────────────────────────────────────────────────────────
+        # Replace -N (null session) with -U 'user%pass', or append if neither present.
+        if re.search(r'\bsmbclient\b', command) and '-U' not in command:
+            command = re.sub(r'(?<!\S)-N\b', '', command)
+            command += f" -U '{user}%{passwd}'"
+
+        # ── enum4linux / enum4linux-ng ────────────────────────────────────────
+        elif re.search(r'\benum4linux(?:-ng)?\b', command) and '-u' not in command:
+            command = re.sub(
+                r'(\benum4linux(?:-ng)?\b)',
+                lambda m: f"{m.group(0)} -u {shlex.quote(user)} -p {shlex.quote(passwd)}",
+                command, count=1
+            )
+
+        # ── crackmapexec / nxc smb ───────────────────────────────────────────
+        elif re.search(r'\b(?:crackmapexec|nxc)\s+smb\b', command) and '-u' not in command:
+            command = re.sub(
+                r'(\b(?:crackmapexec|nxc)\s+smb\b)',
+                lambda m: f"{m.group(0)} -u {shlex.quote(user)} -p {shlex.quote(passwd)}",
+                command, count=1
+            )
+
+        # ── rpcclient ────────────────────────────────────────────────────────
+        elif re.search(r'\brpcclient\b', command):
+            # Replace empty -U "" / -U '' or missing -U entirely
+            if re.search(r'''-U\s+["']["']''', command):
+                command = re.sub(r'''-U\s+["']["']''', f"-U '{user}%{passwd}'", command)
+            elif '-U' not in command:
+                command += f" -U '{user}%{passwd}'"
+
+        # ── evil-winrm ───────────────────────────────────────────────────────
+        elif re.search(r'\bevil-winrm\b', command) and '-u' not in command:
+            command += f" -u {shlex.quote(user)} -p {shlex.quote(passwd)}"
+
+        # ── mysql (empty-password shortcut) ──────────────────────────────────
+        elif re.search(r'\bmysql\b', command) and '-p' not in command and passwd:
+            command = re.sub(
+                r'(\bmysql\b)',
+                lambda m: f"{m.group(0)} -u {shlex.quote(user)} -p{shlex.quote(passwd)}",
+                command, count=1
+            )
+
+        # ── psexec.py / wmiexec.py / secretsdump.py (Impacket) ───────────────
+        elif re.search(r'\b(?:psexec|wmiexec|smbexec|secretsdump)\.py\b', command):
+            # Impacket tools accept DOMAIN/user:pass@ format; inject if plain IP used
+            if not re.search(r'[^/]@', command):
+                # Append before the target: tool.py [opts] user:pass@target
+                command = re.sub(
+                    r'''(?<= )(\d{1,3}(?:\.\d{1,3}){3}|[\w.-]+)(?= |$)''',
+                    lambda m: f"{user}:{passwd}@{m.group(0)}",
+                    command, count=1
+                )
+
+        return command
+
     async def execute_command(self, session_id: str, command: str) -> Dict:
         """Execute a command and capture output."""
         session = self.sessions.get(session_id)
@@ -1423,9 +1519,15 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # Mark any service this command targets as in_progress (state machine).
             self._mark_services_in_progress(session, command)
 
-            # Execute command with increased timeout for advanced tools (nikto, wpscan, msfconsole)
+            # Inject known credentials before execution so tools run non-interactively
+            command = self._inject_credentials(command, session)
+
+            # stdin=DEVNULL: close stdin so tools that prompt for a password
+            # (smbclient, mysql, ftp, etc.) receive EOF instead of blocking on
+            # terminal input. All credentials must be embedded in command flags.
             process = await asyncio.create_subprocess_shell(
                 command,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd="/tmp"  # Safe directory
@@ -3618,6 +3720,29 @@ Web apps: {webapps}
                 f"  • {e['title']} | CVE: {cves} | severity: {sev}"
                 + (f" | software: {sw}" if sw else "")
             )
+        return "\n".join(lines)
+
+    def _format_credentials_for_ai(self, session) -> str:
+        """Format discovered credentials for inclusion in the AI prompt.
+
+        Shows the full username + secret so the AI can embed them directly in
+        command flags rather than guessing or relying on interactive prompts.
+        Shows at most 10 most recent credentials to keep token usage bounded.
+        Returns a ready-to-paste summary string, or 'None discovered yet.'
+        """
+        if not session.credentials:
+            return "None discovered yet."
+        lines = []
+        for c in session.credentials[-10:]:
+            user    = c.get('username', '?')
+            secret  = c.get('secret', '')
+            stype   = c.get('secret_type', 'password')
+            service = c.get('service') or c.get('host') or '?'
+            host    = c.get('host', '')
+            parts = [f"  {user}:{secret}  [{stype}]  service={service}"]
+            if host and host != service:
+                parts.append(f"  host={host}")
+            lines.append("".join(parts))
         return "\n".join(lines)
 
     def _summarize_vulnerabilities(self, session: Session) -> List[Dict]:
