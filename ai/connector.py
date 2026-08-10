@@ -6,6 +6,7 @@ Supports both local Ollama (DeepSeek models) and DeepSeek API
 import json
 import logging
 import os
+import re
 from typing import Dict, List, Optional, Any
 
 from dotenv import load_dotenv
@@ -17,6 +18,48 @@ import requests
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_json(text: str) -> Optional[dict]:
+    """Extract the first valid JSON object from arbitrary AI output.
+
+    Handles the common failure modes where a model wraps its JSON in markdown
+    code fences, adds a preamble sentence, or emits thinking tokens before the
+    actual response.
+
+    Returns the parsed dict, or None if no valid JSON object was found.
+    """
+    if not text:
+        return None
+
+    # 1. Strip markdown fences (```json ... ``` or ``` ... ```)
+    stripped = re.sub(r'```(?:json)?\s*(.*?)\s*```', r'\1', text, flags=re.DOTALL).strip()
+
+    # 2. Try the stripped text first (clean path)
+    for candidate in (stripped, text):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Find the outermost {...} by scanning brace depth — handles preamble text
+    #    and models that emit a sentence before the JSON blob.
+    start = text.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    break  # malformed even after extraction — give up
+
+    return None
 
 
 class AIResponse(BaseModel):
@@ -242,29 +285,22 @@ class KMN_AI_Connector:
             response.raise_for_status()
             
             result = response.json()
-            response_text = result.get('response', '{}')
-            
-            # Parse JSON response
-            try:
-                # Extract JSON from response (handles cases where AI adds extra text)
-                import re
-                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-                if json_match:
-                    response_text = json_match.group(0)
-                
-                ai_data = json.loads(response_text)
-                return AIResponse(**ai_data)
-                
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse AI response: {response_text}")
-                # Fallback response
-                return AIResponse(
-                    reasoning="Failed to parse AI response",
-                    suggested_command="echo 'AI response parsing error'",
-                    risk_level="low",
-                    confidence=0.0,
-                    attack_phase="reconnaissance"
+            response_text = result.get('response', '')
+
+            # Parse JSON response — use robust extractor that handles markdown
+            # fences, preamble text, and thinking tokens before the JSON blob.
+            ai_data = _extract_json(response_text)
+            if ai_data is None:
+                logger.error(
+                    f"Could not extract valid JSON from Ollama response "
+                    f"(model={self.local_model}): {response_text[:500]}"
                 )
+                return None  # Caller (orchestrator) handles None: logs + stops session cleanly
+            try:
+                return AIResponse(**ai_data)
+            except Exception as e:
+                logger.error(f"AIResponse validation failed: {e} | data={ai_data}")
+                return None
                 
         except requests.exceptions.RequestException as e:
             logger.error(f"Local AI request failed: {e}")
@@ -321,22 +357,22 @@ class KMN_AI_Connector:
                 
                 result = response.json()
                 response_text = result['choices'][0]['message']['content']
-                
-                # Parse JSON response
-                try:
-                    ai_data = json.loads(response_text)
-                    return AIResponse(**ai_data)
-                    
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse API response: {response_text}")
-                    # Fallback response
-                    return AIResponse(
-                        reasoning="Failed to parse AI response",
-                        suggested_command="echo 'AI response parsing error'",
-                        risk_level="low",
-                        confidence=0.0,
-                        attack_phase="reconnaissance"
+
+                # Parse JSON response — use robust extractor that handles any
+                # extra text or fences the API model might emit despite the
+                # json_object response_format hint.
+                ai_data = _extract_json(response_text)
+                if ai_data is None:
+                    logger.error(
+                        f"Could not extract valid JSON from API response "
+                        f"(model={self.api_model}): {response_text[:500]}"
                     )
+                    return None  # Caller handles None: logs + stops cleanly
+                try:
+                    return AIResponse(**ai_data)
+                except Exception as e:
+                    logger.error(f"AIResponse validation failed: {e} | data={ai_data}")
+                    return None
                     
         except httpx.RequestError as e:
             logger.error(f"API request failed: {e}")

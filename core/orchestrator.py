@@ -1561,7 +1561,14 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 
             # Get AI decision for next step, passing memory to AI
             ai_response = await self.ai_connector.ask_ai_async(context, session_id, memory=memory_string)
-            
+
+            # Guard against None (JSON parse failure, model timeout, validation error).
+            # Log and stop this loop iteration cleanly — do NOT execute a fallback command.
+            if not ai_response:
+                logger.error(f"AI returned no valid response for session {session_id} (post-command). Halting loop.")
+                session.status = "error"
+                return
+
             # Store AI decision
             decision = {
                 "timestamp": datetime.now().isoformat(),
