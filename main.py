@@ -587,6 +587,86 @@ async def get_vulnerabilities(session_id: str):
     }
 
 
+# ── Shell session endpoints ────────────────────────────────────────────────────
+
+class StartHandlerRequest(BaseModel):
+    lhost: str
+    lport: int = 4444
+    payload: str = "windows/x64/meterpreter/reverse_tcp"
+
+
+class ShellExecRequest(BaseModel):
+    command: str
+
+
+@app.post("/api/sessions/{session_id}/shells/handler")
+async def start_handler(session_id: str, req: StartHandlerRequest):
+    """Start a Metasploit multi/handler listener for this session."""
+    if not orchestrator.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    info = await orchestrator.start_shell_handler(
+        session_id, req.lhost, req.lport, req.payload
+    )
+    return {"status": "started", "handler": info}
+
+
+@app.delete("/api/sessions/{session_id}/shells/handler/{handler_id}")
+async def stop_handler(session_id: str, handler_id: str):
+    """Stop a running multi/handler."""
+    ok = await orchestrator.stop_shell_handler(session_id, handler_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Handler not found")
+    return {"status": "stopped", "handler_id": handler_id}
+
+
+@app.get("/api/sessions/{session_id}/shells/handlers")
+async def list_handlers(session_id: str):
+    """List all handlers (live + persisted config) for a session."""
+    live    = orchestrator.get_shell_handlers(session_id)
+    saved   = orchestrator.get_persisted_handlers(session_id)
+    # Merge: live state takes precedence over saved state
+    live_ids = {h["handler_id"] for h in live}
+    merged  = live + [s for s in saved if s["handler_id"] not in live_ids]
+    return {"handlers": merged, "count": len(merged)}
+
+
+@app.get("/api/sessions/{session_id}/shells")
+async def list_shell_sessions(session_id: str):
+    """List active meterpreter/shell sessions for a pentest session."""
+    sessions = orchestrator.get_shell_sessions(session_id)
+    return {"sessions": sessions, "count": len(sessions)}
+
+
+@app.post("/api/sessions/{session_id}/shells/{handler_id}/{msf_id}/exec")
+async def exec_in_shell(session_id: str, handler_id: str, msf_id: int,
+                        req: ShellExecRequest):
+    """Run a command inside an active meterpreter or shell session."""
+    output = await orchestrator.run_shell_command(
+        session_id, handler_id, msf_id, req.command
+    )
+    return {
+        "session_id": session_id,
+        "handler_id": handler_id,
+        "msf_id":     msf_id,
+        "command":    req.command,
+        "output":     output,
+    }
+
+
+@app.get("/api/sessions/{session_id}/shells/{handler_id}/{msf_id}/history")
+async def shell_command_history(session_id: str, handler_id: str, msf_id: int):
+    """Return the command history for an active shell session."""
+    history = orchestrator.get_shell_command_history(session_id, handler_id, msf_id)
+    return {"history": history, "count": len(history)}
+
+
+@app.get("/api/shells/local-ip")
+async def get_local_ip():
+    """Return the primary non-loopback IP of this machine (suggested LHOST)."""
+    from core.shell_manager import get_local_ip as _local_ip
+    return {"local_ip": _local_ip()}
+
+
 @app.get("/api/sessions/{session_id}/live_output")
 async def get_live_output(session_id: str):
     """Return the current streaming command output buffer for a session.
