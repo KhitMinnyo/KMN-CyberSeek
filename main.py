@@ -679,16 +679,50 @@ async def resume_session(session_id: str):
 
 @app.post("/api/sessions/{session_id}/restart")
 async def restart_session(session_id: str):
-    """Restart a session from scratch — clears all scan data and re-runs nmap + AI.
-    Unlike /resume (which continues from existing data), /restart discards all
-    discovered hosts, services, commands, AI decisions, and vulnerabilities and
-    runs the full reconnaissance pipeline again."""
+    """Smart restart — keeps existing nmap scan data (hosts/services/ports) but
+    clears all AI decisions, commands, and vulnerabilities, then re-runs AI
+    analysis from the existing scan data.
+
+    Use this when the AI loop failed or went off-track but the scan data is
+    still valid (e.g. session failed within hours of the last scan). Avoids an
+    expensive nmap re-scan when the port state hasn't had time to change.
+
+    For a full re-scan (e.g. days have passed and port state may have changed),
+    use POST /api/sessions/{session_id}/rescan instead.
+    """
     if session_id not in orchestrator.sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = orchestrator.sessions[session_id]
 
-    # Clear all accumulated data so the restart is truly from zero
+    # Preserve scan data — hosts, services, and raw scan blobs stay intact so
+    # the AI sees the same network context without re-running nmap.
+    session.commands_executed.clear()
+    session.ai_decisions.clear()
+    session.vulnerabilities.clear()
+    session.auto_depth_counter = 0
+    session.current_stage = "reconnaissance"
+    session.status = "analyzing"
+
+    logger.info(f"Smart restart for session {session_id} — keeping scan data, resetting AI state")
+    asyncio.create_task(orchestrator._analyze_with_ai(session_id))
+    return {"status": "success", "message": "AI state reset — re-analyzing existing scan data"}
+
+
+@app.post("/api/sessions/{session_id}/rescan")
+async def rescan_session(session_id: str):
+    """Full rescan — clears ALL data (scan results, commands, AI decisions,
+    vulnerabilities, credentials) and re-runs the complete nmap + AI pipeline.
+
+    Use this when port state may have changed (e.g. days since last scan) or
+    you want a completely fresh start. For a faster reset that keeps scan data,
+    use POST /api/sessions/{session_id}/restart instead.
+    """
+    if session_id not in orchestrator.sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = orchestrator.sessions[session_id]
+
     session.discovered_hosts.clear()
     session.discovered_services.clear()
     session.scan_results.clear()
@@ -700,9 +734,9 @@ async def restart_session(session_id: str):
     session.current_stage = "reconnaissance"
     session.status = "scanning"
 
-    logger.info(f"Restarting session {session_id} from scratch")
+    logger.info(f"Full rescan for session {session_id} — all data cleared")
     asyncio.create_task(orchestrator.start_reconnaissance(session_id))
-    return {"status": "success", "message": "Session restarted from scratch"}
+    return {"status": "success", "message": "Full rescan started from scratch"}
 
 
 @app.get("/api/ollama/models")
