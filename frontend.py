@@ -2317,13 +2317,10 @@ def show_docs():
 
     lang = st.session_state["docs_lang"]
 
-    _TAB_NAMES = {
-        "en": ["🚀 Getting Started", "📋 Session Guide", "🤖 AI & Commands",
-               "🕸️ Threat Intel", "🧠 Ollama Models", "🔧 Troubleshooting"],
-        "my": ["🚀 စတင်နည်း", "📋 Session လမ်းညွှန်", "🤖 AI & Commands",
-               "🕸️ Threat Intel", "🧠 Ollama Models", "🔧 ပြဿနာ ဖြေရှင်းနည်း"],
-    }
-    tab_gs, tab_session, tab_ai, tab_ti, tab_ollama, tab_trouble = st.tabs(_TAB_NAMES[lang])
+    tab_gs, tab_session, tab_ai, tab_ti, tab_ollama, tab_trouble = st.tabs([
+        "🚀 Getting Started", "📋 Session Guide", "🤖 AI & Commands",
+        "🕸️ Threat Intel", "🧠 Ollama Models", "🔧 Troubleshooting",
+    ])
 
     # ── Getting Started ────────────────────────────────────────────────────────
     with tab_gs:
