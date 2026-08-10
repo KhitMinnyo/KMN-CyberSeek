@@ -901,6 +901,20 @@ def show_session_overview(session_details: Dict):
         or session_details.get("commands_executed_count", 0) > 0
     )
 
+    # Detect "ghost running": status=failed but commands are still being logged.
+    # This happens when asyncio tasks queued before the failure keep executing.
+    # Show an informational banner so the user knows the backend will drain soon.
+    if status == "failed":
+        cmd_count = session_details.get("commands_executed_count", 0)
+        ai_count  = session_details.get("ai_decisions_count", len(session_details.get("ai_decisions", [])))
+        if cmd_count > 0 or ai_count > 0:
+            st.warning(
+                "⚠️ **Session marked failed** — queued tasks may still be finishing in the background. "
+                "Wait a few seconds, then refresh. If the problem persists, use **Reset AI** to restart analysis "
+                "from the existing scan data, or **Full Rescan** to start from scratch.",
+                icon=None
+            )
+
     if in_progress:
         if status == "ready":
             st.button("🟢 Session Active — AI is running autonomously",
