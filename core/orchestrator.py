@@ -1611,13 +1611,15 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 session.status = "error"
                 return
 
-            # Store AI decision
+            # Store AI decision — include attack_phase so the frontend timeline
+            # can identify which stages actually had decisions (vs. skipped).
             decision = {
                 "timestamp": datetime.now().isoformat(),
                 "reasoning": ai_response.reasoning,
                 "suggested_command": ai_response.suggested_command,
                 "risk_level": ai_response.risk_level,
                 "confidence": ai_response.confidence,
+                "attack_phase": ai_response.attack_phase,
                 "context": "post_command_analysis"
             }
 
