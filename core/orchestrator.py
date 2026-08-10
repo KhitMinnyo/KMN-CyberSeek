@@ -1927,26 +1927,73 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             session.current_stage = new_stage
             self._save_session_status(session_id, session)
 
-            # ANTI-LOOP GUARDRAIL: Check if the AI suggested a command we recently executed
-            recent_commands = [cmd.get('command', '').strip() for cmd in session.commands_executed[-5:]]
-            if ai_response.suggested_command and ai_response.suggested_command.strip() in recent_commands:
-                logger.warning(f"LOOP DETECTED for session {session_id}! AI suggested repeating: {ai_response.suggested_command}")
-                # Force the session to stop auto-executing
+            # ANTI-LOOP GUARDRAIL ─────────────────────────────────────────────
+            # Two complementary checks:
+            #   1. Normalized-command match  — catches variations that differ only
+            #      in output-redirection suffixes (| tee, 2>&1, > file), case, or
+            #      minor flag tweaks (-R vs -r). The AI was evading the old exact-
+            #      match check by appending "2>&1 | tee /tmp/..." to each retry.
+            #   2. Stage stagnation counter — catches longer loops where the AI
+            #      cycles through a *set* of different-looking commands all within
+            #      the same stage without producing a successful result or advancing.
+
+            def _norm_cmd(cmd: str) -> str:
+                """Return a normalised command string suitable for loop detection."""
+                c = cmd.strip()
+                # Strip common output-capture suffixes that the AI adds on retries
+                c = re.sub(r'\s*2?>?&?\d*\s*\|?\s*tee\s+\S+', '', c)   # | tee FILE
+                c = re.sub(r'\s*2>&1', '', c)                            # 2>&1
+                c = re.sub(r'\s*>+\s*\S+', '', c)                       # > file / >> file
+                # Collapse whitespace and lowercase for case-insensitive comparison
+                c = re.sub(r'\s+', ' ', c).strip().lower()
+                return c
+
+            _suggested_norm = _norm_cmd(ai_response.suggested_command or "")
+            _recent_norms   = [_norm_cmd(cmd.get('command', ''))
+                               for cmd in session.commands_executed[-8:]]
+
+            # Check 1: normalised duplicate
+            _loop_reason = None
+            if _suggested_norm and _suggested_norm in _recent_norms:
+                _loop_reason = (
+                    "SYSTEM OVERRIDE: AI suggested a command equivalent to one recently "
+                    "executed (differs only in output redirection or minor flags). "
+                    "Auto-execution halted to prevent infinite loop."
+                )
+
+            # Check 2: stage stagnation — same stage for 8+ consecutive decisions
+            # without the stage advancing means the AI is spinning in place.
+            if not _loop_reason:
+                _stage_decisions = [
+                    d for d in session.ai_decisions[-8:]
+                    if d.get("attack_phase") == session.current_stage
+                ]
+                if len(_stage_decisions) >= 8:
+                    _loop_reason = (
+                        f"SYSTEM OVERRIDE: Session has made 8+ consecutive AI decisions "
+                        f"at stage '{session.current_stage}' without advancing. "
+                        "Likely stuck — halting auto-execution. "
+                        "Try a different approach or advance to the next stage manually."
+                    )
+
+            if _loop_reason:
+                logger.warning(
+                    f"LOOP/STAGNATION DETECTED for session {session_id}: {_loop_reason[:120]}"
+                )
                 session.status = "ready"
-                session.auto_depth_counter = session.max_auto_depth # Force manual intervention
-                
-                # Add a pseudo-decision indicating the loop
+                session.auto_depth_counter = session.max_auto_depth
+
                 _d = {
                     "timestamp": datetime.now().isoformat(),
-                    "reasoning": "SYSTEM OVERRIDE: AI attempted to repeat a previous command. Auto-execution halted to prevent infinite loop. Manual intervention required.",
+                    "reasoning": _loop_reason,
                     "suggested_command": "",
                     "risk_level": "high",
                     "confidence": 1.0,
-                    "context": "loop_prevention"
+                    "context": "loop_prevention",
                 }
                 session.ai_decisions.append(_d)
                 self._save_ai_decision(session_id, _d)
-                return # Exit early, do not execute
+                return  # Exit early — do not execute
             
             # Check if we should auto-execute the suggested command (Agentic Loop).
             # FULL_AUTO_MODE: skip risk-level and confidence filters entirely.
