@@ -973,6 +973,7 @@ def show_session_overview(session_details: Dict):
                 icon=None
             )
 
+    # ── Status indicator + live output ────────────────────────────────────────
     if in_progress:
         if status == "ready":
             st.button("🟢 Session Active — AI is running autonomously",
@@ -992,78 +993,71 @@ def show_session_overview(session_details: Dict):
                         )
             except Exception:
                 pass
-    else:
-        btn_col1, btn_col2, btn_col3 = st.columns(3)
 
-        # For failed sessions: Restart is the recommended action (session errored out).
-        # For all others with data: Resume continues AI from current state.
-        # For fresh initialized sessions: Start begins the first scan.
-        # Button layout depends on session status:
-        #
-        # failed  → Reset AI (primary) | Rescan | Delete
-        #   Reset AI keeps nmap data, clears AI state — fastest recovery.
-        #   Rescan re-runs nmap from scratch — use when days have passed.
-        #
-        # others  → Resume/Start (primary) | Reset AI | Delete
-        if status == "failed":
-            with btn_col1:
-                if st.button("🔄 Reset AI",
-                             help="Keep scan data — clear AI decisions/commands and re-analyze. "
-                                  "Fastest recovery when session failed within hours of last scan.",
-                             type="primary", use_container_width=True):
-                    api_session.post(f"{API_BASE}/sessions/{session_id}/restart")
-                    time.sleep(0.5)
-                    st.rerun()
-            with btn_col2:
+    # ── Session control buttons — always visible regardless of status ─────────
+    # Resume/Start are hidden while in_progress to prevent spawning duplicate AI
+    # loops. Reset AI, Delete, and Full Rescan are always available so the user
+    # can interrupt a stuck/looping/failed session without waiting for it to stop.
+    st.markdown("")
+    btn_col1, btn_col2, btn_col3 = st.columns(3)
+
+    if not in_progress:
+        # Resume / Start — only safe to show when session is not already running
+        with btn_col1:
+            if status == "failed":
                 if st.button("▶️ Resume",
                              help="Retry AI analysis on existing scan data without clearing anything.",
                              use_container_width=True):
                     api_session.post(f"{API_BASE}/sessions/{session_id}/resume")
                     time.sleep(0.5)
                     st.rerun()
-        else:
-            with btn_col1:
-                if status == "initialized" and not has_data:
-                    label = "🚀 Start"
-                    tip = "Run initial nmap scan and begin AI analysis"
-                    endpoint = f"{API_BASE}/sessions/{session_id}/start"
-                else:
-                    label = "▶️ Resume"
-                    tip = "Continue AI analysis from current scan data (no re-scan)"
-                    endpoint = f"{API_BASE}/sessions/{session_id}/resume"
-                if st.button(label, help=tip, type="primary", use_container_width=True):
-                    api_session.post(endpoint)
+            elif status == "initialized" and not has_data:
+                if st.button("🚀 Start",
+                             help="Run initial nmap scan and begin AI analysis",
+                             type="primary", use_container_width=True):
+                    api_session.post(f"{API_BASE}/sessions/{session_id}/start")
                     time.sleep(0.5)
                     st.rerun()
-            with btn_col2:
-                if st.button("🔄 Reset AI",
-                             help="Clear AI decisions/commands, keep scan data, re-analyze. "
-                                  "Use when AI went off-track but scan is still valid.",
-                             use_container_width=True):
-                    api_session.post(f"{API_BASE}/sessions/{session_id}/restart")
+            else:
+                if st.button("▶️ Resume",
+                             help="Continue AI analysis from current scan data (no re-scan)",
+                             type="primary", use_container_width=True):
+                    api_session.post(f"{API_BASE}/sessions/{session_id}/resume")
                     time.sleep(0.5)
                     st.rerun()
 
-        with btn_col3:
-            if st.button("🗑️ Delete", help="Permanently delete this session and all its data",
-                         use_container_width=True):
-                response = api_session.delete(f"{API_BASE}/sessions/{session_id}")
-                if response.status_code == 200:
-                    st.session_state.selected_session = None
-                    time.sleep(0.5)
-                    st.rerun()
-                else:
-                    st.error(f"Failed to delete session: {response.status_code}")
+    with btn_col2:
+        _reset_primary = in_progress and status == "failed"
+        if st.button("🔄 Reset AI",
+                     help="Keep scan data — clear AI decisions/commands and re-analyze. "
+                          "Safe to use while session is running (stops the current loop).",
+                     type="primary" if _reset_primary else "secondary",
+                     use_container_width=True):
+            api_session.post(f"{API_BASE}/sessions/{session_id}/restart")
+            time.sleep(0.5)
+            st.rerun()
 
-        # Full rescan — separate row, less prominent (expensive operation)
-        if has_data:
-            if st.button("🔁 Full Rescan",
-                         help="Days have passed and port state may have changed? "
-                              "Clears ALL data (scan + AI) and re-runs nmap from scratch.",
-                         use_container_width=True):
-                api_session.post(f"{API_BASE}/sessions/{session_id}/rescan")
+    with btn_col3:
+        if st.button("🗑️ Delete",
+                     help="Permanently delete this session and all its data",
+                     use_container_width=True):
+            response = api_session.delete(f"{API_BASE}/sessions/{session_id}")
+            if response.status_code == 200:
+                st.session_state.selected_session = None
                 time.sleep(0.5)
                 st.rerun()
+            else:
+                st.error(f"Failed to delete session: {response.status_code}")
+
+    # Full rescan — separate row, less prominent (expensive operation)
+    if has_data:
+        if st.button("🔁 Full Rescan",
+                     help="Days have passed and port state may have changed? "
+                          "Clears ALL data (scan + AI) and re-runs nmap from scratch.",
+                     use_container_width=True):
+            api_session.post(f"{API_BASE}/sessions/{session_id}/rescan")
+            time.sleep(0.5)
+            st.rerun()
 
     # Report download
     if st.button("📄 Download DOCX Report", use_container_width=True):
