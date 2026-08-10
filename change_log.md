@@ -4,6 +4,27 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.1.3] — 2026-08-10
+
+### Added
+- **Auto-pivot on loop detection** (`core/orchestrator.py`) — when the anti-loop guardrail fires, the session no longer halts. Instead it automatically:
+  1. Detects which attack vector was being looped on (`_detect_exhausted_target()` heuristic).
+  2. Adds it to `session.exhausted_services` (persisted to DB, survives restarts).
+  3. Logs an `auto_pivot` decision in the AI Decisions tab.
+  4. Resets the auto-execution depth counter and re-invokes the AI with the exhausted vector injected as context — so the AI skips it and picks the next viable target.
+- **`_detect_exhausted_target()`** — module-level heuristic that classifies recent commands into a named vector label (`smb`, `ftp`, `tomcat_8080`, `glassfish`, `ssh_bruteforce`, `web_dir_enum`, etc.).
+- **`_auto_pivot()` method** — orchestrator method driving the pivot flow. Enforces a configurable `MAX_AUTO_PIVOTS` cap (default 6, via env var). When the cap is hit, logs a `pivot_limit_reached` decision and falls back to manual-wait.
+- **`EXHAUSTED ATTACK VECTORS` block in AI context** — injected at the top of every `_analyze_with_ai()` call when `session.exhausted_services` is non-empty. AI receives a hard instruction not to suggest any command targeting an exhausted vector.
+- **`exhausted_services` DB column** — added to `sessions` table via migration. Saved on every status transition. Restored on backend restart.
+- **Frontend — exhausted services display** (Overview tab):
+  - Auto-pivot in progress → `🔄 Auto-pivoting` info banner listing which vectors were exhausted.
+  - Pivot limit reached → `🛑 Auto-pivot limit reached` error banner.
+  - Always-visible caption listing all exhausted vectors when non-empty.
+- **AI Decisions log badges** — context-specific badges on each decision row: `🔁 loop`, `🔄 pivot`, `🛑 pivot-limit`, `🛡 vetoed`.
+- **`MAX_AUTO_PIVOTS` env var** — operator-configurable cap on consecutive auto-pivots before falling back to manual. Default `6`.
+
+---
+
 ## [2.1.2] — 2026-08-10
 
 ### Added

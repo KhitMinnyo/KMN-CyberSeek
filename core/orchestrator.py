@@ -95,6 +95,52 @@ def _advance_stage(current: str, proposed: str) -> str:
     return _STAGE_ORDER[next_idx]
 
 
+def _detect_exhausted_target(cmds: List[str], stage: str) -> str:
+    """Heuristic: detect which service/attack-vector the AI was repeatedly attempting.
+
+    Scans the normalised text of recent commands and returns a short label that
+    is added to session.exhausted_services so the AI knows to skip it.
+    Falls back to a stage-scoped label if no specific tool is recognisable.
+    """
+    joined = " ".join(cmds).lower()
+    # SMB family
+    if any(t in joined for t in ["smbclient", "enum4linux", "smbmap", "rpcclient",
+                                  "crackmapexec smb", "nxc smb", "nmap -p 139,445",
+                                  "nmap -p445", "nmap -p 445"]):
+        return "smb"
+    # FTP
+    if "ftp" in joined and ("nmap" not in joined or "ftp" in joined.replace("nmap", "")):
+        return "ftp"
+    # Tomcat
+    if "8080" in joined or "tomcat" in joined or "manager/html" in joined:
+        return "tomcat_8080"
+    # GlassFish
+    if any(p in joined for p in ["4848", "8181", "glassfish"]):
+        return "glassfish"
+    # SSH brute-force
+    if "hydra" in joined and "ssh" in joined:
+        return "ssh_bruteforce"
+    if "medusa" in joined and "ssh" in joined:
+        return "ssh_bruteforce"
+    # Web directory brute
+    if any(t in joined for t in ["gobuster", "dirb", "ffuf", "dirbuster"]):
+        return "web_dir_enum"
+    # Nikto
+    if "nikto" in joined:
+        return "nikto_web"
+    # Metasploit exploit module
+    if "exploit/" in joined or "auxiliary/" in joined:
+        return f"msf_{stage}"
+    # RDP
+    if "3389" in joined or "rdp" in joined:
+        return "rdp"
+    # SNMP
+    if "snmp" in joined or "161" in joined:
+        return "snmp"
+    # Fallback: label by stage
+    return f"{stage}_exhausted"
+
+
 # Service test-lifecycle ordering. Transitions only ever move a service UP this
 # ladder (a tested service never reverts to untested).
 _SERVICE_STATE_ORDER: Dict[str, int] = {
@@ -231,6 +277,14 @@ class Session:
         # generated, so the deterministic trigger never queues the same check twice.
         self._reuse_dispatched: set = set()
 
+        # Auto-pivot: attack vectors that have been exhausted (looped out) and
+        # should be skipped. Persisted to DB so pivots survive backend restarts.
+        self.exhausted_services: List[str] = []
+        # Safety cap: after this many consecutive auto-pivots without advancing
+        # the stage, stop and wait for manual intervention.
+        self._auto_pivot_count: int = 0
+        self._MAX_AUTO_PIVOTS: int = int(os.getenv("MAX_AUTO_PIVOTS", "6"))
+
     def to_dict(self) -> Dict:
         """Convert session to dictionary."""
         return {
@@ -260,6 +314,7 @@ class Session:
             "objective_complete": self.objective_complete,
             "strategic_plan": self.strategic_plan,
             "reflections": self.reflections[-5:],
+            "exhausted_services": self.exhausted_services,
         }
 
 
@@ -345,6 +400,7 @@ class Orchestrator:
                 ("objective_progress",     "REAL DEFAULT 0.0"),
                 ("objective_progress_note","TEXT DEFAULT ''"),
                 ("objective_complete",     "BOOLEAN DEFAULT FALSE"),
+                ("exhausted_services",     "TEXT DEFAULT '[]'"),
             ]
             for col_name, col_def in _strategic_cols:
                 try:
@@ -1247,6 +1303,18 @@ class Orchestrator:
 
             # Prepare context for AI with CRITICAL RULE about domain usage
             _active_shells = self.get_shell_sessions(session_id)
+
+            # Exhausted attack vectors — injected so AI skips them automatically
+            _exhausted_ctx = ""
+            if session.exhausted_services:
+                _exhausted_ctx = (
+                    "\n=== EXHAUSTED ATTACK VECTORS — DO NOT RETRY ===\n"
+                    + "\n".join(f"- {s}" for s in session.exhausted_services)
+                    + "\nThese vectors have been looped on and abandoned. "
+                    "Choose a DIFFERENT service, port, or technique. "
+                    "Do not suggest any command that targets an exhausted vector.\n"
+                )
+
             _shell_ctx = ""
             if _active_shells:
                 _shell_ctx = (
@@ -1258,7 +1326,7 @@ class Orchestrator:
 
             context = f"""
 {_target_type_note}
-
+{_exhausted_ctx}
 {self._plan_context_block(session)}
 === TARGET CONTEXT ===
 Target IP:     {session.target_ip}
@@ -2028,9 +2096,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 logger.warning(
                     f"LOOP/STAGNATION DETECTED for session {session_id}: {_loop_reason[:120]}"
                 )
-                session.status = "ready"
-                session.auto_depth_counter = session.max_auto_depth
-
+                # Log the loop_prevention decision for audit trail
                 _d = {
                     "timestamp": datetime.now().isoformat(),
                     "reasoning": _loop_reason,
@@ -2041,7 +2107,11 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 }
                 session.ai_decisions.append(_d)
                 self._save_ai_decision(session_id, _d)
-                return  # Exit early — do not execute
+                # Auto-pivot: mark exhausted vector and re-run AI with fresh context
+                # instead of halting. _auto_pivot() enforces a safety cap and falls
+                # back to manual-wait mode if all viable paths are exhausted.
+                await self._auto_pivot(session_id, _loop_reason)
+                return  # _auto_pivot() re-schedules _analyze_with_ai internally
             
             # Check if we should auto-execute the suggested command (Agentic Loop).
             # FULL_AUTO_MODE: skip risk-level and confidence filters entirely.
@@ -2289,13 +2359,99 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         try:
             conn = sqlite3.connect(self.db_path)
             conn.execute(
-                "UPDATE sessions SET current_stage = ?, status = ? WHERE session_id = ?",
-                (session.current_stage, session.status, session_id),
+                "UPDATE sessions SET current_stage = ?, status = ?, exhausted_services = ? WHERE session_id = ?",
+                (session.current_stage, session.status,
+                 json.dumps(session.exhausted_services), session_id),
             )
             conn.commit()
             conn.close()
         except sqlite3.Error as e:
             logger.warning(f"Failed to persist session status for {session_id}: {e}")
+
+    async def _auto_pivot(self, session_id: str, loop_reason: str) -> None:
+        """Auto-pivot when the AI loops on a failing attack vector.
+
+        Instead of halting the session (old behaviour), we:
+          1. Detect what the AI was trying from recent commands.
+          2. Add that vector to session.exhausted_services so future AI calls
+             see it under "EXHAUSTED ATTACK VECTORS — DO NOT RETRY".
+          3. Reset the depth counter so auto-execution can continue.
+          4. Re-invoke the AI analysis — which will now pick a different target.
+
+        A safety cap (_MAX_AUTO_PIVOTS) stops runaway pivoting if the AI
+        somehow exhausts every option without advancing the stage.
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        if session._auto_pivot_count >= session._MAX_AUTO_PIVOTS:
+            logger.warning(
+                f"Session {session_id}: max auto-pivots ({session._MAX_AUTO_PIVOTS}) "
+                "reached — halting and waiting for manual intervention."
+            )
+            session.status = "ready"
+            session.auto_depth_counter = session.max_auto_depth
+            _d = {
+                "timestamp": datetime.now().isoformat(),
+                "reasoning": (
+                    f"AUTO-PIVOT LIMIT REACHED ({session._MAX_AUTO_PIVOTS} pivots). "
+                    f"Exhausted vectors: {', '.join(session.exhausted_services)}. "
+                    "All known attack paths have been attempted. Manual review required."
+                ),
+                "suggested_command": "",
+                "risk_level": "high",
+                "confidence": 1.0,
+                "context": "pivot_limit_reached",
+            }
+            session.ai_decisions.append(_d)
+            self._save_ai_decision(session_id, _d)
+            self._save_session_status(session_id, session)
+            return
+
+        session._auto_pivot_count += 1
+
+        # Detect what was being tried
+        recent_cmds = [c.get("command", "") for c in session.commands_executed[-8:]]
+        exhausted_label = _detect_exhausted_target(recent_cmds, session.current_stage)
+
+        if exhausted_label and exhausted_label not in session.exhausted_services:
+            session.exhausted_services.append(exhausted_label)
+            logger.info(
+                f"Session {session_id}: auto-pivot #{session._auto_pivot_count} — "
+                f"marked exhausted: '{exhausted_label}'. "
+                f"Total exhausted: {session.exhausted_services}"
+            )
+        else:
+            logger.info(
+                f"Session {session_id}: auto-pivot #{session._auto_pivot_count} — "
+                f"'{exhausted_label}' already exhausted, continuing with updated context."
+            )
+
+        # Log a pivot decision so the AI Decisions tab shows what happened
+        _d = {
+            "timestamp": datetime.now().isoformat(),
+            "reasoning": (
+                f"AUTO-PIVOT #{session._auto_pivot_count}: '{exhausted_label}' marked exhausted. "
+                f"{loop_reason[:200]} "
+                f"Automatically continuing with next available attack vector."
+            ),
+            "suggested_command": "",
+            "risk_level": "medium",
+            "confidence": 1.0,
+            "context": "auto_pivot",
+        }
+        session.ai_decisions.append(_d)
+        self._save_ai_decision(session_id, _d)
+
+        # Reset depth counter so auto-execution quota is fresh for the new vector
+        session.auto_depth_counter = 0
+        session.status = "analyzing"
+        self._save_session_status(session_id, session)
+
+        # Brief pause so the frontend can reflect the pivot decision, then resume
+        await asyncio.sleep(3)
+        await self._analyze_with_ai(session_id)
 
     def _save_command_result(self, session_id: str, command_id: str, command: str,
                            output: str, error: str, return_code: int):
@@ -3109,7 +3265,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                        COALESCE(reflections, '[]'),
                        COALESCE(objective_progress, 0.0),
                        COALESCE(objective_progress_note, ''),
-                       COALESCE(objective_complete, 0)
+                       COALESCE(objective_complete, 0),
+                       COALESCE(exhausted_services, '[]')
                 FROM sessions
                 WHERE status NOT IN ('completed', 'failed')
                 ORDER BY created_at DESC
@@ -3121,7 +3278,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 (session_id, target_ip, target_domain, status, current_stage,
                  auto_approve, authorization_confirmed,
                  db_objective, db_plan_json, db_reflections_json,
-                 db_progress, db_progress_note, db_complete) = session_row
+                 db_progress, db_progress_note, db_complete,
+                 db_exhausted_json) = session_row
 
                 # Create session object
                 session = Session(session_id, target_ip, target_domain, auto_approve, bool(authorization_confirmed))
@@ -3146,6 +3304,12 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 session.objective_progress = float(db_progress or 0.0)
                 session.objective_progress_note = db_progress_note or ""
                 session.objective_complete = bool(db_complete)
+                try:
+                    ex = json.loads(db_exhausted_json)
+                    if isinstance(ex, list):
+                        session.exhausted_services = ex
+                except (json.JSONDecodeError, TypeError):
+                    pass
                 
                 # Load scan results
                 cursor.execute('''
