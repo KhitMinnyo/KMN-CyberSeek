@@ -630,6 +630,62 @@ async def list_threat_intel(topic: Optional[str] = None):
     return {"topic_filter": topic, "findings": findings, "count": len(findings)}
 
 
+@app.get("/api/vulnerabilities")
+async def list_all_vulnerabilities(
+    source_tool: Optional[str] = None,
+    service: Optional[str] = None,
+    risk_level: Optional[str] = None,
+):
+    """Return structured vulnerability findings across ALL sessions from the DB.
+
+    Optional query params (all substring / exact match):
+      source_tool  – e.g. 'nvd', 'searchsploit', 'nmap-vuln-script', 'vulners'
+      service      – e.g. 'http', 'ssh'  (substring, case-insensitive)
+      risk_level   – 'high' | 'medium' | 'low' | 'unknown'
+    """
+    import sqlite3 as _sqlite3
+    import json as _json
+
+    rows: list = []
+    try:
+        conn = _sqlite3.connect(orchestrator.db_path)
+        conn.row_factory = _sqlite3.Row
+        query = """
+            SELECT v.*, s.target_ip, s.target_hostname, s.name AS session_name
+            FROM vulnerabilities v
+            LEFT JOIN sessions s ON s.session_id = v.session_id
+            WHERE 1=1
+        """
+        params: list = []
+        if source_tool:
+            query += " AND v.source_tool = ?"
+            params.append(source_tool)
+        if service:
+            query += " AND v.service LIKE ?"
+            params.append(f"%{service}%")
+        if risk_level:
+            query += " AND v.risk_level = ?"
+            params.append(risk_level)
+        query += " ORDER BY v.discovered_at DESC"
+        cur = conn.execute(query, params)
+        for row in cur.fetchall():
+            d = dict(row)
+            for json_field in ("cve_ids", "reference_urls"):
+                raw = d.get(json_field)
+                if isinstance(raw, str):
+                    try:
+                        d[json_field] = _json.loads(raw)
+                    except Exception:
+                        d[json_field] = []
+            rows.append(d)
+        conn.close()
+    except Exception as exc:
+        logger.error(f"Failed to query global vulnerabilities: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"vulnerabilities": rows, "count": len(rows)}
+
+
 @app.post("/api/sessions/{session_id}/start")
 async def start_session_scan(session_id: str):
     """Start initial reconnaissance scan for a session."""
