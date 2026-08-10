@@ -912,24 +912,44 @@ def show_session_overview(session_details: Dict):
     else:
         btn_col1, btn_col2, btn_col3 = st.columns(3)
 
-        with btn_col1:
-            if status == "initialized" and not has_data:
-                label, tip = "🚀 Start", "Run initial nmap scan and begin AI analysis"
-                endpoint = f"{API_BASE}/sessions/{session_id}/start"
-            else:
-                label, tip = "▶️ Resume", "Continue AI analysis from current scan data (no re-scan)"
-                endpoint = f"{API_BASE}/sessions/{session_id}/resume"
-            if st.button(label, help=tip, type="primary", use_container_width=True):
-                api_session.post(endpoint)
-                time.sleep(0.5)
-                st.rerun()
-
-        with btn_col2:
-            if st.button("🔄 Restart", help="Clear all data and re-run nmap scan from scratch",
-                         use_container_width=True):
-                api_session.post(f"{API_BASE}/sessions/{session_id}/restart")
-                time.sleep(0.5)
-                st.rerun()
+        # For failed sessions: Restart is the recommended action (session errored out).
+        # For all others with data: Resume continues AI from current state.
+        # For fresh initialized sessions: Start begins the first scan.
+        if status == "failed":
+            col_resume, col_restart, col_delete = btn_col1, btn_col2, btn_col3
+            with col_restart:
+                if st.button("🔄 Restart", help="Clear data and re-run nmap + AI from scratch",
+                             type="primary", use_container_width=True):
+                    api_session.post(f"{API_BASE}/sessions/{session_id}/restart")
+                    time.sleep(0.5)
+                    st.rerun()
+            with col_resume:
+                if st.button("▶️ Resume", help="Retry AI analysis on existing scan data (no re-scan)",
+                             use_container_width=True):
+                    api_session.post(f"{API_BASE}/sessions/{session_id}/resume")
+                    time.sleep(0.5)
+                    st.rerun()
+        else:
+            col_start, col_restart, col_delete = btn_col1, btn_col2, btn_col3
+            with col_start:
+                if status == "initialized" and not has_data:
+                    label = "🚀 Start"
+                    tip = "Run initial nmap scan and begin AI analysis"
+                    endpoint = f"{API_BASE}/sessions/{session_id}/start"
+                else:
+                    label = "▶️ Resume"
+                    tip = "Continue AI analysis from current scan data (no re-scan)"
+                    endpoint = f"{API_BASE}/sessions/{session_id}/resume"
+                if st.button(label, help=tip, type="primary", use_container_width=True):
+                    api_session.post(endpoint)
+                    time.sleep(0.5)
+                    st.rerun()
+            with col_restart:
+                if st.button("🔄 Restart", help="Clear all data and re-run nmap scan from scratch",
+                             use_container_width=True):
+                    api_session.post(f"{API_BASE}/sessions/{session_id}/restart")
+                    time.sleep(0.5)
+                    st.rerun()
 
         with btn_col3:
             if st.button("🗑️ Delete", help="Permanently delete this session and all its data",
