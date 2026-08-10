@@ -16,7 +16,6 @@ from typing import Dict, List, Optional
 import requests
 import streamlit as st
 from dotenv import dotenv_values
-from streamlit_autorefresh import st_autorefresh
 from streamlit_option_menu import option_menu
 
 # Configure logging
@@ -405,9 +404,6 @@ def complete_session(session_id: str):
 
 def main():
     """Main Streamlit application."""
-    
-    # Auto-refresh every 5 seconds
-    st_autorefresh(interval=5000, key="auto_refresh")
     
     # Sidebar navigation
     with st.sidebar:

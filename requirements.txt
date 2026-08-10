@@ -25,7 +25,6 @@ pydantic-settings>=2.5.0  # Compatible with 2.1.x
 # Streamlit frontend dependencies
 streamlit>=1.28.1  # Streamlit 1.x is stable
 streamlit-option-menu>=0.3.6
-streamlit-autorefresh>=1.0.1
 
 # AI/LLM integration
 openai>=1.6.1  # OpenAI 1.x is stable
