@@ -915,23 +915,31 @@ def show_session_overview(session_details: Dict):
         # For failed sessions: Restart is the recommended action (session errored out).
         # For all others with data: Resume continues AI from current state.
         # For fresh initialized sessions: Start begins the first scan.
+        # Button layout depends on session status:
+        #
+        # failed  → Reset AI (primary) | Rescan | Delete
+        #   Reset AI keeps nmap data, clears AI state — fastest recovery.
+        #   Rescan re-runs nmap from scratch — use when days have passed.
+        #
+        # others  → Resume/Start (primary) | Reset AI | Delete
         if status == "failed":
-            col_resume, col_restart, col_delete = btn_col1, btn_col2, btn_col3
-            with col_restart:
-                if st.button("🔄 Restart", help="Clear data and re-run nmap + AI from scratch",
+            with btn_col1:
+                if st.button("🔄 Reset AI",
+                             help="Keep scan data — clear AI decisions/commands and re-analyze. "
+                                  "Fastest recovery when session failed within hours of last scan.",
                              type="primary", use_container_width=True):
                     api_session.post(f"{API_BASE}/sessions/{session_id}/restart")
                     time.sleep(0.5)
                     st.rerun()
-            with col_resume:
-                if st.button("▶️ Resume", help="Retry AI analysis on existing scan data (no re-scan)",
+            with btn_col2:
+                if st.button("▶️ Resume",
+                             help="Retry AI analysis on existing scan data without clearing anything.",
                              use_container_width=True):
                     api_session.post(f"{API_BASE}/sessions/{session_id}/resume")
                     time.sleep(0.5)
                     st.rerun()
         else:
-            col_start, col_restart, col_delete = btn_col1, btn_col2, btn_col3
-            with col_start:
+            with btn_col1:
                 if status == "initialized" and not has_data:
                     label = "🚀 Start"
                     tip = "Run initial nmap scan and begin AI analysis"
@@ -944,8 +952,10 @@ def show_session_overview(session_details: Dict):
                     api_session.post(endpoint)
                     time.sleep(0.5)
                     st.rerun()
-            with col_restart:
-                if st.button("🔄 Restart", help="Clear all data and re-run nmap scan from scratch",
+            with btn_col2:
+                if st.button("🔄 Reset AI",
+                             help="Clear AI decisions/commands, keep scan data, re-analyze. "
+                                  "Use when AI went off-track but scan is still valid.",
                              use_container_width=True):
                     api_session.post(f"{API_BASE}/sessions/{session_id}/restart")
                     time.sleep(0.5)
@@ -961,6 +971,16 @@ def show_session_overview(session_details: Dict):
                     st.rerun()
                 else:
                     st.error(f"Failed to delete session: {response.status_code}")
+
+        # Full rescan — separate row, less prominent (expensive operation)
+        if has_data:
+            if st.button("🔁 Full Rescan",
+                         help="Days have passed and port state may have changed? "
+                              "Clears ALL data (scan + AI) and re-runs nmap from scratch.",
+                         use_container_width=True):
+                api_session.post(f"{API_BASE}/sessions/{session_id}/rescan")
+                time.sleep(0.5)
+                st.rerun()
 
     # Report download
     if st.button("📄 Download DOCX Report", use_container_width=True):
