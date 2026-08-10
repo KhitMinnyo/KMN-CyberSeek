@@ -2276,504 +2276,306 @@ def _doc_section(heading: str):
 
 
 def show_docs():
-    """In-app documentation page."""
-    # ── Custom CSS ─────────────────────────────────────────────────────────────
-    st.markdown("""
-<style>
-/* Docs page — brighter backgrounds, better contrast */
-.doc-tab-content { background: #151b26; }
-.stTabs [data-baseweb="tab-list"] { gap: 6px; }
-.stTabs [data-baseweb="tab"] {
-    background: #1e2530 !important;
-    border-radius: 6px !important;
-    color: #90caf9 !important;
-    font-weight: 600;
-}
-.stTabs [aria-selected="true"] {
-    background: #2a3f6f !important;
-    color: #ffffff !important;
-}
-.stExpander { background: #1e2530 !important; border: 1px solid #2a3040 !important; }
-</style>""", unsafe_allow_html=True)
+    """In-app documentation — pure HTML/JS, zero st.rerun() involved."""
+    import streamlit.components.v1 as _components
 
-    # ── Header row with language toggle ────────────────────────────────────────
-    h_col, lang_col = st.columns([5, 1])
-    with h_col:
-        st.markdown("<h1 class='main-header'>📖 Documentation</h1>", unsafe_allow_html=True)
-    if "docs_lang" not in st.session_state:
-        st.session_state["docs_lang"] = "en"
+    # HTML-string builders — return str, never call st.*
+    def _c(title, body, accent="#4f8ef7"):
+        return (
+            f'<div class="card" style="border-left-color:{accent}">'
+            f'<div class="ct">{title}</div>'
+            f'<div class="cb">{body}</div></div>'
+        )
 
-    _lang_changed = False
-    with lang_col:
-        st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
-        cur = st.session_state["docs_lang"]
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("🇬🇧 EN", use_container_width=True,
-                         type="primary" if cur == "en" else "secondary",
-                         key="docs_lang_en"):
-                if cur != "en":
-                    st.session_state["docs_lang"] = "en"
-                    _lang_changed = True
-        with c2:
-            if st.button("🇲🇲 MY", use_container_width=True,
-                         type="primary" if cur == "my" else "secondary",
-                         key="docs_lang_my"):
-                if cur != "my":
-                    st.session_state["docs_lang"] = "my"
-                    _lang_changed = True
+    def _s(text):
+        return f'<div class="sh">{text}</div>'
 
-    lang = st.session_state["docs_lang"]
+    def _note(text, cls="ai"):
+        return f'<div class="alert {cls}">{text}</div>'
 
-    if _lang_changed:
-        st.rerun()
+    def _pre(text):
+        import html as _h
+        return f'<pre><code>{_h.escape(text)}</code></pre>'
 
-    tab_gs, tab_session, tab_ai, tab_ti, tab_ollama, tab_trouble = st.tabs([
-        "🚀 Getting Started", "📋 Session Guide", "🤖 AI & Commands",
-        "🕸️ Threat Intel", "🧠 Ollama Models", "🔧 Troubleshooting",
-    ])
+    def _exp(q, a):
+        return ('<details class="exp"><summary>' + q + '</summary>'
+                + '<div class="exb">' + a + '</div></details>')
 
-    # ── Getting Started ────────────────────────────────────────────────────────
-    with tab_gs:
-        if lang == "en":
-            _doc_section("Quick Start")
-            for i, step in enumerate([
-                ("Run <code>./start.sh</code>", "Starts FastAPI backend (port 6000) and Streamlit frontend (port 8501)."),
-                ("Open Settings → AI Configuration", "Connect local Ollama or enter a DeepSeek API key."),
-                ("Click New Session", "Enter a target IP or domain and confirm authorization."),
-                ("Watch Session Timeline", "Phases progress automatically as the AI works."),
-                ("Review results", "Check Vulnerabilities, AI Decisions, and Credentials tabs."),
-            ], 1):
-                _doc_card(f"{i}. {step[0]}", step[1], accent="#4caf50")
-        else:
-            _doc_section("အမြန်စတင်နည်း")
-            for i, step in enumerate([
-                ("./start.sh ကို run ပါ", "FastAPI backend (port 6000) နဲ့ Streamlit frontend (port 8501) စတင်မည်။"),
-                ("Settings → AI Configuration သို့သွားပါ", "Local Ollama ချိတ်ဆက် သို့မဟုတ် DeepSeek API key ထည့်ပါ။"),
-                ("New Session နှိပ်ပါ", "Target IP သို့မဟုတ် domain ထည့်ပြီး authorization confirm လုပ်ပါ။"),
-                ("Session Timeline ကြည့်ပါ", "AI အလုပ်လုပ်သွားသည်နှင့် phases တွေ တဆင့်ချင်း တိုးသွားမည်။"),
-                ("Result စစ်ဆေးပါ", "Vulnerabilities, AI Decisions, Credentials tabs တွေကြည့်ပါ။"),
-            ], 1):
-                _doc_card(f"{i}. {step[0]}", step[1], accent="#4caf50")
+    t0en = (
+        _s('Quick Start') +
+        _c('1. Run <code>./start.sh</code>', 'Starts FastAPI backend (port 6000) and Streamlit frontend (port 8501).', '#4caf50') +
+        _c('2. Open Settings &#8594; AI Configuration', 'Connect local Ollama or enter a DeepSeek API key.', '#4caf50') +
+        _c('3. Click New Session', 'Enter a target IP or domain and confirm authorization.', '#4caf50') +
+        _c('4. Watch Session Timeline', 'Phases progress automatically as the AI works.', '#4caf50') +
+        _c('5. Review results', 'Check Vulnerabilities, AI Decisions, and Credentials tabs.', '#4caf50') +
+        _s('System Architecture') +
+        _pre('Streamlit Frontend  (port 8501)  ←  Operator Dashboard\n         │\n         ▼\nFastAPI Backend  (port 6000)\n  Orchestrator │ Scanner │ AI Connector │ SQLite DB\n         │              │               │\n    AI Engine      Nmap/NSE        Shell Exec\n  (Ollama/API)   (Scanner)        (Kali env)') +
+        _s('Attack Chain &#8212; Phase Order') +
+        _c('<code>osint</code>', 'Passive intel: whois, dig, theHarvester, crt.sh, Google Dorks &#8212; domain targets only', '#7e57c2') +
+        _c('<code>reconnaissance</code>', 'Active scanning: Nmap top-1000 ports with service/version detection', '#1976d2') +
+        _c('<code>enumeration</code>', 'Subdomain, endpoint, user, and share enumeration', '#0288d1') +
+        _c('<code>vulnerability_analysis</code>', 'CVE mapping, nuclei, nikto, sqlmap', '#00838f') +
+        _c('<code>exploitation</code>', 'Exploit execution via Metasploit or standalone tools', '#f57c00') +
+        _c('<code>post_exploitation</code>', 'Shell stabilisation, local data collection', '#e64a19') +
+        _c('<code>privilege_escalation</code>', 'linpeas, sudo -l, SUID checks, kernel exploits', '#c62828') +
+        _c('<code>lateral_movement</code>', 'Pivoting to adjacent hosts using found credentials', '#6a1b9a') +
+        _c('<code>credential_reuse</code>', 'Credential spraying, pass-the-hash, Kerberoasting', '#2e7d32') +
+        _note('Local IP targets (10.x, 192.168.x, 172.16&#8211;31.x): OSINT phase is automatically skipped &#8212; Google Dorks return nothing useful for private addresses.')
+    )
 
-        _doc_section("System Architecture" if lang == "en" else "System Architecture")
-        st.code("""Streamlit Frontend  (port 8501)  ←  Operator Dashboard
-         │
-         ▼
-FastAPI Backend  (port 6000)
-  Orchestrator │ Scanner │ AI Connector │ SQLite DB
-         │              │               │
-    AI Engine      Nmap/NSE        Shell Exec
-  (Ollama/API)   (Scanner)        (Kali env)""", language="text")
+    t0my = (
+        _s('အမြန်စၢးနည်') +
+        _c('1. ./start.sh ကို run ပဪb', 'FastAPI backend (port 6000) နဲ့ Streamlit frontend (port 8501) စတင်မည်၏', '#4caf50') +
+        _c('2. Settings &#8594; AI Configuration သိုသွာပဪb', 'Local Ollama ချင်ဆက် သိုမ၀ုတ် DeepSeek API key ထည်ပဪb၏', '#4caf50') +
+        _c('3. New Session နှိပဪb', 'Target IP သိုမ၀ုတ် domain ထည်ပြ authorization confirm လဪfပဪb၏', '#4caf50') +
+        _c('4. Session Timeline ကြည်ပဪb', 'AI အလဪfပ်လဪfပသွာပည်ပြင် phases တွဲက တဆင်ချင်း တိုးသွာမည်၏', '#4caf50') +
+        _c('5. Result စစဆဲးပဪb', 'Vulnerabilities, AI Decisions, Credentials tabs တွဲကြည်ပဪb၏', '#4caf50') +
+        _s('System Architecture') +
+        _pre('Streamlit Frontend  (port 8501)  ←  Operator Dashboard\n         │\n         ▼\nFastAPI Backend  (port 6000)\n  Orchestrator │ Scanner │ AI Connector │ SQLite DB\n         │              │               │\n    AI Engine      Nmap/NSE        Shell Exec\n  (Ollama/API)   (Scanner)        (Kali env)') +
+        _s('တိဪfက်ခိဪfက် အဆင်ဆပ်ဆပ်') +
+        _c('<code>osint</code>', 'Passive &#8212; whois, dig, theHarvester, crt.sh, Google Dorks (domain target သာ)', '#7e57c2') +
+        _c('<code>reconnaissance</code>', 'Active &#8212; Nmap port 1000 scan, service/version detection', '#1976d2') +
+        _c('<code>enumeration</code>', 'Subdomain, endpoint, user, share ကို enumerate လဪfပြချင်း', '#0288d1') +
+        _c('<code>vulnerability_analysis</code>', 'CVE mapping, nuclei, nikto, sqlmap', '#00838f') +
+        _c('<code>exploitation</code>', 'Metasploit သိုမ၀ုတ် standalone tool နဲ့ exploit', '#f57c00') +
+        _c('<code>post_exploitation</code>', 'Shell stabilize, local data collection', '#e64a19') +
+        _c('<code>privilege_escalation</code>', 'linpeas, sudo -l, SUID check, kernel exploit', '#c62828') +
+        _c('<code>lateral_movement</code>', 'ရှာတွဲကေ့ credential သဪfးပြ pivot', '#6a1b9a') +
+        _c('<code>credential_reuse</code>', 'Credential spraying, pass-the-hash, Kerberoasting', '#2e7d32') +
+        _note('Local IP target (10.x, 192.168.x, 172.16&#8211;31.x) ဆိုရင်း OSINT phase ကို auto-skip လဪfပဪb &#8212; Private IP အတွက် Google Dorks ဘာမှ မပောဗူ၏')
+    )
 
-        _doc_section("Attack Chain — Phase Order" if lang == "en" else "တိုက်ခိုက်မှု အဆင့်ဆင့်")
-        phases_en = [
-            ("osint", "Passive intel: whois, dig, theHarvester, crt.sh, Google Dorks — domain targets only"),
-            ("reconnaissance", "Active scanning: Nmap top-1000 ports with service/version detection"),
-            ("enumeration", "Subdomain, endpoint, user, and share enumeration"),
-            ("vulnerability_analysis", "CVE mapping, nuclei, nikto, sqlmap"),
-            ("exploitation", "Exploit execution via Metasploit or standalone tools"),
-            ("post_exploitation", "Shell stabilisation, local data collection"),
-            ("privilege_escalation", "linpeas, sudo -l, SUID checks, kernel exploits"),
-            ("lateral_movement", "Pivoting to adjacent hosts using found credentials"),
-            ("credential_reuse", "Credential spraying, pass-the-hash, Kerberoasting"),
-        ]
-        phases_my = [
-            ("osint", "Passive — whois, dig, theHarvester, crt.sh, Google Dorks (domain target သာ)"),
-            ("reconnaissance", "Active — Nmap port 1000 scan, service/version detection"),
-            ("enumeration", "Subdomain, endpoint, user, share တွေ enumerate လုပ်ခြင်း"),
-            ("vulnerability_analysis", "CVE mapping, nuclei, nikto, sqlmap"),
-            ("exploitation", "Metasploit သို့မဟုတ် standalone tool နဲ့ exploit"),
-            ("post_exploitation", "Shell stabilize, local data collection"),
-            ("privilege_escalation", "linpeas, sudo -l, SUID check, kernel exploit"),
-            ("lateral_movement", "ရှာတွေ့ credential သုံးပြီး ကျန် host တွေကို pivot"),
-            ("credential_reuse", "Credential spraying, pass-the-hash, Kerberoasting"),
-        ]
-        phases = phases_en if lang == "en" else phases_my
-        accents = ["#7e57c2","#1976d2","#0288d1","#00838f","#f57c00","#e64a19","#c62828","#6a1b9a","#2e7d32"]
-        for (phase, desc), accent in zip(phases, accents):
-            _doc_card(f"<code>{phase}</code>", desc, accent=accent)
+    t1en = (
+        _s('Session Buttons') +
+        _c('&#9654;&#65039; Resume', 'Continues AI analysis from the current state &#8212; no re-scan. Safe to click on an already-running session (idempotent).', '#4caf50') +
+        _c('&#128260; Reset AI', 'Keeps all nmap <b>scan data</b>. Clears AI decisions, commands, vulnerabilities. Re-runs AI from existing scan. Use when AI went off-track.', '#1976d2') +
+        _c('&#128257; Full Rescan', 'Clears everything &#8212; scan data + AI history. Runs nmap from scratch. Use when days have passed or target may have changed.', '#f57c00') +
+        _c('&#128465;&#65039; Delete', 'Permanently removes the session and all its data. Cannot be undone.', '#c62828') +
+        _s('Session Tabs') +
+        _c('&#128202; Overview', 'Session Timeline, button controls, Strategic Layer AI planner with objective + progress %.', '#4f8ef7') +
+        _c('&#128269; Scan Results', 'All discovered hosts, open ports, running services with version info.', '#4f8ef7') +
+        _c('&#128737;&#65039; Vulnerabilities', 'CVEs and weaknesses &#8212; from scanner, threat intel cache, and AI analysis.', '#4f8ef7') +
+        _c('&#129302; AI Decisions', 'Every AI reasoning step: what the AI was thinking, which command it chose and why.', '#4f8ef7') +
+        _c('&#9889; Commands', 'Full command history with output. Pending approval queue shown when manual review is needed.', '#4f8ef7') +
+        _c('&#128193; Evidence', 'Raw tool output saved as evidence: screenshots, file listings, service banners.', '#4f8ef7') +
+        _c('&#128273; Credentials', 'Extracted credentials &#8212; auto-parsed from john, hashcat, hydra output.', '#4f8ef7') +
+        _s('Session Timeline &#8212; Status Icons') +
+        _c('&#9989; Done', 'Stage completed &#8212; AI decisions exist for this phase.', '#455a64') +
+        _c('&#128260; Now', 'Current active stage.', '#455a64') +
+        _c('&#9889; &#8212;', 'Stage was skipped (AI jumped past it without working through it).', '#455a64') +
+        _c('&#9203; Next', 'Not yet reached.', '#455a64') +
+        _s('Auto-Approve Explained') +
+        _c('OFF (default)', 'All commands go to the pending queue for manual review before execution.', '#c62828') +
+        _c('ON', 'All risk levels (LOW / MEDIUM / HIGH) execute automatically without waiting.', '#4caf50') +
+        _note('Two safeguards always apply regardless of auto-approve:<br>(1) Allowlist gate &#8212; dangerous commands are always blocked.<br>(2) Depth checkpoint &#8212; after 15 auto-commands, one manual approval is required.')
+    )
 
-        note = ("**Local IP targets** (10.x, 192.168.x, 172.16–31.x): OSINT phase is automatically skipped — "
-                "Google Dorks return nothing useful for private addresses."
-                if lang == "en" else
-                "**Local IP target** (10.x, 192.168.x, 172.16–31.x) ဆိုရင် OSINT phase ကို auto-skip လုပ်တယ် — "
-                "Private IP အတွက် Google Dorks ဘာမှ မပေါ်ဘူး။")
-        st.info(note)
+    t1my = (
+        _s('Session ခလဪfတ်များ') +
+        _c('&#9654;&#65039; Resume', 'လက်ရှဪ AI analysis ကို ဆက်လဪfပ်မည် &#8212; nmap မပြန်ရ၏', '#4caf50') +
+        _c('&#128260; Reset AI', 'nmap scan data ထာခ်ယု AI decisions, commands, vulnerabilities ဖျက်ပြ AI ကို ပြန်စသည်၏', '#1976d2') +
+        _c('&#128257; Full Rescan', 'အရာအလဪfးဖျက်ပြ nmap ကို အစကနေက ပြန်စသည်၏', '#f57c00') +
+        _c('&#128465;&#65039; Delete', 'Session နှဪ့ data အလဪfးကို အပြင်အပိဪfင် ဖျက်မည်၏', '#c62828') +
+        _s('Session Tabs များ') +
+        _c('&#128202; Overview', 'Session Timeline, ခလဪfတ်များ, Strategic Layer AI planner နှဪ့ progress %.', '#4f8ef7') +
+        _c('&#128269; Scan Results', 'ရှာတွဲကေ့ host, port, service version အချက်များ၏', '#4f8ef7') +
+        _c('&#128737;&#65039; Vulnerabilities', 'Scanner, threat intel, AI analysis မှ CVE နှဪ့ weakness များ၏', '#4f8ef7') +
+        _c('&#129302; AI Decisions', 'AI က reasoning step တိဪfး &#8212; ဘာကြာင်သဪ ဒု command ကို ရွဲးတာဆို ဖာပြသည်၏', '#4f8ef7') +
+        _c('&#9889; Commands', 'Command မှတ်မံတမ်း output၏ Manual review လိုသော pending commands အပောက ပောသည်၏', '#4f8ef7') +
+        _c('&#128193; Evidence', 'Tool output raw file များ: screenshot, file listing, service banner၏', '#4f8ef7') +
+        _c('&#128273; Credentials', 'john, hashcat, hydra output မှ auto-parse လဪfထားသော credential များ၏', '#4f8ef7') +
+        _s('Session Timeline &#8212; Status Icon များ') +
+        _c('&#9989; Done', 'Phase ပြုဆဪfးသည် &#8212; AI decision ရှဪသော phase ဖြစသည်၏', '#455a64') +
+        _c('&#128260; Now', 'လက်ရှဪ လဪfပဆောင်ဆမ်သော stage၏', '#455a64') +
+        _c('&#9889; &#8212;', 'AI ကျာသွားသော stage (အလဪfပမလဪfပဘဲ ဆက်သွား)၏', '#455a64') +
+        _c('&#9203; Next', 'မရောကြသေား stage၏', '#455a64') +
+        _s('Auto-Approve ရှင်လင်းချက်') +
+        _c('OFF (default)', 'Command တိဪfး manual review queue သို ဆောဆြချင်း ဆောသွားလဪfတ်မည်၏', '#c62828') +
+        _c('ON', 'Risk level အလဪfး (LOW / MEDIUM / HIGH) ကို auto-execute လဪfပ်မည်၏', '#4caf50') +
+        _note('Safeguard နှစ်ခဪf ကျင်ဘဪfသဪfးသည်:<br>(1) Allowlist gate &#8212; အန်တရာသဪသော command များကို block သည်၏<br>(2) Depth checkpoint &#8212; auto command 15 ကြိမ်ပြုပဪb manual approval တစ်ကြိမ် လိုသည်၏')
+    )
 
-    # ── Session Guide ──────────────────────────────────────────────────────────
-    with tab_session:
-        if lang == "en":
-            _doc_section("Session Buttons")
-            _doc_card("▶️ Resume", "Continues AI analysis from the current state — no re-scan. Use after a session paused or was stopped normally. Safe to click on an already-running session (idempotent).", accent="#4caf50")
-            _doc_card("🔄 Reset AI", "Keeps all nmap <b>scan data</b> (discovered hosts, services, ports). Clears AI decisions, commands, vulnerabilities. Re-runs AI analysis from the existing scan. Use when AI went off-track or the session failed within hours of the last scan.", accent="#1976d2")
-            _doc_card("🔁 Full Rescan", "Clears <b>everything</b> — scan data + AI history. Runs nmap from scratch. Use when days have passed and the target's port state may have changed.", accent="#f57c00")
-            _doc_card("🗑️ Delete", "Permanently removes the session and all its data from the database. Cannot be undone.", accent="#c62828")
+    t2en = (
+        _s('Risk Classification') +
+        _c('&#129001; LOW &#8212; Read-only / passive', 'No impact. Examples: <code>nmap</code>, <code>curl -I</code>, <code>whois</code>, <code>dig</code>. Auto-executes when auto-approve is ON.', '#4caf50') +
+        _c('&#128993; MEDIUM &#8212; Active / leaves traces', 'Enumeration &#8212; traces but no damage. Examples: <code>nikto</code>, <code>gobuster</code>, <code>nuclei</code>. Auto-executes when auto-approve is ON.', '#f9a825') +
+        _c('&#128308; HIGH &#8212; Destructive / irreversible', 'May crash services or exfiltrate data. Examples: <code>hydra</code>, <code>msfconsole</code>, <code>sqlmap --dump</code>. Requires manual approval.', '#c62828') +
+        _note('Risk level is determined by keyword + regex rules &#8212; not by the LLM. The AI cannot self-classify its command as LOW to bypass review.') +
+        _s('Strategic Layer (AI Planner)') +
+        _c('Runs every 5 commands', 'Evaluates overall progress, updates the multi-step plan, writes a reflection, and declares objective complete when root/SYSTEM/Domain Admin is reached &#8212; halting the agentic loop.', '#7e57c2') +
+        _c('Progress % frozen?', 'Progress updates only when the strategist runs (every 5 commands). Wait for the next batch of 5 to complete.', '#455a64') +
+        _s('AI Decisions &#8212; Notable Findings') +
+        _c('High-value keywords', 'Commands whose output contained: <code>password</code>, <code>hash</code>, <code>CVE</code>, <code>shell</code>, <code>admin</code>, <code>root</code>, <code>credential</code>, <code>exploit</code>, <code>vulnerable</code> &#8212; shown at the top of the AI Decisions tab.', '#00838f') +
+        _s('Command Console') +
+        _c('Manual command injection', 'Enter arbitrary commands against the session target &#8212; outside the AI loop. Useful for running a specific tool the AI has not tried, or verifying a finding.', '#1976d2') +
+        _s('OSINT &#8212; Google Dorks') +
+        _pre('site:<domain> filetype:pdf|xlsx|docx|pptx|sql|bak|env|config|log\nsite:<domain> inurl:admin|login|portal|dashboard\nsite:<domain> "index of" | "parent directory"\n"<domain>" ext:sql|bak|env|config|log\nsite:<domain> intext:"password"|"api_key"|"secret"') +
+        _note('OSINT / Google Dorks only run for domain targets. Private/local IPs (10.x, 192.168.x) skip OSINT automatically.')
+    )
 
-            _doc_section("Session Tabs")
-            for name, desc in [
-                ("📊 Overview", "Session Timeline, button controls, Strategic Layer AI planner with objective + progress %."),
-                ("🔍 Scan Results", "All discovered hosts, open ports, running services with version info."),
-                ("🛡️ Vulnerabilities", "CVEs and weaknesses — from scanner, threat intel cache, and AI analysis."),
-                ("🤖 AI Decisions", "Every AI reasoning step: what the AI was thinking, which command it chose and why."),
-                ("⚡ Commands", "Full command history with output. Pending approval queue shown here when manual review is needed."),
-                ("📁 Evidence", "Raw tool output saved as evidence: screenshots, file listings, service banners."),
-                ("🔑 Credentials", "Extracted credentials: usernames, passwords, hashes — auto-parsed from john, hashcat, hydra output."),
-            ]:
-                _doc_card(name, desc)
+    t2my = (
+        _s('Risk Classification') +
+        _c('&#129001; LOW &#8212; Read-only / passive', 'Observable impact မရှဪ၏ ဥပမာ: <code>nmap</code>, <code>curl -I</code>, <code>whois</code>၏ Auto-approve ON ဆိုရင်း auto-execute လဪfသည်၏', '#4caf50') +
+        _c('&#128993; MEDIUM &#8212; Active / traces ကျန်သည်', 'Active enumeration &#8212; trace ကျန်သောလည်း ပျက်စိး မရှဪ၏ ဥပမာ: <code>nikto</code>, <code>gobuster</code>၏', '#f9a825') +
+        _c('&#128308; HIGH &#8212; Destructive', 'Service crash ဖြစခြင်း data exfiltrate ဖြစနိုင်၏ ဥပမာ: <code>hydra</code>, <code>msfconsole</code>၏ Manual approval လိုသည်၏', '#c62828') +
+        _note('Risk level ကို keyword + regex rule တွဲကနဲ့ deterministic ဆဪfးဖြတ်သည် &#8212; LLM ကိုပေ မဆဪfးဖြတ်သည်၏') +
+        _s('Strategic Layer (AI Planner)') +
+        _c('Command 5 ကြိမ်တိဪfးး run သည်', 'Overall progress စစဆဲးပြု multi-step plan update လဪfသည်၏ Root/SYSTEM/Domain Admin ရသောအခါ loop ကို ရပသည်၏', '#7e57c2') +
+        _c('Progress % မတိုးဗူး?', 'Strategist သည် command 5 ကြိမ်တိဪfးးမှ update လဪfပဪb၏', '#455a64') +
+        _s('AI Decisions &#8212; Notable Findings') +
+        _c('High-value keyword များ', 'Output ထဲ အစိ keyword ပဪbသော command များ: <code>password</code>, <code>hash</code>, <code>CVE</code>, <code>shell</code>, <code>admin</code>, <code>root</code>, <code>credential</code>', '#00838f') +
+        _s('Command Console') +
+        _c('Manual command ထည်သွင်းနည်း', 'AI loop မပဪbဘဲ target ကို command တိက်ရိက်ပေးနိုင်သည်၏', '#1976d2') +
+        _s('OSINT &#8212; Google Dorks') +
+        _pre('site:<domain> filetype:pdf|xlsx|docx|pptx|sql|bak|env|config|log\nsite:<domain> inurl:admin|login|portal|dashboard\nsite:<domain> "index of" | "parent directory"\n"<domain>" ext:sql|bak|env|config|log\nsite:<domain> intext:"password"|"api_key"|"secret"') +
+        _note('OSINT / Google Dorks သည် domain target များအတွက်သာမှ run သည်၏ Private IP (10.x, 192.168.x) များကို auto-skip လဪfသည်၏')
+    )
 
-            _doc_section("Session Timeline — Status Icons")
-            for icon, meaning in [
-                ("✅ Done", "Stage completed — AI decisions exist for this phase."),
-                ("🔄 Now", "Current active stage."),
-                ("⚡ —", "Stage was skipped (AI jumped past it without working through it)."),
-                ("⏳ Next", "Not yet reached."),
-            ]:
-                _doc_card(icon, meaning, accent="#455a64")
+    t3en = (
+        _s('What is Threat Intel?') +
+        _c('Standalone research tool', 'The Threat Intel page builds a local vulnerability knowledge base over time. Completely separate from live pentest sessions &#8212; never issues shell commands.', '#7e57c2') +
+        _s('How It Works') +
+        _c('1. Enter a search topic', 'Software name, version, or CVE query &#8212; e.g. <code>Apache httpd 2.4.49</code>, <code>GlassFish 4.1</code>.', '#1976d2') +
+        _c('2. DuckDuckGo search', 'Searches for <code>[topic] CVE vulnerability</code> and fetches up to 5 result pages.', '#1976d2') +
+        _c('3. AI extraction', 'Each page&#39;s text is sent to the AI using an isolated prompt &#8212; separate from the pentest AI.', '#1976d2') +
+        _c('4. Structured storage', 'CVE IDs, title, description, severity stored in SQLite <code>threat_intel_cache</code> with <code>verified=False</code>.', '#1976d2') +
+        _c('5. Auto cross-reference', 'After every nmap scan, orchestrator cross-references service names against the cache. Matches are added to the Vulnerabilities tab.', '#1976d2') +
+        _note('All Threat Intel findings are unverified by design. Web pages can be wrong or outdated. Cross-check CVE IDs against NVD, Vulners, or CISA KEV before acting.', 'aw') +
+        _s('Useful Search Topics') +
+        _c('<code>Apache httpd 2.4.49</code>', 'Example finding: CVE-2021-41773 path traversal RCE', '#00838f') +
+        _c('<code>ProFTPD 1.3.5</code>', 'Example finding: mod_copy unauthenticated RCE', '#00838f') +
+        _c('<code>OpenSSH 7.2p2</code>', 'Example finding: Username enumeration CVE', '#00838f') +
+        _c('<code>GlassFish 4.1</code>', 'Example finding: CVE-2017-1000028 unauthenticated RCE', '#00838f') +
+        _c('<code>Tomcat 7.0</code>', 'Example finding: CVE-2020-1938 Ghostcat AJP RCE', '#00838f')
+    )
 
-            _doc_section("Auto-Approve Explained")
-            _doc_card("OFF (default)", "All commands go to the pending queue for manual review before execution.", accent="#c62828")
-            _doc_card("ON", "All risk levels (LOW / MEDIUM / HIGH) execute automatically without waiting for approval.", accent="#4caf50")
-            st.info("Two safeguards always apply regardless of auto-approve setting:\n\n"
-                    "1. **Allowlist gate** — structurally dangerous commands are always blocked and routed to manual review.\n\n"
-                    "2. **Depth checkpoint** — after 15 consecutive auto-executed commands, one manual approval is required before continuing.")
-        else:
-            _doc_section("Session ခလုတ်များ")
-            _doc_card("▶️ Resume", "လက်ရှိ AI analysis ကို ဆက်လုပ်မည် — nmap မပြန်ရ။ Session ရပ်သွားပြီးနောက် ပြန်နှိပ်ရန်။ Session active ဖြစ်နေပြီးဆိုရင်လည်း ဘေးကင်းစွာ နှိပ်နိုင်သည် (idempotent)။", accent="#4caf50")
-            _doc_card("🔄 Reset AI", "nmap <b>scan data</b> (host, service, port) များကို ထားခဲ့၍ AI decisions, commands, vulnerabilities ကို ဖျက်ပြီး AI ကို ပြန်စသည်။ AI လမ်းမှားသွားသောအခါ သို့မဟုတ် session ပျက်သောအခါ အသုံးပြုပါ။", accent="#1976d2")
-            _doc_card("🔁 Full Rescan", "<b>အရာအားလုံး</b> ဖျက်ပြီး nmap ကို အစကနေ ပြန်စသည်။ ရက်ပေါင်းများစွာ ကြာနောက်မှ target ပြောင်းနိုင်သည် ဟု ယုံကြည်ပါက အသုံးပြုပါ။", accent="#f57c00")
-            _doc_card("🗑️ Delete", "Session နှင့် data အားလုံးကို database မှ အပြီးအပိုင် ဖျက်မည်။ ပြန်ရ၍ မရပါ။", accent="#c62828")
+    t3my = (
+        _s('Threat Intel ဆိုတာ ဘာလဲ?') +
+        _c('သသန့် research tool', 'Threat Intel page သည် local vulnerability knowledge base တည်ဆောဆ်သည်၏ Live pentest session နှဪ့ လဪfးလဪfး သခြားဖြစပြု shell command မပေးနိုင်၏', '#7e57c2') +
+        _s('လဪfပဆောပဪfန်') +
+        _c('1. Search topic ထည်ပဪb', 'Software name, version, CVE &#8212; ဥပမာ <code>Apache httpd 2.4.49</code>', '#1976d2') +
+        _c('2. DuckDuckGo ရှာဖွေသည်', '<code>[topic] CVE vulnerability</code> ကို search ပြု result page 5 ခဪf ထဪ fetch လဪfသည်၏', '#1976d2') +
+        _c('3. AI extraction', 'Page text တစ်ခဪfကို isolated prompt ဖြင့် AI ထံ ပေးပြု CVE data extract လဪfသည်၏', '#1976d2') +
+        _c('4. Database သိမ်းဆည်းမှ', 'CVE ID, title, severity ကို SQLite <code>threat_intel_cache</code> တွင် သိမ်းသည်၏', '#1976d2') +
+        _c('5. Auto cross-reference', 'Nmap scan ပြုတိဪfးး service name များကို cache နှဪ့ တိက်စစပြု Vulnerabilities tab သို ထည်သည်၏', '#1976d2') +
+        _note('Threat Intel result များသည် verify မပြဪfရှေား &#8212; web page များ မှာနိုင်၏ CVE ID ကို NVD, Vulners, CISA KEV တွင် cross-check ပြဪfပဪb၏', 'aw') +
+        _s('ရှာဖွေသင်ှောအသော topic များ') +
+        _c('<code>Apache httpd 2.4.49</code>', 'ဥပမာ finding: CVE-2021-41773 path traversal RCE', '#00838f') +
+        _c('<code>ProFTPD 1.3.5</code>', 'ဥပမာ finding: mod_copy unauthenticated RCE', '#00838f') +
+        _c('<code>OpenSSH 7.2p2</code>', 'ဥပမာ finding: Username enumeration CVE', '#00838f') +
+        _c('<code>GlassFish 4.1</code>', 'ဥပမာ finding: CVE-2017-1000028 unauthenticated RCE', '#00838f') +
+        _c('<code>Tomcat 7.0</code>', 'ဥပမာ finding: CVE-2020-1938 Ghostcat AJP RCE', '#00838f')
+    )
 
-            _doc_section("Session Tabs များ")
-            for name, desc in [
-                ("📊 Overview", "Session Timeline, ခလုတ်များ, Strategic Layer AI planner နှင့် objective progress %."),
-                ("🔍 Scan Results", "ရှာတွေ့ host, port, service version အချက်အလက်များ။"),
-                ("🛡️ Vulnerabilities", "Scanner, threat intel cache, AI analysis မှ CVE နှင့် weakness များ။"),
-                ("🤖 AI Decisions", "AI ၏ reasoning step တိုင်း — ဘာကြောင့် ဒီ command ကို ရွေးတာ ဆိုတာ ဖော်ပြသည်။"),
-                ("⚡ Commands", "Command မှတ်တမ်းနှင့် output။ Manual review လိုသော pending commands ဤနေရာတွင် ပေါ်မည်။"),
-                ("📁 Evidence", "Tool output raw file များ: screenshot, file listing, service banner။"),
-                ("🔑 Credentials", "john, hashcat, hydra output မှ auto-parse လုပ်ထားသော credential များ။"),
-            ]:
-                _doc_card(name, desc)
+    _ctx_tbl = '<table class="tbl"><tr><th>Model size</th><th>Safe context window</th></tr><tr><td>7&#8211;8B</td><td>16,384</td></tr><tr><td>13&#8211;14B</td><td>32,768</td></tr><tr><td>32B</td><td>32,768&#8211;65,536</td></tr><tr><td>70&#8211;72B</td><td>65,536&#8211;131,072</td></tr></table>'
+    _setup_grid = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:10px 0"><div><div class="card" style="border-left-color:#1976d2"><div class="ct">M2 Mac Mini 24GB</div><div class="cb">Settings &#8594; AI Configuration:<br>Model <code>qwen2.5:14b</code>, Context <code>32768</code></div></div><pre><code>ollama pull qwen2.5:14b</code></pre></div><div><div class="card" style="border-left-color:#7e57c2"><div class="ct">M4 Pro 64GB</div><div class="cb">Settings &#8594; AI Configuration:<br>Model <code>qwen2.5:72b</code>, Context <code>65536</code></div></div><pre><code>ollama pull qwen2.5:72b</code></pre></div></div>'
 
-            _doc_section("Session Timeline — Status Icon များ")
-            for icon, meaning in [
-                ("✅ Done", "Phase ပြီးဆုံးသည် — AI decision ရှိသော phase ဖြစ်သည်။"),
-                ("🔄 Now", "လက်ရှိ လုပ်ဆောင်နေသော stage။"),
-                ("⚡ —", "AI ကျော်သွားသော stage (အလုပ်မလုပ်ဘဲ ဆက်သွားသည်)။"),
-                ("⏳ Next", "မရောက်သေးသော stage။"),
-            ]:
-                _doc_card(icon, meaning, accent="#455a64")
+    t4en = (
+        _s('What the AI Needs to Do Well') +
+        _c('1. Structured JSON output', 'Every AI response must be valid JSON. A model that garbles this causes parse failures and halts the session.', '#1976d2') +
+        _c('2. Multi-step reasoning', 'The model must plan a full attack chain without skipping phases after just 3 commands.', '#1976d2') +
+        _c('3. Security command vocabulary', 'Knows nmap flags, CVE identifiers, Metasploit modules, GlassFish/Tomcat/SMB quirks.', '#1976d2') +
+        _s('DeepHat vs qwen2.5 &#8212; Which to Use?') +
+        _c('DeepHat V1-7B', '<b>Base:</b> Qwen2.5-Coder-7B cybersecurity fine-tune | <b>7.61B parameters</b><br>OK Security vocab &#8212; understands CVE IDs natively<br>Weaker reasoning &#8594; stage-skipping | JSON inconsistent &#8594; parse errors | NOT fully uncensored', '#f57c00') +
+        _c('qwen2.5:14b &#8212; Recommended', '<b>Base:</b> Qwen2.5 14B (Alibaba) | <b>14.7B parameters</b><br>2&#215; parameters &#8594; better JSON reliability | Better multi-step reasoning | Fewer stage-skip bugs<br>Not cybersecurity-specialized | Requires ~11 GB RAM', '#4caf50') +
+        _note('Use <code>qwen2.5:14b</code> as primary. The #1 cause of session failures is bad JSON output and premature stage advancement &#8212; both are reasoning problems that a larger model solves.', 'ao') +
+        _s('Hardware Recommendations') +
+        _c('M2 Mac Mini &#8212; 24 GB RAM (current)', 'Primary: <code>qwen2.5:14b</code> &#8212; ~9 GB disk, ~11 GB RAM, context 32,768<br>Alt: <code>deepseek-r1:14b</code><br>Stretch: <code>qwen2.5:32b</code> &#8212; ~19 GB disk, ~21 GB RAM', '#1976d2') +
+        _c('M4 Pro &#8212; 64 GB RAM (upcoming)', 'Primary: <code>qwen2.5:72b</code> &#8212; ~42 GB disk, ~45 GB RAM, context 131,072<br>Alt: <code>deepseek-r1:70b</code> &#8212; ~40 GB disk, ~42 GB RAM<br>Lighter: <code>qwen2.5:32b</code> &#8212; ~19 GB disk, context 65,536', '#7e57c2') +
+        _s('Quick Setup') +
+        '<div style="text-align:center;padding:8px 0">' + _setup_grid + '</div>' +
+        _s('Context Window &#8212; Why It Matters') +
+        _c('What happens when context overflows', 'Local models have a fixed context window. When session history exceeds it, the model silently forgets old content &#8212; causing repeated commands, stage regression, or hallucinated progress.', '#f57c00') +
+        _c('Built-in mitigations', '1. Episode summaries &#8212; every N commands, old history is compressed and re-injected.<br>2. Configurable context window &#8212; Settings &#8594; AI Configuration &#8594; Context window controls Ollama&#39;s <code>num_ctx</code>.', '#4caf50') +
+        _ctx_tbl
+    )
 
-            _doc_section("Auto-Approve ရှင်းလင်းချက်")
-            _doc_card("OFF (default)", "Command တိုင်း manual review queue သို့ ဦးစွာ ဆောင်ရွက်မည်။", accent="#c62828")
-            _doc_card("ON", "Risk level အားလုံး (LOW / MEDIUM / HIGH) ကို သတိပေးချက်မပေဘဲ auto-execute လုပ်မည်။", accent="#4caf50")
-            st.info("Auto-approve setting မည်သို့ပင်ဖြစ်စေ safeguard နှစ်ခု ကျင့်သုံးသည်:\n\n"
-                    "1. Allowlist gate — အန္တရာယ်ရှိသော command များကို အမြဲ block ပြီး manual review သို့ ပို့သည်။\n\n"
-                    "2. Depth checkpoint — auto command ၁၅ ကြိမ်ဆက်တိုက် run ပြီးပါက manual approval တစ်ကြိမ် လိုသည်။")
+    t4my = (
+        _s('AI ကောကေား run ဖို့ လိုချင်တာ') +
+        _c('1. Structured JSON output', 'AI response တိဪfးး valid JSON ဖြစရမည်၏ JSON ဖောက်ပြန်ပဪbက parse fail ဖြစပြု session ရပသည်၏', '#1976d2') +
+        _c('2. Multi-step reasoning', 'Command 3 ကြိမ်ပြုမှ phase တွဲက ကျာမသွာဘဲ attack chain တစ်ခဪfလဪfး plan ဆွဲနိုင်ရမည်၏', '#1976d2') +
+        _c('3. Security command vocabulary', 'nmap flag, CVE ID, Metasploit module, GlassFish/Tomcat/SMB quirk များ သိသည်ဆိုရမည်၏', '#1976d2') +
+        _s('DeepHat vs qwen2.5 &#8212; ဘယ်၀ာသဪfးမလဲ?') +
+        _c('DeepHat V1-7B', '<b>Base:</b> Qwen2.5-Coder-7B fine-tune | <b>7.61B parameters</b><br>Security vocab ကေားသည် | CVE ID နားလည်သည်<br>Reasoning အားနည် &#8594; stage-skip | JSON မတည်မငြိမ်', '#f57c00') +
+        _c('qwen2.5:14b &#8212; Recommended', '<b>Base:</b> Qwen2.5 14B (Alibaba) | <b>14.7B parameters</b><br>Parameter 2 ဆ &#8594; JSON reliability ကေားသည် | Reasoning ကေား<br>Cybersecurity specialized မ၀ုတ် | RAM ~11 GB လိုသည်', '#4caf50') +
+        _note('qwen2.5:14b ကိုသဪfးပဪb၏ Session fail ညမာရင်း #1 မှာ JSON error နှဪ့ stage advancement &#8212; ကြးသော model ဖြဉ့ ဖြေရှင်းနိုင်၏', 'ao') +
+        _s('Hardware Recommendation') +
+        _c('M2 Mac Mini &#8212; 24 GB RAM (လက်ရှဪ)', 'Primary: <code>qwen2.5:14b</code> &#8212; disk ~9 GB, RAM ~11 GB, context 32,768<br>Alt: <code>deepseek-r1:14b</code><br>Stretch: <code>qwen2.5:32b</code>', '#1976d2') +
+        _c('M4 Pro &#8212; 64 GB RAM (ကိုးမည်)', 'Primary: <code>qwen2.5:72b</code> &#8212; disk ~42 GB, RAM ~45 GB, context 131,072<br>Alt: <code>deepseek-r1:70b</code><br>Lighter: <code>qwen2.5:32b</code>', '#7e57c2') +
+        _s('Setup အမြန်း') +
+        '<div style="text-align:center;padding:8px 0">' + _setup_grid + '</div>' +
+        _s('Context Window &#8212; ဘာကြာန်သည် အရးကြုးသလဲ?') +
+        _c('Context overflow ဖြစရင်း ဘာဖြစမလဲ?', 'Model က context window ကျာသွားအခါ session history ကျာသွားအခါ model က အ၀ောများကို မေ့သွား &#8212; command ထပ်ခြင်း, stage regression, hallucination ဖြစနိုင်၏', '#f57c00') +
+        _c('Built-in mitigation', '1. Episode summaries &#8212; command N ကြိမ်တိဪfးး history ကို compress ပြု re-inject လဪfသည်၏<br>2. Context window configure &#8212; Settings &#8594; AI Configuration တွင် Ollama <code>num_ctx</code> ကို ထိန်ချဪfပနိုင်သည်၏', '#4caf50') +
+        _ctx_tbl
+    )
 
-    # ── AI & Commands ──────────────────────────────────────────────────────────
-    with tab_ai:
-        if lang == "en":
-            _doc_section("Risk Classification")
-            _doc_card("🟢 LOW — Read-only / passive", "No observable impact. Examples: <code>nmap</code>, <code>curl -I</code>, <code>whois</code>, <code>dig</code>, <code>whatweb</code>. Auto-executes when auto-approve is ON.", accent="#4caf50")
-            _doc_card("🟡 MEDIUM — Active / leaves traces", "Active enumeration — leaves traces but causes no damage. Examples: <code>nikto</code>, <code>gobuster</code>, <code>nuclei</code>, <code>sqlmap --dbs</code>. Auto-executes when auto-approve is ON.", accent="#f9a825")
-            _doc_card("🔴 HIGH — Destructive / irreversible", "May crash services or exfiltrate data. Examples: <code>hydra</code>, <code>msfconsole</code>, <code>sqlmap --dump</code>, <code>hashcat</code>. Requires manual approval unless auto-approve is ON.", accent="#c62828")
-            st.info("Risk level is determined by deterministic keyword + regex rules — not by the LLM. "
-                    "The AI cannot self-classify its own command as LOW to bypass review.")
+    _api_tbl = '<table class="tbl"><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr><tr><td>POST</td><td>/api/sessions</td><td>Create new session</td></tr><tr><td>GET</td><td>/api/sessions/history</td><td>List all sessions from DB</td></tr><tr><td>POST</td><td>/api/sessions/{id}/resume</td><td>Resume AI analysis (idempotent)</td></tr><tr><td>POST</td><td>/api/sessions/{id}/restart</td><td>Reset AI state, keep scan data</td></tr><tr><td>POST</td><td>/api/sessions/{id}/rescan</td><td>Full rescan &#8212; clear everything, re-run nmap</td></tr><tr><td>POST</td><td>/api/sessions/{id}/approve/{cmd_id}</td><td>Approve a pending command</td></tr><tr><td>DELETE</td><td>/api/sessions/{id}</td><td>Delete session</td></tr><tr><td>GET</td><td>/api/stats</td><td>Dashboard stats</td></tr></table>'
 
-            _doc_section("Strategic Layer (AI Planner)")
-            _doc_card("Runs every 5 commands", "The Strategic Layer runs separately from the tactical command loop. Every 5 completed commands, it evaluates overall progress, updates the multi-step plan, writes a reflection, and declares objective complete when root / SYSTEM / Domain Admin is reached — halting the agentic loop.", accent="#7e57c2")
-            _doc_card("Progress % frozen?", "Progress updates only when the strategist runs (every 5 commands). If progress looks frozen, wait for the next batch of 5 commands to complete.", accent="#455a64")
+    t5en = (
+        _s('Common Issues') +
+        _exp('Session status FAILED but terminal still active', 'Asyncio tasks queued before failure finish running after status changed. Normal &#8212; backend drains queue then stops. Wait a few seconds, refresh, then use Reset AI.') +
+        _exp('echo &#39;AI response parsing error&#39; in command history', 'AI returned invalid JSON. Session now halts cleanly on parse failure. If seen on an old session, do a Reset AI. Switching to qwen2.5:14b reduces parse failures.') +
+        _exp('All stages Done after only 5 commands', 'Old bug: AI jumped to credential_reuse immediately. Fixed &#8212; stage gate prevents advancing more than 1 phase per AI decision. Do a Reset AI on affected sessions.') +
+        _exp('Progress % frozen at 5%', 'Strategic Layer runs every 5 completed commands. Wait for next batch of 5, or do a Reset AI.') +
+        _exp('Resume button showing on active session', 'Session status was &#39;ready&#39; but Resume was showing. Fixed &#8212; &#39;ready&#39; now shows Session Active instead. Update and restart the frontend.') +
+        _exp('Pending commands piling up', 'Two causes: (1) auto_approve OFF &#8212; commands go to queue by design. (2) Max auto-depth reached (15 commands) &#8212; one manual approval resets the counter.') +
+        _exp('AI keeps suggesting the same command repeatedly', 'Context overflow &#8212; model forgot it ran that command. Increase context window in Settings (try 32768 or 65536). Switch to a larger model (14B+).') +
+        _exp('Session History shows &#39;No sessions recorded yet&#39;', 'Fixed &#8212; caused by FastAPI route order bug. Update to latest and restart backend.') +
+        _exp('OSINT running on local/private IP targets', 'Fixed &#8212; private IPs (10.x, 192.168.x, 172.16&#8211;31.x, localhost) now skip OSINT automatically.') +
+        _exp('Backend not starting / port conflict', 'start.sh auto-detects port conflicts and finds the next free port. Set BACKEND_PORT / FRONTEND_PORT in .env to override.') +
+        _s('Port Configuration') +
+        _pre('# .env\nBACKEND_PORT=6000    # FastAPI backend\nFRONTEND_PORT=8501   # Streamlit frontend') +
+        _s('API Reference &#8212; Key Endpoints')
+        + '_api_tbl'
+    )
 
-            _doc_section("AI Decisions — Notable Findings")
-            _doc_card("High-value keywords", "The AI Decisions tab highlights commands whose output contained: <code>password</code>, <code>hash</code>, <code>CVE</code>, <code>shell</code>, <code>admin</code>, <code>root</code>, <code>credential</code>, <code>exploit</code>, <code>vulnerable</code>. These appear at the top of the tab for immediate review.", accent="#00838f")
+    t5my = (
+        _s('ဖြစလေ့ရှဪသော ပြည်မာများ') +
+        _exp('Status FAILED ပမဲ့ terminal ဆက်တက်နေပဪb', 'Failure မဖြစမာမာ queue လ်ဖြစသည်အလီ asyncio task များ ဆက်ပြု run နေပဪb၏ ပဪfမှန်ဖြစသည်၏ ကြာနည်း Reset AI နှိပဪb၏') +
+        _exp('Command history တွင် parsing error ပောဗိပဪb', 'AI က invalid JSON ပြန်ပေးသည်၏ parse fail ဆိုရင်း session သပ်ရပ်သွား ရပသည်၏ Reset AI နှိပဪb၏') +
+        _exp('Command 5 ကြိမ်ပြုမှ stage အလဪfး Done', 'AI က credential_reuse သို ချက်ချင်း ရောကသွား၏ Fix ပြဪfပြု &#8212; stage gate ကြာကြိ့ phase တစ်ဆင်သာမ ကျာမသော၏ Reset AI နှိပဪb၏') +
+        _exp('Progress % 5% မှ မတိုးဗူး', 'Strategic Layer သည် command 5 ကြိမ်တိဪfးးမှ update လဪfပဪb၏ Command 5 ကြိမ် ထပြုမှ ကြည်ပဪb၏') +
+        _exp('Session active ဖြစနေပမဲ့ Resume ခလဪfတ် ပောဗိပဪb', "'ready' status ဆိုရင်း Resume ပောလျှိချင်း ဖြစလိုး၏ Fix ပြဪfပြု &#8212; 'ready' တွင် Session Active ပြမည်၏ Update ပြု frontend restart လဪfပဪb၏") +
+        _exp('Pending command များ တွဲနေပဪb', '(1) auto_approve OFF &#8212; command တိဪfး queue သို ရောကရမည်၏ (2) Auto-depth 15 ကြိမ် ပြည်ပြုပဪb &#8212; manual approval တစ်ကြိမ် နှိပြု counter reset ဖြစသည်၏') +
+        _exp('AI က command တူတူ ထပ်ပြနေပဪb', 'Context overflow &#8212; model က ရှဪပြုး command ကို မေ့သွား၏ Settings တွင် context window ကို 32768 သို 65536 တိုးပဪb၏ Model ကို 14B+ သို ပြားလျှိကြည်ပဪb၏') +
+        _exp("History 'No sessions recorded yet' ပြနေပဪb", 'FastAPI route order bug ကြာမှဖြစလျှိချင်း၏ Fix ပြဪfပြု &#8212; latest update ပြု backend restart လဪfပဪb၏') +
+        _exp('Local/private IP ကို OSINT run သွားနေပဪb', 'Fix ပြဪfပြု &#8212; private IP (10.x, 192.168.x, 172.16&#8211;31.x) များကို OSINT auto-skip ဖြစသွား၏') +
+        _exp('Backend မစနိုင် / port conflict', 'start.sh က port conflict ကို auto-detect ပြု next free port ရှာသည်၏ .env ထဲ BACKEND_PORT/FRONTEND_PORT သတ်မှတ်ပဪb၏') +
+        _s('Port Configuration') +
+        _pre('# .env\nBACKEND_PORT=6000    # FastAPI backend\nFRONTEND_PORT=8501   # Streamlit frontend') +
+        _s('API Reference &#8212; အခြိအကျဪ Endpoints')
+        + '_api_tbl'
+    )
 
-            _doc_section("Command Console")
-            _doc_card("Manual command injection", "The Command Console lets you enter arbitrary commands against the session target — outside the AI loop. Useful for running a specific tool the AI has not tried, quickly verifying a finding, or injecting a result into the session context. Auto-approve is checked by default — uncheck to queue for review first.", accent="#1976d2")
+    _tabs_data = [
+        ("&#128640; Getting Started", t0en, t0my),
+        ("&#128203; Session Guide",   t1en, t1my),
+        ("&#129302; AI &amp; Commands", t2en, t2my),
+        ("&#128376;&#65039; Threat Intel", t3en, t3my),
+        ("&#129504; Ollama Models",    t4en, t4my),
+        ("&#128295; Troubleshooting",  t5en, t5my),
+    ]
 
-            _doc_section("OSINT — Google Dorks")
-            st.code('site:<domain> filetype:pdf|xlsx|docx|pptx|sql|bak|env|config|log\n'
-                    'site:<domain> inurl:admin|login|portal|dashboard\n'
-                    'site:<domain> "index of" | "parent directory"\n'
-                    '"<domain>" ext:sql|bak|env|config|log\n'
-                    'site:<domain> intext:"password"|"api_key"|"secret"', language="text")
-            st.info("OSINT / Google Dorks only run for **domain targets**. "
-                    "Private/local IPs (10.x, 192.168.x) skip OSINT automatically.")
-        else:
-            _doc_section("Risk Classification")
-            _doc_card("🟢 LOW — Read-only / passive", "Observable impact မရှိ။ ဥပမာ: <code>nmap</code>, <code>curl -I</code>, <code>whois</code>, <code>dig</code>. Auto-approve ON ဆိုရင် auto-execute လုပ်သည်။", accent="#4caf50")
-            _doc_card("🟡 MEDIUM — Active / traces ကျန်သည်", "Active enumeration — trace ကျန်သော်လည်း ပျက်စီးနိုင်ဘွယ် မရှိ။ ဥပမာ: <code>nikto</code>, <code>gobuster</code>, <code>nuclei</code>. Auto-approve ON ဆိုရင် auto-execute လုပ်သည်။", accent="#f9a825")
-            _doc_card("🔴 HIGH — Destructive / ပြောင်းပြန်မလှန်နိုင်", "Service crash ဖြစ်ခြင်း သို့မဟုတ် data exfiltrate ဖြစ်နိုင်သည်။ ဥပမာ: <code>hydra</code>, <code>msfconsole</code>, <code>sqlmap --dump</code>. Auto-approve ON မဟုတ်ဘဲ manual approval လိုသည်။", accent="#c62828")
-            st.info("Risk level ကို keyword + regex rule တွေနဲ့ deterministic ဆုံးဖြတ်သည် — LLM ကိုပေး၍ မဆုံးဖြတ်ရ။ "
-                    "AI သည် LOW ဟု ကိုယ်တိုင် classify ၍ bypass လုပ်၍ မရပါ။")
+    _tb_html = "".join(
+        f'<button class="tb{" ta" if i == 0 else ""}" onclick="sT({i})">{name}</button>'
+        for i, (name, _, _) in enumerate(_tabs_data)
+    )
+    _tp_html = "".join(
+        f'<div class="tp{" ta" if i == 0 else ""}"><div class="en">{en}</div>'
+        f'<div class="my">{my}</div></div>'
+        for i, (_, en, my) in enumerate(_tabs_data)
+    )
 
-            _doc_section("Strategic Layer (AI Planner)")
-            _doc_card("Command ၅ ကြိမ်တိုင်း run သည်", "Tactical loop နှင့် သီးခြားစွာ run သည်။ Command ၅ ကြိမ်ပြီးတိုင်း overall progress စစ်ဆေးပြီး multi-step plan update လုပ်သည်။ Root / SYSTEM / Domain Admin ရသောအခါ loop ကို ရပ်သည်။", accent="#7e57c2")
-            _doc_card("Progress % မတိုးဘူးလား?", "Strategist သည် command ၅ ကြိမ်တိုင်းမှ update လုပ်ပါ။ မတိုးဟု ထင်ရလျှင် command ငါးကြိမ် ထပ်ပြီးမှ ကြည့်ပါ။", accent="#455a64")
+    _css = "<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#0e1117;color:#e8eaf6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px 20px;font-size:14px;line-height:1.5}.hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}h1{color:#e8eaf6;font-size:1.45rem}.lbs{display:flex;gap:6px}.lb{background:#1e2530;color:#e8eaf6;border:1px solid #2a3040;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:.85rem;transition:all .15s}.lb.la{background:#4f8ef7;border-color:#4f8ef7;color:#fff}.tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}.tb{background:#1e2530;color:#90caf9;border:1px solid #2a3040;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:.85rem;transition:all .15s}.tb.ta{background:#4f8ef7;color:#fff;border-color:#4f8ef7}.tp{display:none}.tp.ta{display:block}.en{display:block}.my{display:none}[data-lang=my] .en{display:none}[data-lang=my] .my{display:block}.card{background:#1e2530;border-left:4px solid #4f8ef7;padding:14px 18px;border-radius:6px;margin:8px 0}.ct{color:#e8eaf6;font-weight:600;font-size:1rem;margin-bottom:5px}.cb{color:#b0bec5;line-height:1.7}.sh{color:#90caf9;font-size:1.1rem;font-weight:700;margin:22px 0 8px;padding-bottom:4px;border-bottom:1px solid #2a3040}.alert{padding:12px 16px;border-radius:6px;margin:10px 0;line-height:1.6}.ai{background:#1a2744;border:1px solid #2196f3;color:#90caf9}.aw{background:#2d1f00;border:1px solid #f57c00;color:#ffb74d}.ao{background:#1a2d1a;border:1px solid #4caf50;color:#81c784}code{background:#2a3040;padding:2px 5px;border-radius:3px;font-family:monospace;font-size:.88em}pre{background:#1e2530;border:1px solid #2a3040;padding:12px;border-radius:6px;overflow-x:auto;margin:10px 0;font-size:.83rem;color:#b0bec5;white-space:pre}details.exp{border:1px solid #2a3040;border-radius:6px;margin:6px 0;overflow:hidden}details.exp summary{background:#1e2530;padding:12px 16px;cursor:pointer;color:#90caf9;list-style:none;user-select:none}details.exp summary::-webkit-details-marker{display:none}details.exp summary::after{content:' \\25BC';font-size:.75rem;float:right;opacity:.7}details[open].exp summary::after{content:' \\25B2'}.exb{padding:14px 16px;background:#141920;color:#b0bec5;line-height:1.7}.tbl{width:100%;border-collapse:collapse;margin:12px 0;font-size:.85rem}.tbl th{background:#1e2530;color:#90caf9;padding:9px 12px;text-align:left;border:1px solid #2a3040}.tbl td{padding:8px 12px;border:1px solid #2a3040;color:#b0bec5}.tbl tr:nth-child(even) td{background:#141920}</style>"
+    _js = "<script>function sL(l){  document.documentElement.setAttribute('data-lang',l);  try{localStorage.setItem('kmn_dl',l);}catch(e){}  document.getElementById('lb-en').classList.toggle('la',l==='en');  document.getElementById('lb-my').classList.toggle('la',l==='my');}function sT(i){  document.querySelectorAll('.tp').forEach(function(p,j){p.classList.toggle('ta',j===i);});  document.querySelectorAll('.tb').forEach(function(b,j){b.classList.toggle('ta',j===i);});}(function(){var l;try{l=localStorage.getItem('kmn_dl');}catch(e){}sL(l||'en');})();</script>"
+    _html = (
+        '<!DOCTYPE html><html><head><meta charset=utf-8><style>*{box-sizing:border-box;margin:0;padding:0}body{background:#0e1117;color:#e8eaf6;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;padding:16px 20px;font-size:14px;line-height:1.5}.hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}h1{color:#e8eaf6;font-size:1.45rem}.lbs{display:flex;gap:6px}.lb{background:#1e2530;color:#e8eaf6;border:1px solid #2a3040;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:.85rem;transition:all .15s}.lb.la{background:#4f8ef7;border-color:#4f8ef7;color:#fff}.tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}.tb{background:#1e2530;color:#90caf9;border:1px solid #2a3040;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:.85rem;transition:all .15s}.tb.ta{background:#4f8ef7;color:#fff;border-color:#4f8ef7}.tp{display:none}.tp.ta{display:block}.en{display:block}.my{display:none}[data-lang=my] .en{display:none}[data-lang=my] .my{display:block}.card{background:#1e2530;border-left:4px solid #4f8ef7;padding:14px 18px;border-radius:6px;margin:8px 0}.ct{color:#e8eaf6;font-weight:600;font-size:1rem;margin-bottom:5px}.cb{color:#b0bec5;line-height:1.7}.sh{color:#90caf9;font-size:1.1rem;font-weight:700;margin:22px 0 8px;padding-bottom:4px;border-bottom:1px solid #2a3040}.alert{padding:12px 16px;border-radius:6px;margin:10px 0;line-height:1.6}.ai{background:#1a2744;border:1px solid #2196f3;color:#90caf9}.aw{background:#2d1f00;border:1px solid #f57c00;color:#ffb74d}.ao{background:#1a2d1a;border:1px solid #4caf50;color:#81c784}code{background:#2a3040;padding:2px 5px;border-radius:3px;font-family:monospace;font-size:.88em}pre{background:#1e2530;border:1px solid #2a3040;padding:12px;border-radius:6px;overflow-x:auto;margin:10px 0;font-size:.83rem;color:#b0bec5;white-space:pre}details.exp{border:1px solid #2a3040;border-radius:6px;margin:6px 0;overflow:hidden}details.exp summary{background:#1e2530;padding:12px 16px;cursor:pointer;color:#90caf9;list-style:none;user-select:none}details.exp summary::-webkit-details-marker{display:none}details.exp summary::after{content:\' \\25BC\';font-size:.75rem;float:right;opacity:.7}details[open].exp summary::after{content:\' \\25B2\'}.exb{padding:14px 16px;background:#141920;color:#b0bec5;line-height:1.7}.tbl{width:100%;border-collapse:collapse;margin:12px 0;font-size:.85rem}.tbl th{background:#1e2530;color:#90caf9;padding:9px 12px;text-align:left;border:1px solid #2a3040}.tbl td{padding:8px 12px;border:1px solid #2a3040;color:#b0bec5}.tbl tr:nth-child(even) td{background:#141920}</style></head><body><div class="hdr"><h1>&#128218; Documentation</h1><div class="lbs"><button class="lb la" id="lb-en" onclick="sL(\'en\')">&#127468;&#127463; EN</button><button class="lb" id="lb-my" onclick="sL(\'my\')">&#127474;&#127474; MY</button></div></div><div class="tabs">'
+        + _tb_html + '</div>'
+        + _tp_html + _js + '</body></html>'
+    )
 
-            _doc_section("AI Decisions — Notable Findings")
-            _doc_card("High-value keyword များ", "AI Decisions tab တွင် output ထဲ ဤ keyword ပါသော command များကို အပေါ်ဆုံးတွင် highlight ပြသည်: <code>password</code>, <code>hash</code>, <code>CVE</code>, <code>shell</code>, <code>admin</code>, <code>root</code>, <code>credential</code>, <code>exploit</code>, <code>vulnerable</code>", accent="#00838f")
-
-            _doc_section("Command Console")
-            _doc_card("Manual command ထည့်သွင်းနည်း", "AI loop မပါဘဲ target ကို command တိုက်ရိုက်ပေးနိုင်သည်။ AI မကြိုးစားသေးသော tool run ရန်၊ finding verify ရန် သုံးပါ။ Default — auto-approve checked ဖြစ်သည်; uncheck ဆိုရင် pending queue သို့ ဦးစွာ သွားသည်။", accent="#1976d2")
-
-            _doc_section("OSINT — Google Dorks")
-            st.code('site:<domain> filetype:pdf|xlsx|docx|pptx|sql|bak|env|config|log\n'
-                    'site:<domain> inurl:admin|login|portal|dashboard\n'
-                    'site:<domain> "index of" | "parent directory"\n'
-                    '"<domain>" ext:sql|bak|env|config|log\n'
-                    'site:<domain> intext:"password"|"api_key"|"secret"', language="text")
-            st.info("OSINT / Google Dorks သည် domain target များအတွက်သာ run သည်။ "
-                    "Private IP (10.x, 192.168.x) များကို auto-skip လုပ်သည်။")
-
-    # ── Threat Intel ───────────────────────────────────────────────────────────
-    with tab_ti:
-        if lang == "en":
-            _doc_section("What is Threat Intel?")
-            _doc_card("Standalone research tool", "The Threat Intel page builds a <b>local vulnerability knowledge base</b> over time. It is completely separate from live pentest sessions — it never issues shell commands and cannot affect an active engagement.", accent="#7e57c2")
-
-            _doc_section("How It Works")
-            for i, step in enumerate([
-                ("Enter a search topic", "Software name, version, or CVE query — e.g., <code>Apache httpd 2.4.49</code>, <code>GlassFish 4.1</code>, <code>latest critical CVEs 2026</code>."),
-                ("DuckDuckGo search", "KMN-CyberSeek searches for <code>{topic} CVE vulnerability</code> and fetches up to 5 result pages."),
-                ("AI extraction", "Each page's text is sent to the AI using an isolated prompt — separate from the pentest AI."),
-                ("Structured storage", "CVE IDs, title, description, affected software, severity are stored in the local SQLite <code>threat_intel_cache</code> table with <code>verified=False</code>."),
-                ("Auto cross-reference", "After every nmap scan, the orchestrator cross-references discovered service names against the cache. Matching entries are added to the Vulnerabilities tab as <code>source_tool: threat-intel-cache</code>."),
-            ], 1):
-                _doc_card(f"{i}. {step[0]}", step[1], accent="#1976d2")
-
-            st.warning("**All Threat Intel findings are unverified by design.** Web pages can be wrong or outdated. "
-                       "Treat every result as a lead — cross-check CVE IDs against NVD, Vulners, or CISA KEV before acting.")
-
-            _doc_section("Useful Search Topics")
-            for topic, example in [
-                ("Apache httpd 2.4.49", "CVE-2021-41773 path traversal RCE"),
-                ("ProFTPD 1.3.5", "mod_copy unauthenticated RCE"),
-                ("OpenSSH 7.2p2", "Username enumeration CVE"),
-                ("GlassFish 4.1", "CVE-2017-1000028 unauthenticated RCE"),
-                ("Tomcat 7.0", "CVE-2020-1938 Ghostcat AJP RCE"),
-            ]:
-                _doc_card(f"<code>{topic}</code>", f"Example finding: {example}", accent="#00838f")
-        else:
-            _doc_section("Threat Intel ဆိုတာ ဘာလဲ?")
-            _doc_card("သီးသန့် research tool တစ်ခု", "Threat Intel page သည် <b>local vulnerability knowledge base</b> တည်ဆောက်သည်။ Live pentest session နှင့် လုံးဝ သီးခြားဖြစ်ပြီး shell command မပေးနိုင်ဘဲ active engagement ကို မထိခိုက်နိုင်ပါ။", accent="#7e57c2")
-
-            _doc_section("လုပ်ဆောင်ပုံ")
-            for i, step in enumerate([
-                ("Search topic ထည့်ပါ", "Software name, version, CVE — ဥပမာ <code>Apache httpd 2.4.49</code>, <code>GlassFish 4.1</code>, <code>latest critical CVEs 2026</code>"),
-                ("DuckDuckGo ရှာဖွေသည်", "<code>{topic} CVE vulnerability</code> ကို search ပြီး result page ၅ ခု ထိ fetch လုပ်သည်။"),
-                ("AI extraction", "Page text တစ်ခုစီကို isolated prompt ဖြင့် AI ထံ ပေးပြီး CVE data extract လုပ်သည်။"),
-                ("Database သိမ်းဆည်းမှု", "CVE ID, title, description, severity တို့ကို SQLite <code>threat_intel_cache</code> table တွင် <code>verified=False</code> ဖြင့် သိမ်းဆည်းသည်။"),
-                ("Auto cross-reference", "Nmap scan ပြီးတိုင်း orchestrator သည် ရှာတွေ့ service name များကို cache နှင့် တိုက်စစ်ပြီး ကိုက်ညီသည်ဆိုလျှင် Vulnerabilities tab သို့ ထည့်သည်။"),
-            ], 1):
-                _doc_card(f"{i}. {step[0]}", step[1], accent="#1976d2")
-
-            st.warning("Threat Intel result များသည် verify မပြုရသေး — web page များ မှားနိုင်သည် သို့မဟုတ် ဟောင်းနေနိုင်သည်။ "
-                       "CVE ID တိုင်းကို NVD, Vulners, CISA KEV တွင် cross-check ပြုပြီးမှ လုပ်ဆောင်ပါ။")
-
-            _doc_section("ရှာဖွေသင့်သော topic များ")
-            for topic, example in [
-                ("Apache httpd 2.4.49", "CVE-2021-41773 path traversal RCE"),
-                ("ProFTPD 1.3.5", "mod_copy unauthenticated RCE"),
-                ("OpenSSH 7.2p2", "Username enumeration CVE"),
-                ("GlassFish 4.1", "CVE-2017-1000028 unauthenticated RCE"),
-                ("Tomcat 7.0", "CVE-2020-1938 Ghostcat AJP RCE"),
-            ]:
-                _doc_card(f"<code>{topic}</code>", f"ဥပမာ finding: {example}", accent="#00838f")
-
-    # ── Ollama Models ──────────────────────────────────────────────────────────
-    with tab_ollama:
-        if lang == "en":
-            _doc_section("What the AI Needs to Do Well")
-            for i, item in enumerate([
-                ("Structured JSON output", "Every AI response must be valid JSON. A model that garbles this causes parse failures and halts the session."),
-                ("Multi-step reasoning", "The model must plan a full attack chain without skipping phases after 3 commands."),
-                ("Security command vocabulary", "Knows nmap flags, CVE identifiers, Metasploit modules, GlassFish/Tomcat/SMB quirks."),
-            ], 1):
-                _doc_card(f"{i}. {item[0]}", item[1], accent="#1976d2")
-
-            _doc_section("DeepHat vs qwen2.5 — Which to Use?")
-            _doc_card("DeepHat V1-7B", "<b>Base:</b> Qwen2.5-Coder-7B fine-tuned on cybersecurity data &nbsp;|&nbsp; <b>7.61B parameters</b><br>"
-                      "✅ Security vocabulary excellent &nbsp;&nbsp; ✅ Understands CVE IDs natively &nbsp;&nbsp; ✅ Smaller / faster<br>"
-                      "❌ 7B = weaker reasoning → stage-skipping &nbsp;&nbsp; ❌ JSON inconsistent → parse errors &nbsp;&nbsp; ❌ NOT fully uncensored", accent="#f57c00")
-            _doc_card("qwen2.5:14b — Recommended", "<b>Base:</b> Qwen2.5 14B (Alibaba) &nbsp;|&nbsp; <b>14.7B parameters</b><br>"
-                      "✅ 2x parameters → better JSON reliability &nbsp;&nbsp; ✅ Better multi-step reasoning &nbsp;&nbsp; ✅ Fewer stage-skip bugs<br>"
-                      "❌ Not cybersecurity-specialized &nbsp;&nbsp; ❌ Requires ~11 GB RAM", accent="#4caf50")
-            st.success("**Use qwen2.5:14b as primary.** The #1 cause of session failures is bad JSON output and premature stage advancement — "
-                       "both are reasoning problems that a larger model solves better than a smaller specialized one.")
-
-            _doc_section("Hardware Recommendations")
-            _doc_card("M2 Mac Mini — 24 GB RAM (current)",
-                      "⭐ <code>qwen2.5:14b</code> — ~9 GB disk, ~11 GB RAM, context 32,768<br>"
-                      "Alt: <code>deepseek-r1:14b</code> — similar specs<br>"
-                      "Stretch: <code>qwen2.5:32b</code> — ~19 GB disk, ~21 GB RAM", accent="#1976d2")
-            _doc_card("M4 Pro — 64 GB RAM (upcoming)",
-                      "⭐ <code>qwen2.5:72b</code> — ~42 GB disk, ~45 GB RAM, context 131,072<br>"
-                      "Alt: <code>deepseek-r1:70b</code> — ~40 GB disk, ~42 GB RAM<br>"
-                      "Lighter: <code>qwen2.5:32b</code> — ~19 GB disk, context 65,536", accent="#7e57c2")
-
-            _doc_section("Quick Setup")
-            col_m2, col_m4 = st.columns(2)
-            with col_m2:
-                _doc_card("M2 Mac Mini 24GB", "Settings → AI Configuration: Model <code>qwen2.5:14b</code>, Context <code>32768</code>", accent="#1976d2")
-                st.code("ollama pull qwen2.5:14b", language="bash")
-            with col_m4:
-                _doc_card("M4 Pro 64GB", "Settings → AI Configuration: Model <code>qwen2.5:72b</code>, Context <code>65536</code>", accent="#7e57c2")
-                st.code("ollama pull qwen2.5:72b", language="bash")
-
-            _doc_section("Context Window — Why It Matters")
-            _doc_card("What happens when context overflows",
-                      "Local models have a fixed context window. When session history exceeds it, the model silently forgets old content — causing repeated commands, stage regression, or hallucinated progress.", accent="#f57c00")
-            _doc_card("Built-in mitigations",
-                      "1. <b>Episode summaries</b> — every N commands, old history is compressed into a summary and re-injected.<br>"
-                      "2. <b>Configurable context window</b> — Settings → AI Configuration → Context window controls Ollama's <code>num_ctx</code>.", accent="#4caf50")
-            ctx_data = {"Model size": ["7–8B", "13–14B", "32B", "70–72B"], "Safe context window": ["16,384", "32,768", "32,768–65,536", "65,536–131,072"]}
-            st.dataframe(ctx_data, width="stretch", hide_index=True)
-        else:
-            _doc_section("AI ကောင်းကောင်း run ဖို့ လိုချင်တာ")
-            for i, item in enumerate([
-                ("Structured JSON output", "AI response တိုင်း valid JSON ဖြစ်ရမည်။ JSON ဖောက်ပြန်ပါက parse fail ဖြစ်ပြီး session ရပ်သည်။"),
-                ("Multi-step reasoning", "Command ၃ ကြိမ်ပြီးမှ phase တွေ ကျော်မသွားဘဲ attack chain တစ်ခုလုံး plan ဆွဲနိုင်ရမည်။"),
-                ("Security command vocabulary", "nmap flag, CVE ID, Metasploit module, GlassFish/Tomcat/SMB quirk များ သိသည်ဆိုရမည်။"),
-            ], 1):
-                _doc_card(f"{i}. {item[0]}", item[1], accent="#1976d2")
-
-            _doc_section("DeepHat vs qwen2.5 — ဘယ်ဟာသုံးမလဲ?")
-            _doc_card("DeepHat V1-7B", "<b>Base:</b> Qwen2.5-Coder-7B cybersecurity fine-tune &nbsp;|&nbsp; <b>7.61B parameters</b><br>"
-                      "✅ Security vocab ကောင်းသည် &nbsp;&nbsp; ✅ CVE ID နားလည်သည်<br>"
-                      "❌ 7B = reasoning အားနည်း → stage-skip ဖြစ်နိုင် &nbsp;&nbsp; ❌ JSON မတည်မငြိမ် &nbsp;&nbsp; ❌ Truly uncensored မဟုတ်", accent="#f57c00")
-            _doc_card("qwen2.5:14b — Recommended", "<b>Base:</b> Qwen2.5 14B (Alibaba) &nbsp;|&nbsp; <b>14.7B parameters</b><br>"
-                      "✅ Parameter 2 ဆ → JSON reliability ကောင်း &nbsp;&nbsp; ✅ Reasoning ကောင်း → stage-skip လျော့သည်<br>"
-                      "❌ Cybersecurity specialized မဟုတ် &nbsp;&nbsp; ❌ RAM ~11 GB လိုသည်", accent="#4caf50")
-            st.success("qwen2.5:14b ကိုသုံးပါ။ Session fail ၏ အကြောင်းအရင်း #1 မှာ JSON error နှင့် stage advancement ဖြစ်သည် — "
-                       "ဒါနှစ်ခုလုံး reasoning ပြဿနာဖြစ်ပြီး ကြီးသော model ဖြင့် ဖြေရှင်းနိုင်သည်။")
-
-            _doc_section("Hardware Recommendation")
-            _doc_card("M2 Mac Mini — 24 GB RAM (လက်ရှိ)",
-                      "⭐ <code>qwen2.5:14b</code> — disk ~9 GB, RAM ~11 GB, context 32,768<br>"
-                      "Alt: <code>deepseek-r1:14b</code><br>"
-                      "Stretch: <code>qwen2.5:32b</code> — disk ~19 GB, RAM ~21 GB", accent="#1976d2")
-            _doc_card("M4 Pro — 64 GB RAM (ဝယ်မည်)",
-                      "⭐ <code>qwen2.5:72b</code> — disk ~42 GB, RAM ~45 GB, context 131,072<br>"
-                      "Alt: <code>deepseek-r1:70b</code> — disk ~40 GB, RAM ~42 GB<br>"
-                      "Lighter: <code>qwen2.5:32b</code> — disk ~19 GB, context 65,536", accent="#7e57c2")
-
-            _doc_section("Setup အမြန်")
-            col_m2, col_m4 = st.columns(2)
-            with col_m2:
-                _doc_card("M2 Mac Mini 24GB", "Settings → AI Configuration: Model <code>qwen2.5:14b</code>, Context <code>32768</code>", accent="#1976d2")
-                st.code("ollama pull qwen2.5:14b", language="bash")
-            with col_m4:
-                _doc_card("M4 Pro 64GB", "Settings → AI Configuration: Model <code>qwen2.5:72b</code>, Context <code>65536</code>", accent="#7e57c2")
-                st.code("ollama pull qwen2.5:72b", language="bash")
-
-            _doc_section("Context Window — ဘာကြောင့် အရေးကြီးသလဲ")
-            _doc_card("Context overflow ဖြစ်ရင် ဘာဖြစ်မလဲ",
-                      "Local model ၏ context window ကျော်လွန်ပါက model က အဟောင်းများကို တိတ်တဆိတ် မေ့သွားသည် — command ထပ်ခြင်း, stage regression, hallucination ဖြစ်နိုင်သည်။",
-                      accent="#f57c00")
-            _doc_card("Built-in mitigation",
-                      "1. <b>Episode summaries</b> — command N ကြိမ်တိုင်း history ကို compress ပြီး re-inject လုပ်သည်။<br>"
-                      "2. <b>Context window configure</b> — Settings → AI Configuration → Context window တွင် Ollama <code>num_ctx</code> ကို ထိန်းချုပ်နိုင်သည်။",
-                      accent="#4caf50")
-            ctx_data = {"Model size": ["7–8B", "13–14B", "32B", "70–72B"], "Safe context window": ["16,384", "32,768", "32,768–65,536", "65,536–131,072"]}
-            st.dataframe(ctx_data, width="stretch", hide_index=True)
-
-    # ── Troubleshooting ────────────────────────────────────────────────────────
-    with tab_trouble:
-        if lang == "en":
-            _doc_section("Common Issues")
-            issues_en = [
-                ("Session status FAILED but terminal still active",
-                 "Asyncio tasks queued before failure finish running after status changed. Normal — backend drains queue then stops. "
-                 "Wait a few seconds, refresh, then use <b>Reset AI</b>."),
-                ("<code>echo 'AI response parsing error'</code> in command history",
-                 "AI returned invalid JSON (model cut off mid-response or wrapped in markdown). Now fixed — session halts cleanly on parse failure instead of running a fake echo command. "
-                 "If seen on an old session, do a <b>Reset AI</b>. Switching to qwen2.5:14b reduces parse failures significantly."),
-                ("All stages Done after only 5 commands",
-                 "Old bug: AI jumped to <code>credential_reuse</code> immediately, making all prior stages appear done. "
-                 "Fixed — stage gate now prevents advancing more than 1 phase per AI decision. Do a <b>Reset AI</b> on affected sessions."),
-                ("Progress % frozen at 5% / not increasing",
-                 "Strategic Layer runs every 5 completed commands. Wait for next batch of 5, or do a <b>Reset AI</b> to trigger a fresh strategist pass."),
-                ("Resume button showing on active session",
-                 "Session status was <code>ready</code> (AI autonomous loop active) but Resume was showing. "
-                 "Fixed — <code>ready</code> now shows '🟢 Session Active' instead. Update and restart the frontend."),
-                ("Pending commands piling up / approve does not clear queue",
-                 "Two causes: (1) auto_approve OFF — commands go to queue by design. "
-                 "(2) Max auto-depth reached (15 commands) — one manual approval resets the counter. Check Commands tab."),
-                ("AI keeps suggesting the same command repeatedly",
-                 "Context overflow — model forgot it ran that command. Increase context window in Settings (try 32768 or 65536). Switch to a larger model (14B+)."),
-                ("Session History shows 'No sessions recorded yet'",
-                 "Fixed — caused by FastAPI route order bug. Update to latest and restart backend."),
-                ("OSINT running on local/private IP targets",
-                 "Fixed — private IPs (10.x, 192.168.x, 172.16-31.x, localhost) now skip OSINT automatically."),
-                ("Backend not starting / port conflict",
-                 "<code>start.sh</code> auto-detects port conflicts and finds the next free port. "
-                 "Set <code>BACKEND_PORT</code> / <code>FRONTEND_PORT</code> in <code>.env</code> to override."),
-            ]
-            for title, detail in issues_en:
-                with st.expander(f"? {title}"):
-                    st.markdown(detail, unsafe_allow_html=True)
-
-            _doc_section("Port Configuration")
-            st.code("# .env\nBACKEND_PORT=6000    # FastAPI backend\nFRONTEND_PORT=8501   # Streamlit frontend", language="ini")
-
-            _doc_section("API Reference — Key Endpoints")
-            api_data = {
-                "Method": ["POST", "GET", "POST", "POST", "POST", "POST", "DELETE", "GET"],
-                "Endpoint": ["/api/sessions", "/api/sessions/history", "/api/sessions/{id}/resume",
-                             "/api/sessions/{id}/restart", "/api/sessions/{id}/rescan",
-                             "/api/sessions/{id}/approve/{cmd_id}", "/api/sessions/{id}", "/api/stats"],
-                "Description": ["Create new session", "List all sessions from DB",
-                                 "Resume AI analysis (idempotent)", "Reset AI state, keep scan data",
-                                 "Full rescan — clear everything, re-run nmap", "Approve a pending command",
-                                 "Delete session", "Dashboard stats"],
-            }
-            st.dataframe(api_data, width="stretch", hide_index=True)
-        else:
-            _doc_section("ဖြစ်လေ့ရှိသော ပြဿနာများ")
-            issues_my = [
-                ("Status FAILED ပေမဲ့ terminal ဆက်တက်နေသည်",
-                 "Failure မဖြစ်မီ queue ဝင်ထားသော asyncio task များ ဆက်ပြီး run နေသည်။ ပုံမှန်ဖြစ်သည် — backend က queue ကုန်ပြီးမှ ရပ်သည်။ ကြာနည်းနည်းစောင့်ပြီး refresh လုပ်ပါ၊ ထို့နောက် <b>Reset AI</b> နှိပ်ပါ။"),
-                ("<code>echo 'AI response parsing error'</code> command history တွင် ပေါ်လျှင်",
-                 "AI က invalid JSON ပြန်ပေးသည် (model cut off သွားခြင်း သို့မဟုတ် markdown wrap ဖြင့် ပြန်ပေးခြင်း)။ ယခု fix ပြုပြီး — parse fail ဆိုပါက fake echo မပြုဘဲ session ကို သပ်ရပ်စွာ ရပ်သည်။ ဟောင်းသော session တွင် မြင်ရလျှင် <b>Reset AI</b> နှိပ်ပါ။ qwen2.5:14b သို့ ပြောင်းခြင်းဖြင့် parse error လျော့ချနိုင်သည်။"),
-                ("Command ၅ ကြိမ်ပြီးကတည်းက stage အားလုံး Done ဖြစ်နေသည်",
-                 "AI သည် <code>credential_reuse</code> ကို ချက်ချင်း ရောက်သွားပြီး ရှေ့ stage တွေ Done ဖြစ်ပြနေသည်။ Fix ပြုပြီး — stage gate ကြောင့် AI decision တစ်ကြိမ်တွင် phase တစ်ဆင့်သာ တိုးနိုင်သည်။ ထိခိုက်သော session ကို <b>Reset AI</b> နှိပ်ပါ။"),
-                ("Progress % ၅% မှ မတိုးတော့ဘူး",
-                 "Strategic Layer သည် command ၅ ကြိမ်တိုင်းမှ update လုပ်သည်။ Command ၅ ကြိမ် ထပ်ဖြည့်ပြီးမှ ကြည့်ပါ သို့မဟုတ် <b>Reset AI</b> နှိပ်ပါ။"),
-                ("Session active ဖြစ်နေပေမဲ့ Resume ခလုတ် ပေါ်နေသည်",
-                 "Status <code>ready</code> (AI autonomous loop active) ဆိုလျှင် Resume ပေါ်ခဲ့ဖူးသည်။ Fix ပြုပြီး — <code>ready</code> status တွင် '🟢 Session Active' ပြမည်။ Update ပြီး frontend restart လုပ်ပါ။"),
-                ("Pending command များ တွဲနေသည်",
-                 "ဖြစ်ရသည့် အကြောင်းနှစ်ခု: (1) auto_approve OFF — command တိုင်း queue သို့ ရောက်ရမည်ဟု ဒီဇိုင်းထားသည်။ (2) Auto-depth ၁၅ ကြိမ် ပြည့်ပြီ — manual approval တစ်ကြိမ် နှိပ်ပြီးမှ counter reset ဖြစ်သည်။ Commands tab ကို စစ်ဆေးပါ။"),
-                ("AI က command တူတူ ထပ်ပြနေသည်",
-                 "Context overflow — model က ရှိပြီးသား command ကို မေ့သွားသည်။ Settings တွင် context window ကို ၃၂၇၆၈ သို့မဟုတ် ၆၅၅၃၆ တိုးပါ။ Model ကို 14B+ သို့ ပြောင်းကြည့်ပါ။"),
-                ("History 'No sessions recorded yet' ပြနေသည်",
-                 "FastAPI route order bug ကြောင့် ဖြစ်ခဲ့သည်။ Fix ပြုပြီး — latest update လုပ်ပြီး backend restart လုပ်ပါ။"),
-                ("Local/private IP ကို OSINT run သွားနေသည်",
-                 "Fix ပြုပြီး — private IP (10.x, 192.168.x, 172.16-31.x, localhost) များကို OSINT auto-skip ဖြစ်သွားသည်။"),
-                ("Backend မစနိုင် / port conflict",
-                 "<code>start.sh</code> က port conflict ကို auto-detect ပြီး next free port ရှာသည်။ <code>.env</code> ထဲတွင် <code>BACKEND_PORT</code>/<code>FRONTEND_PORT</code> သတ်မှတ်ပါ။"),
-            ]
-            for title, detail in issues_my:
-                with st.expander(f"? {title}"):
-                    st.markdown(detail, unsafe_allow_html=True)
-
-            _doc_section("Port Configuration")
-            st.code("# .env\nBACKEND_PORT=6000    # FastAPI backend\nFRONTEND_PORT=8501   # Streamlit frontend", language="ini")
-
-            _doc_section("API Reference — အဓိက Endpoints")
-            api_data = {
-                "Method": ["POST", "GET", "POST", "POST", "POST", "POST", "DELETE", "GET"],
-                "Endpoint": ["/api/sessions", "/api/sessions/history", "/api/sessions/{id}/resume",
-                             "/api/sessions/{id}/restart", "/api/sessions/{id}/rescan",
-                             "/api/sessions/{id}/approve/{cmd_id}", "/api/sessions/{id}", "/api/stats"],
-                "Description": ["Session အသစ် ဖန်တီးသည်", "Session အားလုံး စာရင်းကြည့်သည်",
-                                 "AI analysis resume (idempotent)", "AI reset, scan data ထားသည်",
-                                 "Full rescan — အားလုံးဖျက် nmap ပြန်စသည်", "Pending command approve လုပ်သည်",
-                                 "Session ဖျက်သည်", "Dashboard stats"],
-            }
-            st.dataframe(api_data, width="stretch", hide_index=True)
-
+    _components.html(_html, height=720, scrolling=True)
 
 def show_settings():
     """Settings page."""
