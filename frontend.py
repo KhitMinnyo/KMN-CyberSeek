@@ -2303,6 +2303,7 @@ def show_docs():
     if "docs_lang" not in st.session_state:
         st.session_state["docs_lang"] = "en"
 
+    _lang_changed = False
     with lang_col:
         st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
         cur = st.session_state["docs_lang"]
@@ -2311,14 +2312,21 @@ def show_docs():
             if st.button("🇬🇧 EN", use_container_width=True,
                          type="primary" if cur == "en" else "secondary",
                          key="docs_lang_en"):
-                st.session_state["docs_lang"] = "en"
+                if cur != "en":
+                    st.session_state["docs_lang"] = "en"
+                    _lang_changed = True
         with c2:
             if st.button("🇲🇲 MY", use_container_width=True,
                          type="primary" if cur == "my" else "secondary",
                          key="docs_lang_my"):
-                st.session_state["docs_lang"] = "my"
+                if cur != "my":
+                    st.session_state["docs_lang"] = "my"
+                    _lang_changed = True
 
     lang = st.session_state["docs_lang"]
+
+    if _lang_changed:
+        st.rerun()
 
     tab_gs, tab_session, tab_ai, tab_ti, tab_ollama, tab_trouble = st.tabs([
         "🚀 Getting Started", "📋 Session Guide", "🤖 AI & Commands",
