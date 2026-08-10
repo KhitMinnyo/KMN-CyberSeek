@@ -55,6 +55,45 @@ COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "600"))
 # Session-level authorization_confirmed is still required to create a session.
 FULL_AUTO_MODE: bool = os.getenv("FULL_AUTO_MODE", "false").lower() == "true"
 
+# Canonical stage progression order. The AI reports attack_phase in its JSON
+# responses; this list is the source of truth for valid transitions.
+# Rules enforced by _advance_stage():
+#   1. Stage can only move FORWARD (never regress to an earlier stage).
+#   2. Stage can skip at most 1 step per AI response (prevents 5-command full-run).
+_STAGE_ORDER: List[str] = [
+    "osint",
+    "reconnaissance",
+    "enumeration",
+    "vulnerability_analysis",
+    "exploitation",
+    "post_exploitation",
+    "privilege_escalation",
+    "lateral_movement",
+    "credential_reuse",
+]
+_STAGE_INDEX: Dict[str, int] = {s: i for i, s in enumerate(_STAGE_ORDER)}
+
+
+def _advance_stage(current: str, proposed: str) -> str:
+    """Return the stage the session should move to.
+
+    Guarantees:
+    - Never regresses (if proposed is earlier than current, keep current).
+    - Skips at most 1 stage per call (AI can't jump from recon → credential_reuse
+      in a single decision — it must walk through each phase).
+    """
+    curr_idx = _STAGE_INDEX.get(current, 0)
+    prop_idx = _STAGE_INDEX.get(proposed, curr_idx)
+
+    if prop_idx <= curr_idx:
+        # Regression attempt or same stage — stay where we are.
+        return current
+
+    # Allow at most one-step advancement per AI decision.
+    next_idx = min(prop_idx, curr_idx + 1)
+    return _STAGE_ORDER[next_idx]
+
+
 # Service test-lifecycle ordering. Transitions only ever move a service UP this
 # ladder (a tested service never reverts to untested).
 _SERVICE_STATE_ORDER: Dict[str, int] = {
@@ -1073,10 +1112,13 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             }
             
             session.ai_decisions.append(decision)
-            
-            # Update session stage based on AI's analysis
-            session.current_stage = ai_response.attack_phase
-            
+
+            # Advance stage: gate prevents regression and limits skipping to 1 step.
+            new_stage = _advance_stage(session.current_stage, ai_response.attack_phase)
+            if new_stage != session.current_stage:
+                logger.info(f"Session {session_id}: stage {session.current_stage} → {new_stage} (AI proposed: {ai_response.attack_phase})")
+            session.current_stage = new_stage
+
             # Update status based on auto-approve setting and risk level.
             # FULL_AUTO_MODE overrides: execute everything regardless of risk.
             if FULL_AUTO_MODE or (session.auto_approve and ai_response.risk_level in ["low", "medium"]):
@@ -1581,9 +1623,13 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 
             session.ai_decisions.append(decision)
 
-            # Update session stage based strictly on AI's output
-            session.current_stage = ai_response.attack_phase
-            logger.info(f"Updated session {session_id} stage to {session.current_stage}")
+            # Advance stage: gate prevents regression and limits skip to 1 step.
+            new_stage = _advance_stage(session.current_stage, ai_response.attack_phase)
+            if new_stage != session.current_stage:
+                logger.info(f"Session {session_id}: stage {session.current_stage} → {new_stage} (AI proposed: {ai_response.attack_phase})")
+            else:
+                logger.info(f"Session {session_id}: stage held at {session.current_stage} (AI proposed: {ai_response.attack_phase})")
+            session.current_stage = new_stage
             
             # ANTI-LOOP GUARDRAIL: Check if the AI suggested a command we recently executed
             recent_commands = [cmd.get('command', '').strip() for cmd in session.commands_executed[-5:]]
