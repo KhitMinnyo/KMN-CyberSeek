@@ -1300,7 +1300,23 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         session = self.sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
-        
+
+        # Do not execute commands when the session has already failed/completed.
+        # Asyncio tasks queued before the failure would otherwise run after the
+        # session is dead, producing confusing "terminal active / UI failed" state.
+        if session.status in ("failed", "completed", "error"):
+            logger.warning(
+                f"execute_command called on {session_id} with status={session.status} — skipping: {command[:80]}"
+            )
+            return {
+                "command_id": str(uuid.uuid4()),
+                "command": command,
+                "output": "",
+                "error": f"Session is {session.status} — command skipped",
+                "return_code": -1,
+                "success": False,
+            }
+
         command_id = str(uuid.uuid4())
         session.status = "executing"
         
@@ -1483,12 +1499,22 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
     
     async def _process_command_output(self, session_id: str, command: str, output: str, error: Optional[str] = None):
         """Process command output and decide next steps with Agentic Loop.
-        
+
         If error is provided, this triggers self-healing/error recovery mode where the AI
         analyzes the error and suggests a corrected command.
         """
         session = self.sessions.get(session_id)
         if not session:
+            return
+
+        # Stop the agentic loop if the session was marked failed/completed/error
+        # externally (e.g. a parse error in a parallel task set status before this
+        # callback fired). Without this guard the loop keeps spawning new commands
+        # on a dead session, making the terminal appear active while UI shows failed.
+        if session.status in ("failed", "completed", "error"):
+            logger.warning(
+                f"_process_command_output: session {session_id} is {session.status} — halting loop."
+            )
             return
         
         try:
