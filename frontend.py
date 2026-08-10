@@ -1082,37 +1082,32 @@ def show_session_overview(session_details: Dict):
             except Exception:
                 pass
 
-    # ── Session control buttons — always visible regardless of status ─────────
-    # Resume/Start are hidden while in_progress to prevent spawning duplicate AI
-    # loops. Reset AI, Delete, and Full Rescan are always available so the user
-    # can interrupt a stuck/looping/failed session without waiting for it to stop.
+    # ── Session control buttons — all four always visible ─────────────────────
+    # Resume/Start: shown always, disabled while in_progress (prevents duplicate
+    # AI loop spawning but stays visible so the user knows it exists).
+    # Reset AI, Delete, Full Rescan: always clickable regardless of status.
     st.markdown("")
     btn_col1, btn_col2, btn_col3 = st.columns(3)
 
-    if not in_progress:
-        # Resume / Start — only safe to show when session is not already running
-        with btn_col1:
-            if status == "failed":
-                if st.button("▶️ Resume",
-                             help="Retry AI analysis on existing scan data without clearing anything.",
-                             use_container_width=True):
-                    api_session.post(f"{API_BASE}/sessions/{session_id}/resume")
-                    time.sleep(0.5)
-                    st.rerun()
-            elif status == "initialized" and not has_data:
-                if st.button("🚀 Start",
-                             help="Run initial nmap scan and begin AI analysis",
-                             type="primary", use_container_width=True):
-                    api_session.post(f"{API_BASE}/sessions/{session_id}/start")
-                    time.sleep(0.5)
-                    st.rerun()
-            else:
-                if st.button("▶️ Resume",
-                             help="Continue AI analysis from current scan data (no re-scan)",
-                             type="primary", use_container_width=True):
-                    api_session.post(f"{API_BASE}/sessions/{session_id}/resume")
-                    time.sleep(0.5)
-                    st.rerun()
+    with btn_col1:
+        if status == "initialized" and not has_data:
+            # Fresh session — show Start (clickable only when not in_progress)
+            st.button("🚀 Start",
+                      help="Run initial nmap scan and begin AI analysis",
+                      type="primary" if not in_progress else "secondary",
+                      disabled=in_progress,
+                      use_container_width=True,
+                      on_click=lambda: api_session.post(f"{API_BASE}/sessions/{session_id}/start") or time.sleep(0.3))
+        else:
+            # Existing data — Resume (disabled while running to prevent duplicate loop)
+            if st.button("▶️ Resume",
+                         help="Continue AI analysis from current scan data (no re-scan). Disabled while session is already running.",
+                         type="primary" if not in_progress else "secondary",
+                         disabled=in_progress,
+                         use_container_width=True):
+                api_session.post(f"{API_BASE}/sessions/{session_id}/resume")
+                time.sleep(0.5)
+                st.rerun()
 
     with btn_col2:
         _reset_primary = in_progress and status == "failed"
