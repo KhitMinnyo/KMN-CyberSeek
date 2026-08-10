@@ -443,6 +443,70 @@ class Scanner:
                 "vulnerabilities": []
             }
     
+    async def perform_vulnerability_scan_port(
+        self, target: str, port: int, timeout: int = 60
+    ) -> Dict:
+        """Run nmap vuln NSE scripts against a single port.
+
+        Scoped to one port at a time so:
+        - Each port gets a generous individual timeout (default 60s) without
+          one slow port starving all others.
+        - Callers can check a completion marker before calling and skip ports
+          already scanned, enabling true resume across backend restarts.
+
+        Returns the same shape as perform_vulnerability_scan():
+          {"target": ..., "port": int, "success": bool,
+           "vulnerabilities": [...], "raw_output": "..."}
+        """
+        import os as _os
+        timeout = int(_os.getenv("VULN_PORT_TIMEOUT", str(timeout)))
+
+        if not is_valid_target(target):
+            return _invalid_target_result(target, {"vulnerabilities": [], "port": port})
+
+        logger.info(f"Starting per-port vuln scan: {target}:{port}")
+        try:
+            cmd = (
+                f"nmap -sV -T4 -p {int(port)} "
+                f'--script "vuln and not intrusive" --script-timeout 20 '
+                f"{shlex.quote(target)}"
+            )
+            process = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd="/tmp",
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.communicate()
+                logger.warning(f"Per-port vuln scan timed out after {timeout}s: {target}:{port}")
+                return {
+                    "target": target, "port": port,
+                    "success": False, "error": f"timed out after {timeout}s",
+                    "vulnerabilities": [], "raw_output": "",
+                }
+
+            raw = stdout.decode(errors="replace")
+            vulns = self._parse_vulnerability_output(raw)
+            logger.info(f"Per-port vuln scan done: {target}:{port} — {len(vulns)} finding(s)")
+            return {
+                "target": target, "port": port,
+                "success": True, "raw_output": raw,
+                "vulnerabilities": vulns,
+            }
+        except Exception as e:
+            logger.warning(f"Per-port vuln scan error {target}:{port}: {e}")
+            return {
+                "target": target, "port": port,
+                "success": False, "error": str(e),
+                "vulnerabilities": [], "raw_output": "",
+            }
+
     async def searchsploit_lookup(self, service: str, version: str) -> List[Dict]:
         """
         Query the local ExploitDB via `searchsploit` for exploits matching a
