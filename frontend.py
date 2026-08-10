@@ -1250,10 +1250,13 @@ def show_vulnerabilities(session_details: Dict):
             st.info("⏳ Vulnerability scan in progress — findings will appear here automatically.")
         else:
             st.info(
-                "No vulnerability findings for this target. This is normal if the target has "
-                "no services vulnerable to Nmap NSE vuln scripts. "
-                "CVE enrichment via Vulners requires `VULNERS_API_KEY` in Settings. "
-                "Use the **Threat Intel** tab to manually research specific services."
+                "No vulnerability findings recorded for this target. "
+                "The pipeline scans each open port with **Nmap NSE vuln scripts**, "
+                "queries **NIST NVD** (free, no key) per discovered service, "
+                "and searches **local ExploitDB** via searchsploit — all automatically. "
+                "An empty result means those sources found no matching CVEs for the "
+                "detected service versions, which is normal for patched or non-standard targets. "
+                "Use the **Threat Intel** tab for manual open-web research on specific services."
             )
         return
 

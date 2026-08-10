@@ -772,13 +772,36 @@ async def restart_session(session_id: str):
     session.status = "analyzing"
 
     import sqlite3 as _sqlite3
+    import json as _json
     _conn = _sqlite3.connect(orchestrator.db_path)
+
+    # Clear AI decisions for this session.
     _conn.execute('DELETE FROM ai_decisions WHERE session_id = ?', (session_id,))
+
+    # Clear previously stored vulnerability findings so a fresh analysis run
+    # produces clean results (avoids stale dedup entries blocking new findings).
+    _conn.execute('DELETE FROM vulnerabilities WHERE session_id = ?', (session_id,))
+
+    # Remove vuln-analysis completion markers so _run_vulnerability_analysis()
+    # re-runs every step instead of skipping everything as "already done".
+    # We keep the real nmap scan blobs (scan_type not matching these prefixes)
+    # so hosts/services/ports are preserved for the AI context.
+    _conn.execute("""
+        DELETE FROM scan_results
+        WHERE session_id = ?
+          AND (scan_type LIKE 'nmap_vuln_p%'
+               OR scan_type LIKE 'ss_%'
+               OR scan_type LIKE 'nvd_%'
+               OR scan_type LIKE 'vul_%')
+    """, (session_id,))
+
     _conn.commit()
     _conn.close()
 
-    logger.info(f"Smart restart for session {session_id} — keeping scan data, resetting AI state")
+    logger.info(f"Smart restart for session {session_id} — keeping scan data, resetting AI + vuln state")
+    # Re-run both AI analysis and vulnerability analysis from scratch.
     asyncio.create_task(orchestrator._analyze_with_ai(session_id))
+    asyncio.create_task(orchestrator._run_vulnerability_analysis(session_id))
     return {"status": "success", "message": "AI state reset — re-analyzing existing scan data"}
 
 
