@@ -107,6 +107,8 @@ BACKEND_PORT=$(grep -m1 "^BACKEND_PORT=" .env 2>/dev/null | cut -d'=' -f2 | tr -
 BACKEND_PORT="${BACKEND_PORT:-6000}"
 FRONTEND_PORT=$(grep -m1 "^FRONTEND_PORT=" .env 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'" | tr -d ' ')
 FRONTEND_PORT="${FRONTEND_PORT:-8501}"
+DOCS_PORT=$(grep -m1 "^DOCS_PORT=" .env 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'" | tr -d ' ')
+DOCS_PORT="${DOCS_PORT:-3500}"
 
 # ── Resolve free ports (auto-switch if system service holds preferred port) ──
 
@@ -128,7 +130,15 @@ if _port_in_use "$FRONTEND_PORT"; then
     FRONTEND_PORT=$FREE
 fi
 
-export BACKEND_PORT FRONTEND_PORT
+_try_kill_port "$DOCS_PORT"
+if _port_in_use "$DOCS_PORT"; then
+    FREE=$(_find_free_port 3500)
+    echo "ℹ️  Port $DOCS_PORT held by a system service — auto-switching to $FREE"
+    _set_env_val "DOCS_PORT" "$FREE"
+    DOCS_PORT=$FREE
+fi
+
+export BACKEND_PORT FRONTEND_PORT DOCS_PORT
 
 # ── Start services ────────────────────────────────────────────────────────────
 
@@ -138,6 +148,7 @@ cleanup() {
     echo "🛑 Shutting down services..."
     kill $BACKEND_PID 2>/dev/null
     kill $FRONTEND_PID 2>/dev/null
+    kill $DOCS_PID 2>/dev/null
     echo "✅ Services stopped"
     exit 0
 }
@@ -164,7 +175,12 @@ echo "🎨 Starting Streamlit frontend on http://localhost:${FRONTEND_PORT}"
 streamlit run frontend.py --server.port "$FRONTEND_PORT" --server.headless true &
 FRONTEND_PID=$!
 
-# Wait for frontend to start
+# Start standalone docs server
+echo "📖 Starting documentation server on http://localhost:${DOCS_PORT}"
+python3 docs_server.py &
+DOCS_PID=$!
+
+# Wait for frontend/docs to start
 sleep 3
 
 echo ""
@@ -172,6 +188,7 @@ echo "✅ KMN-CyberSeek started successfully!"
 echo ""
 echo "🌐 Access Points:"
 echo "   Dashboard:    http://localhost:${FRONTEND_PORT}"
+echo "   Documentation: http://localhost:${DOCS_PORT}"
 echo "   API Docs:     http://localhost:${BACKEND_PORT}/api/docs"
 echo "   Health Check: http://localhost:${BACKEND_PORT}/health"
 echo ""
@@ -184,4 +201,4 @@ echo ""
 echo "🛑 Press Ctrl+C to stop all services"
 
 # Wait for user interrupt
-wait $BACKEND_PID $FRONTEND_PID
+wait $BACKEND_PID $FRONTEND_PID $DOCS_PID
