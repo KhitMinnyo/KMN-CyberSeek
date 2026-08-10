@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import requests
@@ -591,7 +591,7 @@ def show_dashboard():
 
         # Fill in missing days so the timeline is continuous
         all_days = {
-            (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d"): 0
+            (datetime.now(timezone.utc) - timedelta(days=i)).strftime("%Y-%m-%d"): 0
             for i in range(13, -1, -1)
         }
         for row in spd:
@@ -608,7 +608,7 @@ def show_dashboard():
         import pandas as pd
         df_top = pd.DataFrame(top_targets)
         df_top.columns = ["Target", "Session Count"]
-        st.dataframe(df_top, use_container_width=True, hide_index=True)
+        st.dataframe(df_top, width="stretch", hide_index=True)
 
     # ── System status ────────────────────────────────────────────────────
     st.divider()
