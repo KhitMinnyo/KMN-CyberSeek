@@ -2276,22 +2276,16 @@ def _doc_section(heading: str):
 
 
 def show_docs():
-    """In-app documentation — pure HTML/JS, zero st.rerun() involved."""
+    """In-app documentation — English, pure HTML/JS, no st.rerun()."""
     import streamlit.components.v1 as _components
 
-    # HTML-string builders — return str, never call st.*
     def _c(title, body, accent="#4f8ef7"):
-        return (
-            f'<div class="card" style="border-left-color:{accent}">'
-            f'<div class="ct">{title}</div>'
-            f'<div class="cb">{body}</div></div>'
-        )
+        return (f'<div class="card" style="border-left-color:{accent}">'
+                f'<div class="ct">{title}</div><div class="cb">{body}</div></div>')
 
-    def _s(text):
-        return f'<div class="sh">{text}</div>'
+    def _s(text): return f'<div class="sh">{text}</div>'
 
-    def _note(text, cls="ai"):
-        return f'<div class="alert {cls}">{text}</div>'
+    def _note(text, cls="ai"): return f'<div class="alert {cls}">{text}</div>'
 
     def _pre(text):
         import html as _h
@@ -2301,280 +2295,140 @@ def show_docs():
         return ('<details class="exp"><summary>' + q + '</summary>'
                 + '<div class="exb">' + a + '</div></details>')
 
-    t0en = (
-        _s('Quick Start') +
-        _c('1. Run <code>./start.sh</code>', 'Starts FastAPI backend (port 6000) and Streamlit frontend (port 8501).', '#4caf50') +
-        _c('2. Open Settings &#8594; AI Configuration', 'Connect local Ollama or enter a DeepSeek API key.', '#4caf50') +
-        _c('3. Click New Session', 'Enter a target IP or domain and confirm authorization.', '#4caf50') +
-        _c('4. Watch Session Timeline', 'Phases progress automatically as the AI works.', '#4caf50') +
-        _c('5. Review results', 'Check Vulnerabilities, AI Decisions, and Credentials tabs.', '#4caf50') +
-        _s('System Architecture') +
-        _pre('Streamlit Frontend  (port 8501)  ←  Operator Dashboard\n         │\n         ▼\nFastAPI Backend  (port 6000)\n  Orchestrator │ Scanner │ AI Connector │ SQLite DB\n         │              │               │\n    AI Engine      Nmap/NSE        Shell Exec\n  (Ollama/API)   (Scanner)        (Kali env)') +
-        _s('Attack Chain &#8212; Phase Order') +
-        _c('<code>osint</code>', 'Passive intel: whois, dig, theHarvester, crt.sh, Google Dorks &#8212; domain targets only', '#7e57c2') +
-        _c('<code>reconnaissance</code>', 'Active scanning: Nmap top-1000 ports with service/version detection', '#1976d2') +
-        _c('<code>enumeration</code>', 'Subdomain, endpoint, user, and share enumeration', '#0288d1') +
-        _c('<code>vulnerability_analysis</code>', 'CVE mapping, nuclei, nikto, sqlmap', '#00838f') +
-        _c('<code>exploitation</code>', 'Exploit execution via Metasploit or standalone tools', '#f57c00') +
-        _c('<code>post_exploitation</code>', 'Shell stabilisation, local data collection', '#e64a19') +
-        _c('<code>privilege_escalation</code>', 'linpeas, sudo -l, SUID checks, kernel exploits', '#c62828') +
-        _c('<code>lateral_movement</code>', 'Pivoting to adjacent hosts using found credentials', '#6a1b9a') +
-        _c('<code>credential_reuse</code>', 'Credential spraying, pass-the-hash, Kerberoasting', '#2e7d32') +
-        _note('Local IP targets (10.x, 192.168.x, 172.16&#8211;31.x): OSINT phase is automatically skipped &#8212; Google Dorks return nothing useful for private addresses.')
-    )
+    # Tab 0: &#128640; Getting Started
+    t0 = ""
+    html += _s('Quick Start')
+    html += _c('1. Run <code>./start.sh</code>', 'Starts FastAPI (port 6000) and Streamlit (port 8501).', '#4caf50')
+    html += _c('2. Settings &#8594; AI Configuration', 'Connect Ollama or enter a DeepSeek API key.', '#4caf50')
+    html += _c('3. Click New Session', 'Enter a target IP or domain and confirm authorization.', '#4caf50')
+    html += _c('4. Watch Session Timeline', 'Phases progress automatically as the AI works.', '#4caf50')
+    html += _c('5. Review results', 'Check Vulnerabilities, AI Decisions, and Credentials tabs.', '#4caf50')
+    html += _s('System Architecture')
+    html += _pre('Streamlit Frontend  (port 8501)  ←  Operator Dashboard\n         │\n         ▼\nFastAPI Backend  (port 6000)\n  Orchestrator │ Scanner │ AI Connector │ SQLite DB\n         │              │               │\n    AI Engine      Nmap/NSE        Shell Exec\n  (Ollama/API)   (Scanner)        (Kali env)')
+    html += _s('Attack Chain &#8212; Phase Order')
+    html += _c('<code>osint</code>', 'Passive intel: whois, dig, theHarvester, crt.sh, Google Dorks &#8212; domain targets only', '#7e57c2')
+    html += _c('<code>reconnaissance</code>', 'Active scanning: Nmap top-1000 ports with service/version detection', '#1976d2')
+    html += _c('<code>enumeration</code>', 'Subdomain, endpoint, user, and share enumeration', '#0288d1')
+    html += _c('<code>vulnerability_analysis</code>', 'CVE mapping, nuclei, nikto, sqlmap', '#00838f')
+    html += _c('<code>exploitation</code>', 'Exploit execution via Metasploit or standalone tools', '#f57c00')
+    html += _c('<code>post_exploitation</code>', 'Shell stabilisation, local data collection', '#e64a19')
+    html += _c('<code>privilege_escalation</code>', 'linpeas, sudo -l, SUID checks, kernel exploits', '#c62828')
+    html += _c('<code>lateral_movement</code>', 'Pivoting to adjacent hosts using found credentials', '#6a1b9a')
+    html += _c('<code>credential_reuse</code>', 'Credential spraying, pass-the-hash, Kerberoasting', '#2e7d32')
+    html += _note('Local IP targets (10.x, 192.168.x, 172.16&#8211;31.x): OSINT phase is automatically skipped &#8212; Google Dorks return nothing useful for private addresses.')
 
-    t0my = (
-        _s('အမြန်စၢးနည်') +
-        _c('1. ./start.sh ကို run ပဪb', 'FastAPI backend (port 6000) နဲ့ Streamlit frontend (port 8501) စတင်မည်၏', '#4caf50') +
-        _c('2. Settings &#8594; AI Configuration သိုသွာပဪb', 'Local Ollama ချင်ဆက် သိုမ၀ုတ် DeepSeek API key ထည်ပဪb၏', '#4caf50') +
-        _c('3. New Session နှိပဪb', 'Target IP သိုမ၀ုတ် domain ထည်ပြ authorization confirm လဪfပဪb၏', '#4caf50') +
-        _c('4. Session Timeline ကြည်ပဪb', 'AI အလဪfပ်လဪfပသွာပည်ပြင် phases တွဲက တဆင်ချင်း တိုးသွာမည်၏', '#4caf50') +
-        _c('5. Result စစဆဲးပဪb', 'Vulnerabilities, AI Decisions, Credentials tabs တွဲကြည်ပဪb၏', '#4caf50') +
-        _s('System Architecture') +
-        _pre('Streamlit Frontend  (port 8501)  ←  Operator Dashboard\n         │\n         ▼\nFastAPI Backend  (port 6000)\n  Orchestrator │ Scanner │ AI Connector │ SQLite DB\n         │              │               │\n    AI Engine      Nmap/NSE        Shell Exec\n  (Ollama/API)   (Scanner)        (Kali env)') +
-        _s('တိဪfက်ခိဪfက် အဆင်ဆပ်ဆပ်') +
-        _c('<code>osint</code>', 'Passive &#8212; whois, dig, theHarvester, crt.sh, Google Dorks (domain target သာ)', '#7e57c2') +
-        _c('<code>reconnaissance</code>', 'Active &#8212; Nmap port 1000 scan, service/version detection', '#1976d2') +
-        _c('<code>enumeration</code>', 'Subdomain, endpoint, user, share ကို enumerate လဪfပြချင်း', '#0288d1') +
-        _c('<code>vulnerability_analysis</code>', 'CVE mapping, nuclei, nikto, sqlmap', '#00838f') +
-        _c('<code>exploitation</code>', 'Metasploit သိုမ၀ုတ် standalone tool နဲ့ exploit', '#f57c00') +
-        _c('<code>post_exploitation</code>', 'Shell stabilize, local data collection', '#e64a19') +
-        _c('<code>privilege_escalation</code>', 'linpeas, sudo -l, SUID check, kernel exploit', '#c62828') +
-        _c('<code>lateral_movement</code>', 'ရှာတွဲကေ့ credential သဪfးပြ pivot', '#6a1b9a') +
-        _c('<code>credential_reuse</code>', 'Credential spraying, pass-the-hash, Kerberoasting', '#2e7d32') +
-        _note('Local IP target (10.x, 192.168.x, 172.16&#8211;31.x) ဆိုရင်း OSINT phase ကို auto-skip လဪfပဪb &#8212; Private IP အတွက် Google Dorks ဘာမှ မပောဗူ၏')
-    )
+    # Tab 1: &#128203; Session Guide
+    t1 = ""
+    html += _s('Session Buttons')
+    html += _c('&#9654;&#65039; Resume', 'Continues AI analysis from current state &#8212; no re-scan. Safe on an already-running session (idempotent).', '#4caf50')
+    html += _c('&#128260; Reset AI', 'Keeps nmap <b>scan data</b>. Clears AI decisions, commands, vulnerabilities. Re-runs AI from existing scan. Use when AI went off-track.', '#1976d2')
+    html += _c('&#128257; Full Rescan', 'Clears everything &#8212; scan data + AI history. Runs nmap from scratch. Use when days have passed or target may have changed.', '#f57c00')
+    html += _c('&#128465;&#65039; Delete', 'Permanently removes the session and all its data. Cannot be undone.', '#c62828')
+    html += _s('Session Tabs')
+    html += _c('&#128202; Overview', 'Session Timeline, controls, Strategic Layer AI planner with objective + progress %.', '#4f8ef7')
+    html += _c('&#128269; Scan Results', 'All discovered hosts, open ports, running services with version info.', '#4f8ef7')
+    html += _c('&#128737;&#65039; Vulnerabilities', 'CVEs and weaknesses &#8212; from scanner, threat intel cache, and AI analysis.', '#4f8ef7')
+    html += _c('&#129302; AI Decisions', 'Every AI reasoning step: what the AI was thinking, which command it chose and why.', '#4f8ef7')
+    html += _c('&#9889; Commands', 'Full command history with output. Pending approval queue shown when manual review is needed.', '#4f8ef7')
+    html += _c('&#128193; Evidence', 'Raw tool output saved as evidence: screenshots, file listings, service banners.', '#4f8ef7')
+    html += _c('&#128273; Credentials', 'Extracted credentials &#8212; auto-parsed from john, hashcat, hydra output.', '#4f8ef7')
+    html += _s('Timeline &#8212; Status Icons')
+    html += _c('&#9989; Done', 'Stage completed &#8212; AI decisions exist for this phase.', '#455a64')
+    html += _c('&#128260; Now', 'Current active stage.', '#455a64')
+    html += _c('&#9889; &#8212;', 'Stage was skipped (AI jumped past it).', '#455a64')
+    html += _c('&#9203; Next', 'Not yet reached.', '#455a64')
+    html += _s('Auto-Approve Explained')
+    html += _c('OFF (default)', 'All commands go to the pending queue for manual review before execution.', '#c62828')
+    html += _c('ON', 'All risk levels (LOW / MEDIUM / HIGH) execute automatically without waiting.', '#4caf50')
+    html += _note('Two safeguards always apply:<br>(1) Allowlist gate &#8212; dangerous commands are always blocked.<br>(2) Depth checkpoint &#8212; after 15 auto-commands, one manual approval is required.')
 
-    t1en = (
-        _s('Session Buttons') +
-        _c('&#9654;&#65039; Resume', 'Continues AI analysis from the current state &#8212; no re-scan. Safe to click on an already-running session (idempotent).', '#4caf50') +
-        _c('&#128260; Reset AI', 'Keeps all nmap <b>scan data</b>. Clears AI decisions, commands, vulnerabilities. Re-runs AI from existing scan. Use when AI went off-track.', '#1976d2') +
-        _c('&#128257; Full Rescan', 'Clears everything &#8212; scan data + AI history. Runs nmap from scratch. Use when days have passed or target may have changed.', '#f57c00') +
-        _c('&#128465;&#65039; Delete', 'Permanently removes the session and all its data. Cannot be undone.', '#c62828') +
-        _s('Session Tabs') +
-        _c('&#128202; Overview', 'Session Timeline, button controls, Strategic Layer AI planner with objective + progress %.', '#4f8ef7') +
-        _c('&#128269; Scan Results', 'All discovered hosts, open ports, running services with version info.', '#4f8ef7') +
-        _c('&#128737;&#65039; Vulnerabilities', 'CVEs and weaknesses &#8212; from scanner, threat intel cache, and AI analysis.', '#4f8ef7') +
-        _c('&#129302; AI Decisions', 'Every AI reasoning step: what the AI was thinking, which command it chose and why.', '#4f8ef7') +
-        _c('&#9889; Commands', 'Full command history with output. Pending approval queue shown when manual review is needed.', '#4f8ef7') +
-        _c('&#128193; Evidence', 'Raw tool output saved as evidence: screenshots, file listings, service banners.', '#4f8ef7') +
-        _c('&#128273; Credentials', 'Extracted credentials &#8212; auto-parsed from john, hashcat, hydra output.', '#4f8ef7') +
-        _s('Session Timeline &#8212; Status Icons') +
-        _c('&#9989; Done', 'Stage completed &#8212; AI decisions exist for this phase.', '#455a64') +
-        _c('&#128260; Now', 'Current active stage.', '#455a64') +
-        _c('&#9889; &#8212;', 'Stage was skipped (AI jumped past it without working through it).', '#455a64') +
-        _c('&#9203; Next', 'Not yet reached.', '#455a64') +
-        _s('Auto-Approve Explained') +
-        _c('OFF (default)', 'All commands go to the pending queue for manual review before execution.', '#c62828') +
-        _c('ON', 'All risk levels (LOW / MEDIUM / HIGH) execute automatically without waiting.', '#4caf50') +
-        _note('Two safeguards always apply regardless of auto-approve:<br>(1) Allowlist gate &#8212; dangerous commands are always blocked.<br>(2) Depth checkpoint &#8212; after 15 auto-commands, one manual approval is required.')
-    )
+    # Tab 2: &#129302; AI &amp; Commands
+    t2 = ""
+    html += _s('Risk Classification')
+    html += _c('&#129001; LOW &#8212; Read-only / passive', 'No impact. Examples: <code>nmap</code>, <code>curl -I</code>, <code>whois</code>, <code>dig</code>. Auto-executes when auto-approve is ON.', '#4caf50')
+    html += _c('&#128993; MEDIUM &#8212; Active / leaves traces', 'Enumeration &#8212; traces but no damage. Examples: <code>nikto</code>, <code>gobuster</code>, <code>nuclei</code>. Auto-executes when auto-approve is ON.', '#f9a825')
+    html += _c('&#128308; HIGH &#8212; Destructive / irreversible', 'May crash services or exfiltrate data. Examples: <code>hydra</code>, <code>msfconsole</code>, <code>sqlmap --dump</code>. Requires manual approval.', '#c62828')
+    html += _note('Risk level is determined by keyword + regex rules &#8212; not by the LLM. The AI cannot self-classify its command as LOW to bypass review.')
+    html += _s('Strategic Layer (AI Planner)')
+    html += _c('Runs every 5 commands', 'Evaluates overall progress, updates the multi-step plan, writes a reflection, and declares objective complete when root/SYSTEM/Domain Admin is reached &#8212; halting the agentic loop.', '#7e57c2')
+    html += _c('Progress % frozen?', 'Progress updates only when the strategist runs (every 5 commands). Wait for the next batch of 5.', '#455a64')
+    html += _s('AI Decisions &#8212; Notable Findings')
+    html += _c('High-value keywords', 'Commands whose output contains: <code>password</code>, <code>hash</code>, <code>CVE</code>, <code>shell</code>, <code>admin</code>, <code>root</code>, <code>credential</code>, <code>exploit</code>, <code>vulnerable</code> &#8212; shown at the top of AI Decisions tab.', '#00838f')
+    html += _s('Command Console')
+    html += _c('Manual command injection', 'Enter arbitrary commands against the session target &#8212; outside the AI loop. Useful for running a specific tool the AI has not tried, or verifying a finding.', '#1976d2')
+    html += _s('OSINT &#8212; Google Dorks')
+    html += _pre('site:<domain> filetype:pdf|xlsx|docx|pptx|sql|bak|env|config|log\nsite:<domain> inurl:admin|login|portal|dashboard\nsite:<domain> "index of" | "parent directory"\n"<domain>" ext:sql|bak|env|config|log\nsite:<domain> intext:"password"|"api_key"|"secret"')
+    html += _note('OSINT / Google Dorks only run for domain targets. Private/local IPs (10.x, 192.168.x) skip OSINT automatically.')
 
-    t1my = (
-        _s('Session ခလဪfတ်များ') +
-        _c('&#9654;&#65039; Resume', 'လက်ရှဪ AI analysis ကို ဆက်လဪfပ်မည် &#8212; nmap မပြန်ရ၏', '#4caf50') +
-        _c('&#128260; Reset AI', 'nmap scan data ထာခ်ယု AI decisions, commands, vulnerabilities ဖျက်ပြ AI ကို ပြန်စသည်၏', '#1976d2') +
-        _c('&#128257; Full Rescan', 'အရာအလဪfးဖျက်ပြ nmap ကို အစကနေက ပြန်စသည်၏', '#f57c00') +
-        _c('&#128465;&#65039; Delete', 'Session နှဪ့ data အလဪfးကို အပြင်အပိဪfင် ဖျက်မည်၏', '#c62828') +
-        _s('Session Tabs များ') +
-        _c('&#128202; Overview', 'Session Timeline, ခလဪfတ်များ, Strategic Layer AI planner နှဪ့ progress %.', '#4f8ef7') +
-        _c('&#128269; Scan Results', 'ရှာတွဲကေ့ host, port, service version အချက်များ၏', '#4f8ef7') +
-        _c('&#128737;&#65039; Vulnerabilities', 'Scanner, threat intel, AI analysis မှ CVE နှဪ့ weakness များ၏', '#4f8ef7') +
-        _c('&#129302; AI Decisions', 'AI က reasoning step တိဪfး &#8212; ဘာကြာင်သဪ ဒု command ကို ရွဲးတာဆို ဖာပြသည်၏', '#4f8ef7') +
-        _c('&#9889; Commands', 'Command မှတ်မံတမ်း output၏ Manual review လိုသော pending commands အပောက ပောသည်၏', '#4f8ef7') +
-        _c('&#128193; Evidence', 'Tool output raw file များ: screenshot, file listing, service banner၏', '#4f8ef7') +
-        _c('&#128273; Credentials', 'john, hashcat, hydra output မှ auto-parse လဪfထားသော credential များ၏', '#4f8ef7') +
-        _s('Session Timeline &#8212; Status Icon များ') +
-        _c('&#9989; Done', 'Phase ပြုဆဪfးသည် &#8212; AI decision ရှဪသော phase ဖြစသည်၏', '#455a64') +
-        _c('&#128260; Now', 'လက်ရှဪ လဪfပဆောင်ဆမ်သော stage၏', '#455a64') +
-        _c('&#9889; &#8212;', 'AI ကျာသွားသော stage (အလဪfပမလဪfပဘဲ ဆက်သွား)၏', '#455a64') +
-        _c('&#9203; Next', 'မရောကြသေား stage၏', '#455a64') +
-        _s('Auto-Approve ရှင်လင်းချက်') +
-        _c('OFF (default)', 'Command တိဪfး manual review queue သို ဆောဆြချင်း ဆောသွားလဪfတ်မည်၏', '#c62828') +
-        _c('ON', 'Risk level အလဪfး (LOW / MEDIUM / HIGH) ကို auto-execute လဪfပ်မည်၏', '#4caf50') +
-        _note('Safeguard နှစ်ခဪf ကျင်ဘဪfသဪfးသည်:<br>(1) Allowlist gate &#8212; အန်တရာသဪသော command များကို block သည်၏<br>(2) Depth checkpoint &#8212; auto command 15 ကြိမ်ပြုပဪb manual approval တစ်ကြိမ် လိုသည်၏')
-    )
+    # Tab 3: &#128376;&#65039; Threat Intel
+    t3 = ""
+    html += _s('What is Threat Intel?')
+    html += _c('Standalone research tool', 'The Threat Intel page builds a local vulnerability knowledge base over time. Completely separate from live pentest sessions &#8212; never issues shell commands.', '#7e57c2')
+    html += _s('How It Works')
+    html += _c('1. Enter a search topic', 'Software name, version, or CVE query &#8212; e.g. <code>Apache httpd 2.4.49</code>, <code>GlassFish 4.1</code>.', '#1976d2')
+    html += _c('2. DuckDuckGo search', 'Searches for <code>[topic] CVE vulnerability</code> and fetches up to 5 result pages.', '#1976d2')
+    html += _c('3. AI extraction', 'Each page&#39;s text is sent to the AI using an isolated prompt &#8212; separate from the pentest AI.', '#1976d2')
+    html += _c('4. Structured storage', 'CVE IDs, title, description, severity stored in SQLite <code>threat_intel_cache</code> with <code>verified=False</code>.', '#1976d2')
+    html += _c('5. Auto cross-reference', 'After every nmap scan, orchestrator cross-references service names against the cache. Matches are added to the Vulnerabilities tab.', '#1976d2')
+    html += _note('All findings are unverified by design. Web pages can be wrong or outdated. Cross-check CVE IDs against NVD, Vulners, or CISA KEV before acting.', 'aw')
+    html += _s('Useful Search Topics')
+    html += _c('<code>Apache httpd 2.4.49</code>', 'Example finding: CVE-2021-41773 path traversal RCE', '#00838f')
+    html += _c('<code>ProFTPD 1.3.5</code>', 'Example finding: mod_copy unauthenticated RCE', '#00838f')
+    html += _c('<code>OpenSSH 7.2p2</code>', 'Example finding: Username enumeration CVE', '#00838f')
+    html += _c('<code>GlassFish 4.1</code>', 'Example finding: CVE-2017-1000028 unauthenticated RCE', '#00838f')
+    html += _c('<code>Tomcat 7.0</code>', 'Example finding: CVE-2020-1938 Ghostcat AJP RCE', '#00838f')
 
-    t2en = (
-        _s('Risk Classification') +
-        _c('&#129001; LOW &#8212; Read-only / passive', 'No impact. Examples: <code>nmap</code>, <code>curl -I</code>, <code>whois</code>, <code>dig</code>. Auto-executes when auto-approve is ON.', '#4caf50') +
-        _c('&#128993; MEDIUM &#8212; Active / leaves traces', 'Enumeration &#8212; traces but no damage. Examples: <code>nikto</code>, <code>gobuster</code>, <code>nuclei</code>. Auto-executes when auto-approve is ON.', '#f9a825') +
-        _c('&#128308; HIGH &#8212; Destructive / irreversible', 'May crash services or exfiltrate data. Examples: <code>hydra</code>, <code>msfconsole</code>, <code>sqlmap --dump</code>. Requires manual approval.', '#c62828') +
-        _note('Risk level is determined by keyword + regex rules &#8212; not by the LLM. The AI cannot self-classify its command as LOW to bypass review.') +
-        _s('Strategic Layer (AI Planner)') +
-        _c('Runs every 5 commands', 'Evaluates overall progress, updates the multi-step plan, writes a reflection, and declares objective complete when root/SYSTEM/Domain Admin is reached &#8212; halting the agentic loop.', '#7e57c2') +
-        _c('Progress % frozen?', 'Progress updates only when the strategist runs (every 5 commands). Wait for the next batch of 5 to complete.', '#455a64') +
-        _s('AI Decisions &#8212; Notable Findings') +
-        _c('High-value keywords', 'Commands whose output contained: <code>password</code>, <code>hash</code>, <code>CVE</code>, <code>shell</code>, <code>admin</code>, <code>root</code>, <code>credential</code>, <code>exploit</code>, <code>vulnerable</code> &#8212; shown at the top of the AI Decisions tab.', '#00838f') +
-        _s('Command Console') +
-        _c('Manual command injection', 'Enter arbitrary commands against the session target &#8212; outside the AI loop. Useful for running a specific tool the AI has not tried, or verifying a finding.', '#1976d2') +
-        _s('OSINT &#8212; Google Dorks') +
-        _pre('site:<domain> filetype:pdf|xlsx|docx|pptx|sql|bak|env|config|log\nsite:<domain> inurl:admin|login|portal|dashboard\nsite:<domain> "index of" | "parent directory"\n"<domain>" ext:sql|bak|env|config|log\nsite:<domain> intext:"password"|"api_key"|"secret"') +
-        _note('OSINT / Google Dorks only run for domain targets. Private/local IPs (10.x, 192.168.x) skip OSINT automatically.')
-    )
+    # Tab 4: &#129504; Ollama Models
+    t4 = ""
+    html += _s('What the AI Needs to Do Well')
+    html += _c('1. Structured JSON output', 'Every AI response must be valid JSON. A model that garbles this causes parse failures and halts the session.', '#1976d2')
+    html += _c('2. Multi-step reasoning', 'The model must plan a full attack chain without skipping phases after just 3 commands.', '#1976d2')
+    html += _c('3. Security command vocabulary', 'Knows nmap flags, CVE identifiers, Metasploit modules, GlassFish/Tomcat/SMB quirks.', '#1976d2')
+    html += _s('DeepHat vs qwen2.5 &#8212; Which to Use?')
+    html += _c('DeepHat V1-7B', '<b>Base:</b> Qwen2.5-Coder-7B cybersecurity fine-tune | <b>7.61B parameters</b><br>OK Security vocab &#8212; CVE IDs natively understood<br>Weaker reasoning &#8594; stage-skipping | JSON inconsistent &#8594; parse errors | NOT fully uncensored', '#f57c00')
+    html += _c('qwen2.5:14b &#8212; Recommended', '<b>Base:</b> Qwen2.5 14B (Alibaba) | <b>14.7B parameters</b><br>2&#215; parameters &#8594; better JSON reliability | Better multi-step reasoning | Fewer stage-skip bugs<br>Not cybersecurity-specialized | Requires ~11 GB RAM', '#4caf50')
+    html += _note('Use <code>qwen2.5:14b</code> as primary. The #1 cause of session failures is bad JSON output and premature stage advancement &#8212; both are reasoning problems a larger model solves.', 'ao')
+    html += _s('Hardware Recommendations')
+    html += _c('M2 Mac Mini &#8212; 24 GB RAM (current)', 'Primary: <code>qwen2.5:14b</code> &#8212; ~9 GB disk, ~11 GB RAM, context 32,768<br>Alt: <code>deepseek-r1:14b</code><br>Stretch: <code>qwen2.5:32b</code> &#8212; ~19 GB disk, ~21 GB RAM', '#1976d2')
+    html += _c('M4 Pro &#8212; 64 GB RAM (upcoming)', 'Primary: <code>qwen2.5:72b</code> &#8212; ~42 GB disk, ~45 GB RAM, context 131,072<br>Alt: <code>deepseek-r1:70b</code><br>Lighter: <code>qwen2.5:32b</code> &#8212; ~19 GB disk, context 65,536', '#7e57c2')
+    html += _s('Quick Setup')
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:10px 0"><div><div class="card" style="border-left-color:#1976d2"><div class="ct">M2 Mac Mini 24GB</div><div class="cb">Model <code>qwen2.5:14b</code>, Context <code>32768</code></div></div><pre><code>ollama pull qwen2.5:14b</code></pre></div><div><div class="card" style="border-left-color:#7e57c2"><div class="ct">M4 Pro 64GB</div><div class="cb">Model <code>qwen2.5:72b</code>, Context <code>65536</code></div></div><pre><code>ollama pull qwen2.5:72b</code></pre></div></div>'
+    html += _s('Context Window &#8212; Why It Matters')
+    html += _c('What happens when context overflows', 'Local models have a fixed context window. When session history exceeds it, the model silently forgets old content &#8212; causing repeated commands, stage regression, or hallucinated progress.', '#f57c00')
+    html += _c('Built-in mitigations', '1. Episode summaries &#8212; every N commands, old history is compressed and re-injected.<br>2. Configurable context window &#8212; Settings &#8594; AI Configuration &#8594; Context window controls Ollama&#39;s <code>num_ctx</code>.', '#4caf50')
+    html += '<table class="tbl"><tr><th>Model size</th><th>Safe context window</th></tr><tr><td>7&#8211;8B</td><td>16,384</td></tr><tr><td>13&#8211;14B</td><td>32,768</td></tr><tr><td>32B</td><td>32,768&#8211;65,536</td></tr><tr><td>70&#8211;72B</td><td>65,536&#8211;131,072</td></tr></table>'
 
-    t2my = (
-        _s('Risk Classification') +
-        _c('&#129001; LOW &#8212; Read-only / passive', 'Observable impact မရှဪ၏ ဥပမာ: <code>nmap</code>, <code>curl -I</code>, <code>whois</code>၏ Auto-approve ON ဆိုရင်း auto-execute လဪfသည်၏', '#4caf50') +
-        _c('&#128993; MEDIUM &#8212; Active / traces ကျန်သည်', 'Active enumeration &#8212; trace ကျန်သောလည်း ပျက်စိး မရှဪ၏ ဥပမာ: <code>nikto</code>, <code>gobuster</code>၏', '#f9a825') +
-        _c('&#128308; HIGH &#8212; Destructive', 'Service crash ဖြစခြင်း data exfiltrate ဖြစနိုင်၏ ဥပမာ: <code>hydra</code>, <code>msfconsole</code>၏ Manual approval လိုသည်၏', '#c62828') +
-        _note('Risk level ကို keyword + regex rule တွဲကနဲ့ deterministic ဆဪfးဖြတ်သည် &#8212; LLM ကိုပေ မဆဪfးဖြတ်သည်၏') +
-        _s('Strategic Layer (AI Planner)') +
-        _c('Command 5 ကြိမ်တိဪfးး run သည်', 'Overall progress စစဆဲးပြု multi-step plan update လဪfသည်၏ Root/SYSTEM/Domain Admin ရသောအခါ loop ကို ရပသည်၏', '#7e57c2') +
-        _c('Progress % မတိုးဗူး?', 'Strategist သည် command 5 ကြိမ်တိဪfးးမှ update လဪfပဪb၏', '#455a64') +
-        _s('AI Decisions &#8212; Notable Findings') +
-        _c('High-value keyword များ', 'Output ထဲ အစိ keyword ပဪbသော command များ: <code>password</code>, <code>hash</code>, <code>CVE</code>, <code>shell</code>, <code>admin</code>, <code>root</code>, <code>credential</code>', '#00838f') +
-        _s('Command Console') +
-        _c('Manual command ထည်သွင်းနည်း', 'AI loop မပဪbဘဲ target ကို command တိက်ရိက်ပေးနိုင်သည်၏', '#1976d2') +
-        _s('OSINT &#8212; Google Dorks') +
-        _pre('site:<domain> filetype:pdf|xlsx|docx|pptx|sql|bak|env|config|log\nsite:<domain> inurl:admin|login|portal|dashboard\nsite:<domain> "index of" | "parent directory"\n"<domain>" ext:sql|bak|env|config|log\nsite:<domain> intext:"password"|"api_key"|"secret"') +
-        _note('OSINT / Google Dorks သည် domain target များအတွက်သာမှ run သည်၏ Private IP (10.x, 192.168.x) များကို auto-skip လဪfသည်၏')
-    )
+    # Tab 5: &#128295; Troubleshooting
+    t5 = ""
+    html += _s('Common Issues')
+    html += _exp('Session status FAILED but terminal still active', 'Asyncio tasks queued before failure finish running after status changed. Normal &#8212; backend drains queue then stops. Wait a few seconds, refresh, then use Reset AI.')
+    html += _exp('&#39;AI response parsing error&#39; in command history', 'AI returned invalid JSON. Session now halts cleanly on parse failure. If seen on an old session, do a Reset AI. Switching to qwen2.5:14b reduces parse failures.')
+    html += _exp('All stages Done after only 5 commands', 'Old bug: AI jumped to credential_reuse immediately. Fixed &#8212; stage gate prevents advancing more than 1 phase per AI decision. Do a Reset AI.')
+    html += _exp('Progress % frozen at 5%', 'Strategic Layer runs every 5 completed commands. Wait for next batch of 5, or do a Reset AI.')
+    html += _exp('Resume button showing on active session', 'Fixed &#8212; &#39;ready&#39; now shows Session Active instead. Update and restart the frontend.')
+    html += _exp('Pending commands piling up', 'Two causes: (1) auto_approve OFF &#8212; commands go to queue by design. (2) Max auto-depth reached (15 commands) &#8212; one manual approval resets the counter.')
+    html += _exp('AI keeps suggesting the same command repeatedly', 'Context overflow &#8212; model forgot it ran that command. Increase context window in Settings (try 32768 or 65536). Switch to a larger model (14B+).')
+    html += _exp('Session History shows &#39;No sessions recorded yet&#39;', 'Fixed &#8212; caused by FastAPI route order bug. Update to latest and restart backend.')
+    html += _exp('OSINT running on local/private IP targets', 'Fixed &#8212; private IPs (10.x, 192.168.x, 172.16&#8211;31.x, localhost) now skip OSINT automatically.')
+    html += _exp('Backend not starting / port conflict', 'start.sh auto-detects port conflicts and finds the next free port. Set BACKEND_PORT / FRONTEND_PORT in .env to override.')
+    html += _s('Port Configuration')
+    html += _pre('# .env\nBACKEND_PORT=6000    # FastAPI backend\nFRONTEND_PORT=8501   # Streamlit frontend')
+    html += _s('API Reference &#8212; Key Endpoints')
+    html += '<table class="tbl"><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr><tr><td>POST</td><td>/api/sessions</td><td>Create new session</td></tr><tr><td>GET</td><td>/api/sessions/history</td><td>List all sessions</td></tr><tr><td>POST</td><td>/api/sessions/{id}/resume</td><td>Resume AI (idempotent)</td></tr><tr><td>POST</td><td>/api/sessions/{id}/restart</td><td>Reset AI, keep scan data</td></tr><tr><td>POST</td><td>/api/sessions/{id}/rescan</td><td>Full rescan &#8212; clear all, re-run nmap</td></tr><tr><td>POST</td><td>/api/sessions/{id}/approve/{cmd_id}</td><td>Approve pending command</td></tr><tr><td>DELETE</td><td>/api/sessions/{id}</td><td>Delete session</td></tr><tr><td>GET</td><td>/api/stats</td><td>Dashboard stats</td></tr></table>'
 
-    t3en = (
-        _s('What is Threat Intel?') +
-        _c('Standalone research tool', 'The Threat Intel page builds a local vulnerability knowledge base over time. Completely separate from live pentest sessions &#8212; never issues shell commands.', '#7e57c2') +
-        _s('How It Works') +
-        _c('1. Enter a search topic', 'Software name, version, or CVE query &#8212; e.g. <code>Apache httpd 2.4.49</code>, <code>GlassFish 4.1</code>.', '#1976d2') +
-        _c('2. DuckDuckGo search', 'Searches for <code>[topic] CVE vulnerability</code> and fetches up to 5 result pages.', '#1976d2') +
-        _c('3. AI extraction', 'Each page&#39;s text is sent to the AI using an isolated prompt &#8212; separate from the pentest AI.', '#1976d2') +
-        _c('4. Structured storage', 'CVE IDs, title, description, severity stored in SQLite <code>threat_intel_cache</code> with <code>verified=False</code>.', '#1976d2') +
-        _c('5. Auto cross-reference', 'After every nmap scan, orchestrator cross-references service names against the cache. Matches are added to the Vulnerabilities tab.', '#1976d2') +
-        _note('All Threat Intel findings are unverified by design. Web pages can be wrong or outdated. Cross-check CVE IDs against NVD, Vulners, or CISA KEV before acting.', 'aw') +
-        _s('Useful Search Topics') +
-        _c('<code>Apache httpd 2.4.49</code>', 'Example finding: CVE-2021-41773 path traversal RCE', '#00838f') +
-        _c('<code>ProFTPD 1.3.5</code>', 'Example finding: mod_copy unauthenticated RCE', '#00838f') +
-        _c('<code>OpenSSH 7.2p2</code>', 'Example finding: Username enumeration CVE', '#00838f') +
-        _c('<code>GlassFish 4.1</code>', 'Example finding: CVE-2017-1000028 unauthenticated RCE', '#00838f') +
-        _c('<code>Tomcat 7.0</code>', 'Example finding: CVE-2020-1938 Ghostcat AJP RCE', '#00838f')
-    )
-
-    t3my = (
-        _s('Threat Intel ဆိုတာ ဘာလဲ?') +
-        _c('သသန့် research tool', 'Threat Intel page သည် local vulnerability knowledge base တည်ဆောဆ်သည်၏ Live pentest session နှဪ့ လဪfးလဪfး သခြားဖြစပြု shell command မပေးနိုင်၏', '#7e57c2') +
-        _s('လဪfပဆောပဪfန်') +
-        _c('1. Search topic ထည်ပဪb', 'Software name, version, CVE &#8212; ဥပမာ <code>Apache httpd 2.4.49</code>', '#1976d2') +
-        _c('2. DuckDuckGo ရှာဖွေသည်', '<code>[topic] CVE vulnerability</code> ကို search ပြု result page 5 ခဪf ထဪ fetch လဪfသည်၏', '#1976d2') +
-        _c('3. AI extraction', 'Page text တစ်ခဪfကို isolated prompt ဖြင့် AI ထံ ပေးပြု CVE data extract လဪfသည်၏', '#1976d2') +
-        _c('4. Database သိမ်းဆည်းမှ', 'CVE ID, title, severity ကို SQLite <code>threat_intel_cache</code> တွင် သိမ်းသည်၏', '#1976d2') +
-        _c('5. Auto cross-reference', 'Nmap scan ပြုတိဪfးး service name များကို cache နှဪ့ တိက်စစပြု Vulnerabilities tab သို ထည်သည်၏', '#1976d2') +
-        _note('Threat Intel result များသည် verify မပြဪfရှေား &#8212; web page များ မှာနိုင်၏ CVE ID ကို NVD, Vulners, CISA KEV တွင် cross-check ပြဪfပဪb၏', 'aw') +
-        _s('ရှာဖွေသင်ှောအသော topic များ') +
-        _c('<code>Apache httpd 2.4.49</code>', 'ဥပမာ finding: CVE-2021-41773 path traversal RCE', '#00838f') +
-        _c('<code>ProFTPD 1.3.5</code>', 'ဥပမာ finding: mod_copy unauthenticated RCE', '#00838f') +
-        _c('<code>OpenSSH 7.2p2</code>', 'ဥပမာ finding: Username enumeration CVE', '#00838f') +
-        _c('<code>GlassFish 4.1</code>', 'ဥပမာ finding: CVE-2017-1000028 unauthenticated RCE', '#00838f') +
-        _c('<code>Tomcat 7.0</code>', 'ဥပမာ finding: CVE-2020-1938 Ghostcat AJP RCE', '#00838f')
-    )
-
-    _ctx_tbl = '<table class="tbl"><tr><th>Model size</th><th>Safe context window</th></tr><tr><td>7&#8211;8B</td><td>16,384</td></tr><tr><td>13&#8211;14B</td><td>32,768</td></tr><tr><td>32B</td><td>32,768&#8211;65,536</td></tr><tr><td>70&#8211;72B</td><td>65,536&#8211;131,072</td></tr></table>'
-    _setup_grid = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:10px 0"><div><div class="card" style="border-left-color:#1976d2"><div class="ct">M2 Mac Mini 24GB</div><div class="cb">Settings &#8594; AI Configuration:<br>Model <code>qwen2.5:14b</code>, Context <code>32768</code></div></div><pre><code>ollama pull qwen2.5:14b</code></pre></div><div><div class="card" style="border-left-color:#7e57c2"><div class="ct">M4 Pro 64GB</div><div class="cb">Settings &#8594; AI Configuration:<br>Model <code>qwen2.5:72b</code>, Context <code>65536</code></div></div><pre><code>ollama pull qwen2.5:72b</code></pre></div></div>'
-
-    t4en = (
-        _s('What the AI Needs to Do Well') +
-        _c('1. Structured JSON output', 'Every AI response must be valid JSON. A model that garbles this causes parse failures and halts the session.', '#1976d2') +
-        _c('2. Multi-step reasoning', 'The model must plan a full attack chain without skipping phases after just 3 commands.', '#1976d2') +
-        _c('3. Security command vocabulary', 'Knows nmap flags, CVE identifiers, Metasploit modules, GlassFish/Tomcat/SMB quirks.', '#1976d2') +
-        _s('DeepHat vs qwen2.5 &#8212; Which to Use?') +
-        _c('DeepHat V1-7B', '<b>Base:</b> Qwen2.5-Coder-7B cybersecurity fine-tune | <b>7.61B parameters</b><br>OK Security vocab &#8212; understands CVE IDs natively<br>Weaker reasoning &#8594; stage-skipping | JSON inconsistent &#8594; parse errors | NOT fully uncensored', '#f57c00') +
-        _c('qwen2.5:14b &#8212; Recommended', '<b>Base:</b> Qwen2.5 14B (Alibaba) | <b>14.7B parameters</b><br>2&#215; parameters &#8594; better JSON reliability | Better multi-step reasoning | Fewer stage-skip bugs<br>Not cybersecurity-specialized | Requires ~11 GB RAM', '#4caf50') +
-        _note('Use <code>qwen2.5:14b</code> as primary. The #1 cause of session failures is bad JSON output and premature stage advancement &#8212; both are reasoning problems that a larger model solves.', 'ao') +
-        _s('Hardware Recommendations') +
-        _c('M2 Mac Mini &#8212; 24 GB RAM (current)', 'Primary: <code>qwen2.5:14b</code> &#8212; ~9 GB disk, ~11 GB RAM, context 32,768<br>Alt: <code>deepseek-r1:14b</code><br>Stretch: <code>qwen2.5:32b</code> &#8212; ~19 GB disk, ~21 GB RAM', '#1976d2') +
-        _c('M4 Pro &#8212; 64 GB RAM (upcoming)', 'Primary: <code>qwen2.5:72b</code> &#8212; ~42 GB disk, ~45 GB RAM, context 131,072<br>Alt: <code>deepseek-r1:70b</code> &#8212; ~40 GB disk, ~42 GB RAM<br>Lighter: <code>qwen2.5:32b</code> &#8212; ~19 GB disk, context 65,536', '#7e57c2') +
-        _s('Quick Setup') +
-        '<div style="text-align:center;padding:8px 0">' + _setup_grid + '</div>' +
-        _s('Context Window &#8212; Why It Matters') +
-        _c('What happens when context overflows', 'Local models have a fixed context window. When session history exceeds it, the model silently forgets old content &#8212; causing repeated commands, stage regression, or hallucinated progress.', '#f57c00') +
-        _c('Built-in mitigations', '1. Episode summaries &#8212; every N commands, old history is compressed and re-injected.<br>2. Configurable context window &#8212; Settings &#8594; AI Configuration &#8594; Context window controls Ollama&#39;s <code>num_ctx</code>.', '#4caf50') +
-        _ctx_tbl
-    )
-
-    t4my = (
-        _s('AI ကောကေား run ဖို့ လိုချင်တာ') +
-        _c('1. Structured JSON output', 'AI response တိဪfးး valid JSON ဖြစရမည်၏ JSON ဖောက်ပြန်ပဪbက parse fail ဖြစပြု session ရပသည်၏', '#1976d2') +
-        _c('2. Multi-step reasoning', 'Command 3 ကြိမ်ပြုမှ phase တွဲက ကျာမသွာဘဲ attack chain တစ်ခဪfလဪfး plan ဆွဲနိုင်ရမည်၏', '#1976d2') +
-        _c('3. Security command vocabulary', 'nmap flag, CVE ID, Metasploit module, GlassFish/Tomcat/SMB quirk များ သိသည်ဆိုရမည်၏', '#1976d2') +
-        _s('DeepHat vs qwen2.5 &#8212; ဘယ်၀ာသဪfးမလဲ?') +
-        _c('DeepHat V1-7B', '<b>Base:</b> Qwen2.5-Coder-7B fine-tune | <b>7.61B parameters</b><br>Security vocab ကေားသည် | CVE ID နားလည်သည်<br>Reasoning အားနည် &#8594; stage-skip | JSON မတည်မငြိမ်', '#f57c00') +
-        _c('qwen2.5:14b &#8212; Recommended', '<b>Base:</b> Qwen2.5 14B (Alibaba) | <b>14.7B parameters</b><br>Parameter 2 ဆ &#8594; JSON reliability ကေားသည် | Reasoning ကေား<br>Cybersecurity specialized မ၀ုတ် | RAM ~11 GB လိုသည်', '#4caf50') +
-        _note('qwen2.5:14b ကိုသဪfးပဪb၏ Session fail ညမာရင်း #1 မှာ JSON error နှဪ့ stage advancement &#8212; ကြးသော model ဖြဉ့ ဖြေရှင်းနိုင်၏', 'ao') +
-        _s('Hardware Recommendation') +
-        _c('M2 Mac Mini &#8212; 24 GB RAM (လက်ရှဪ)', 'Primary: <code>qwen2.5:14b</code> &#8212; disk ~9 GB, RAM ~11 GB, context 32,768<br>Alt: <code>deepseek-r1:14b</code><br>Stretch: <code>qwen2.5:32b</code>', '#1976d2') +
-        _c('M4 Pro &#8212; 64 GB RAM (ကိုးမည်)', 'Primary: <code>qwen2.5:72b</code> &#8212; disk ~42 GB, RAM ~45 GB, context 131,072<br>Alt: <code>deepseek-r1:70b</code><br>Lighter: <code>qwen2.5:32b</code>', '#7e57c2') +
-        _s('Setup အမြန်း') +
-        '<div style="text-align:center;padding:8px 0">' + _setup_grid + '</div>' +
-        _s('Context Window &#8212; ဘာကြာန်သည် အရးကြုးသလဲ?') +
-        _c('Context overflow ဖြစရင်း ဘာဖြစမလဲ?', 'Model က context window ကျာသွားအခါ session history ကျာသွားအခါ model က အ၀ောများကို မေ့သွား &#8212; command ထပ်ခြင်း, stage regression, hallucination ဖြစနိုင်၏', '#f57c00') +
-        _c('Built-in mitigation', '1. Episode summaries &#8212; command N ကြိမ်တိဪfးး history ကို compress ပြု re-inject လဪfသည်၏<br>2. Context window configure &#8212; Settings &#8594; AI Configuration တွင် Ollama <code>num_ctx</code> ကို ထိန်ချဪfပနိုင်သည်၏', '#4caf50') +
-        _ctx_tbl
-    )
-
-    _api_tbl = '<table class="tbl"><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr><tr><td>POST</td><td>/api/sessions</td><td>Create new session</td></tr><tr><td>GET</td><td>/api/sessions/history</td><td>List all sessions from DB</td></tr><tr><td>POST</td><td>/api/sessions/{id}/resume</td><td>Resume AI analysis (idempotent)</td></tr><tr><td>POST</td><td>/api/sessions/{id}/restart</td><td>Reset AI state, keep scan data</td></tr><tr><td>POST</td><td>/api/sessions/{id}/rescan</td><td>Full rescan &#8212; clear everything, re-run nmap</td></tr><tr><td>POST</td><td>/api/sessions/{id}/approve/{cmd_id}</td><td>Approve a pending command</td></tr><tr><td>DELETE</td><td>/api/sessions/{id}</td><td>Delete session</td></tr><tr><td>GET</td><td>/api/stats</td><td>Dashboard stats</td></tr></table>'
-
-    t5en = (
-        _s('Common Issues') +
-        _exp('Session status FAILED but terminal still active', 'Asyncio tasks queued before failure finish running after status changed. Normal &#8212; backend drains queue then stops. Wait a few seconds, refresh, then use Reset AI.') +
-        _exp('echo &#39;AI response parsing error&#39; in command history', 'AI returned invalid JSON. Session now halts cleanly on parse failure. If seen on an old session, do a Reset AI. Switching to qwen2.5:14b reduces parse failures.') +
-        _exp('All stages Done after only 5 commands', 'Old bug: AI jumped to credential_reuse immediately. Fixed &#8212; stage gate prevents advancing more than 1 phase per AI decision. Do a Reset AI on affected sessions.') +
-        _exp('Progress % frozen at 5%', 'Strategic Layer runs every 5 completed commands. Wait for next batch of 5, or do a Reset AI.') +
-        _exp('Resume button showing on active session', 'Session status was &#39;ready&#39; but Resume was showing. Fixed &#8212; &#39;ready&#39; now shows Session Active instead. Update and restart the frontend.') +
-        _exp('Pending commands piling up', 'Two causes: (1) auto_approve OFF &#8212; commands go to queue by design. (2) Max auto-depth reached (15 commands) &#8212; one manual approval resets the counter.') +
-        _exp('AI keeps suggesting the same command repeatedly', 'Context overflow &#8212; model forgot it ran that command. Increase context window in Settings (try 32768 or 65536). Switch to a larger model (14B+).') +
-        _exp('Session History shows &#39;No sessions recorded yet&#39;', 'Fixed &#8212; caused by FastAPI route order bug. Update to latest and restart backend.') +
-        _exp('OSINT running on local/private IP targets', 'Fixed &#8212; private IPs (10.x, 192.168.x, 172.16&#8211;31.x, localhost) now skip OSINT automatically.') +
-        _exp('Backend not starting / port conflict', 'start.sh auto-detects port conflicts and finds the next free port. Set BACKEND_PORT / FRONTEND_PORT in .env to override.') +
-        _s('Port Configuration') +
-        _pre('# .env\nBACKEND_PORT=6000    # FastAPI backend\nFRONTEND_PORT=8501   # Streamlit frontend') +
-        _s('API Reference &#8212; Key Endpoints')
-        + '_api_tbl'
-    )
-
-    t5my = (
-        _s('ဖြစလေ့ရှဪသော ပြည်မာများ') +
-        _exp('Status FAILED ပမဲ့ terminal ဆက်တက်နေပဪb', 'Failure မဖြစမာမာ queue လ်ဖြစသည်အလီ asyncio task များ ဆက်ပြု run နေပဪb၏ ပဪfမှန်ဖြစသည်၏ ကြာနည်း Reset AI နှိပဪb၏') +
-        _exp('Command history တွင် parsing error ပောဗိပဪb', 'AI က invalid JSON ပြန်ပေးသည်၏ parse fail ဆိုရင်း session သပ်ရပ်သွား ရပသည်၏ Reset AI နှိပဪb၏') +
-        _exp('Command 5 ကြိမ်ပြုမှ stage အလဪfး Done', 'AI က credential_reuse သို ချက်ချင်း ရောကသွား၏ Fix ပြဪfပြု &#8212; stage gate ကြာကြိ့ phase တစ်ဆင်သာမ ကျာမသော၏ Reset AI နှိပဪb၏') +
-        _exp('Progress % 5% မှ မတိုးဗူး', 'Strategic Layer သည် command 5 ကြိမ်တိဪfးးမှ update လဪfပဪb၏ Command 5 ကြိမ် ထပြုမှ ကြည်ပဪb၏') +
-        _exp('Session active ဖြစနေပမဲ့ Resume ခလဪfတ် ပောဗိပဪb', "'ready' status ဆိုရင်း Resume ပောလျှိချင်း ဖြစလိုး၏ Fix ပြဪfပြု &#8212; 'ready' တွင် Session Active ပြမည်၏ Update ပြု frontend restart လဪfပဪb၏") +
-        _exp('Pending command များ တွဲနေပဪb', '(1) auto_approve OFF &#8212; command တိဪfး queue သို ရောကရမည်၏ (2) Auto-depth 15 ကြိမ် ပြည်ပြုပဪb &#8212; manual approval တစ်ကြိမ် နှိပြု counter reset ဖြစသည်၏') +
-        _exp('AI က command တူတူ ထပ်ပြနေပဪb', 'Context overflow &#8212; model က ရှဪပြုး command ကို မေ့သွား၏ Settings တွင် context window ကို 32768 သို 65536 တိုးပဪb၏ Model ကို 14B+ သို ပြားလျှိကြည်ပဪb၏') +
-        _exp("History 'No sessions recorded yet' ပြနေပဪb", 'FastAPI route order bug ကြာမှဖြစလျှိချင်း၏ Fix ပြဪfပြု &#8212; latest update ပြု backend restart လဪfပဪb၏') +
-        _exp('Local/private IP ကို OSINT run သွားနေပဪb', 'Fix ပြဪfပြု &#8212; private IP (10.x, 192.168.x, 172.16&#8211;31.x) များကို OSINT auto-skip ဖြစသွား၏') +
-        _exp('Backend မစနိုင် / port conflict', 'start.sh က port conflict ကို auto-detect ပြု next free port ရှာသည်၏ .env ထဲ BACKEND_PORT/FRONTEND_PORT သတ်မှတ်ပဪb၏') +
-        _s('Port Configuration') +
-        _pre('# .env\nBACKEND_PORT=6000    # FastAPI backend\nFRONTEND_PORT=8501   # Streamlit frontend') +
-        _s('API Reference &#8212; အခြိအကျဪ Endpoints')
-        + '_api_tbl'
-    )
-
-    _tabs_data = [
-        ("&#128640; Getting Started", t0en, t0my),
-        ("&#128203; Session Guide",   t1en, t1my),
-        ("&#129302; AI &amp; Commands", t2en, t2my),
-        ("&#128376;&#65039; Threat Intel", t3en, t3my),
-        ("&#129504; Ollama Models",    t4en, t4my),
-        ("&#128295; Troubleshooting",  t5en, t5my),
-    ]
-
-    _tb_html = "".join(
-        f'<button class="tb{" ta" if i == 0 else ""}" onclick="sT({i})">{name}</button>'
-        for i, (name, _, _) in enumerate(_tabs_data)
-    )
-    _tp_html = "".join(
-        f'<div class="tp{" ta" if i == 0 else ""}"><div class="en">{en}</div>'
-        f'<div class="my">{my}</div></div>'
-        for i, (_, en, my) in enumerate(_tabs_data)
-    )
-
-    _css = "<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#0e1117;color:#e8eaf6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px 20px;font-size:14px;line-height:1.5}.hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}h1{color:#e8eaf6;font-size:1.45rem}.lbs{display:flex;gap:6px}.lb{background:#1e2530;color:#e8eaf6;border:1px solid #2a3040;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:.85rem;transition:all .15s}.lb.la{background:#4f8ef7;border-color:#4f8ef7;color:#fff}.tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}.tb{background:#1e2530;color:#90caf9;border:1px solid #2a3040;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:.85rem;transition:all .15s}.tb.ta{background:#4f8ef7;color:#fff;border-color:#4f8ef7}.tp{display:none}.tp.ta{display:block}.en{display:block}.my{display:none}[data-lang=my] .en{display:none}[data-lang=my] .my{display:block}.card{background:#1e2530;border-left:4px solid #4f8ef7;padding:14px 18px;border-radius:6px;margin:8px 0}.ct{color:#e8eaf6;font-weight:600;font-size:1rem;margin-bottom:5px}.cb{color:#b0bec5;line-height:1.7}.sh{color:#90caf9;font-size:1.1rem;font-weight:700;margin:22px 0 8px;padding-bottom:4px;border-bottom:1px solid #2a3040}.alert{padding:12px 16px;border-radius:6px;margin:10px 0;line-height:1.6}.ai{background:#1a2744;border:1px solid #2196f3;color:#90caf9}.aw{background:#2d1f00;border:1px solid #f57c00;color:#ffb74d}.ao{background:#1a2d1a;border:1px solid #4caf50;color:#81c784}code{background:#2a3040;padding:2px 5px;border-radius:3px;font-family:monospace;font-size:.88em}pre{background:#1e2530;border:1px solid #2a3040;padding:12px;border-radius:6px;overflow-x:auto;margin:10px 0;font-size:.83rem;color:#b0bec5;white-space:pre}details.exp{border:1px solid #2a3040;border-radius:6px;margin:6px 0;overflow:hidden}details.exp summary{background:#1e2530;padding:12px 16px;cursor:pointer;color:#90caf9;list-style:none;user-select:none}details.exp summary::-webkit-details-marker{display:none}details.exp summary::after{content:' \\25BC';font-size:.75rem;float:right;opacity:.7}details[open].exp summary::after{content:' \\25B2'}.exb{padding:14px 16px;background:#141920;color:#b0bec5;line-height:1.7}.tbl{width:100%;border-collapse:collapse;margin:12px 0;font-size:.85rem}.tbl th{background:#1e2530;color:#90caf9;padding:9px 12px;text-align:left;border:1px solid #2a3040}.tbl td{padding:8px 12px;border:1px solid #2a3040;color:#b0bec5}.tbl tr:nth-child(even) td{background:#141920}</style>"
-    _js = "<script>function sL(l){  document.documentElement.setAttribute('data-lang',l);  try{localStorage.setItem('kmn_dl',l);}catch(e){}  document.getElementById('lb-en').classList.toggle('la',l==='en');  document.getElementById('lb-my').classList.toggle('la',l==='my');}function sT(i){  document.querySelectorAll('.tp').forEach(function(p,j){p.classList.toggle('ta',j===i);});  document.querySelectorAll('.tb').forEach(function(b,j){b.classList.toggle('ta',j===i);});}(function(){var l;try{l=localStorage.getItem('kmn_dl');}catch(e){}sL(l||'en');})();</script>"
+    _tabs = [t0, t1, t2, t3, t4, t5]
+    _tb = '<button class="tb ta" onclick="sT(0)">&#128640; Getting Started</button><button class="tb" onclick="sT(1)">&#128203; Session Guide</button><button class="tb" onclick="sT(2)">&#129302; AI &amp; Commands</button><button class="tb" onclick="sT(3)">&#128376;&#65039; Threat Intel</button><button class="tb" onclick="sT(4)">&#129504; Ollama Models</button><button class="tb" onclick="sT(5)">&#128295; Troubleshooting</button>'
+    _tp = "".join(
+        f'<div class="tp{" ta" if i==0 else ""}>{c}</div>'
+        for i, c in enumerate(_tabs))
+    _css = "<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#0e1117;color:#e8eaf6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px 20px;font-size:14px;line-height:1.5}h1{color:#e8eaf6;font-size:1.5rem;margin-bottom:18px}.tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}.tb{background:#1e2530;color:#90caf9;border:1px solid #2a3040;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:.85rem;transition:all .15s}.tb.ta{background:#4f8ef7;color:#fff;border-color:#4f8ef7}.tp{display:none}.tp.ta{display:block}.card{background:#1e2530;border-left:4px solid #4f8ef7;padding:14px 18px;border-radius:6px;margin:8px 0}.ct{color:#e8eaf6;font-weight:600;font-size:1rem;margin-bottom:5px}.cb{color:#b0bec5;line-height:1.7}.sh{color:#90caf9;font-size:1.1rem;font-weight:700;margin:22px 0 8px;padding-bottom:4px;border-bottom:1px solid #2a3040}.alert{padding:12px 16px;border-radius:6px;margin:10px 0;line-height:1.6}.ai{background:#1a2744;border:1px solid #2196f3;color:#90caf9}.aw{background:#2d1f00;border:1px solid #f57c00;color:#ffb74d}.ao{background:#1a2d1a;border:1px solid #4caf50;color:#81c784}code{background:#2a3040;padding:2px 5px;border-radius:3px;font-family:monospace;font-size:.88em}pre{background:#1e2530;border:1px solid #2a3040;padding:12px;border-radius:6px;overflow-x:auto;margin:10px 0;font-size:.83rem;color:#b0bec5;white-space:pre}details.exp{border:1px solid #2a3040;border-radius:6px;margin:6px 0;overflow:hidden}details.exp summary{background:#1e2530;padding:12px 16px;cursor:pointer;color:#90caf9;list-style:none;user-select:none}details.exp summary::-webkit-details-marker{display:none}details.exp summary::after{content:' ▼';font-size:.75rem;float:right;opacity:.7}details[open].exp summary::after{content:' ▲'}.exb{padding:14px 16px;background:#141920;color:#b0bec5;line-height:1.7}.tbl{width:100%;border-collapse:collapse;margin:12px 0;font-size:.85rem}.tbl th{background:#1e2530;color:#90caf9;padding:9px 12px;text-align:left;border:1px solid #2a3040}.tbl td{padding:8px 12px;border:1px solid #2a3040;color:#b0bec5}.tbl tr:nth-child(even) td{background:#141920}</style>"
+    _js = "<script>function sT(i){document.querySelectorAll('.tp').forEach(function(p,j){p.classList.toggle('ta',j===i);});document.querySelectorAll('.tb').forEach(function(b,j){b.classList.toggle('ta',j===i);});}</script>"
     _html = (
-        '<!DOCTYPE html><html><head><meta charset=utf-8><style>*{box-sizing:border-box;margin:0;padding:0}body{background:#0e1117;color:#e8eaf6;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;padding:16px 20px;font-size:14px;line-height:1.5}.hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}h1{color:#e8eaf6;font-size:1.45rem}.lbs{display:flex;gap:6px}.lb{background:#1e2530;color:#e8eaf6;border:1px solid #2a3040;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:.85rem;transition:all .15s}.lb.la{background:#4f8ef7;border-color:#4f8ef7;color:#fff}.tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}.tb{background:#1e2530;color:#90caf9;border:1px solid #2a3040;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:.85rem;transition:all .15s}.tb.ta{background:#4f8ef7;color:#fff;border-color:#4f8ef7}.tp{display:none}.tp.ta{display:block}.en{display:block}.my{display:none}[data-lang=my] .en{display:none}[data-lang=my] .my{display:block}.card{background:#1e2530;border-left:4px solid #4f8ef7;padding:14px 18px;border-radius:6px;margin:8px 0}.ct{color:#e8eaf6;font-weight:600;font-size:1rem;margin-bottom:5px}.cb{color:#b0bec5;line-height:1.7}.sh{color:#90caf9;font-size:1.1rem;font-weight:700;margin:22px 0 8px;padding-bottom:4px;border-bottom:1px solid #2a3040}.alert{padding:12px 16px;border-radius:6px;margin:10px 0;line-height:1.6}.ai{background:#1a2744;border:1px solid #2196f3;color:#90caf9}.aw{background:#2d1f00;border:1px solid #f57c00;color:#ffb74d}.ao{background:#1a2d1a;border:1px solid #4caf50;color:#81c784}code{background:#2a3040;padding:2px 5px;border-radius:3px;font-family:monospace;font-size:.88em}pre{background:#1e2530;border:1px solid #2a3040;padding:12px;border-radius:6px;overflow-x:auto;margin:10px 0;font-size:.83rem;color:#b0bec5;white-space:pre}details.exp{border:1px solid #2a3040;border-radius:6px;margin:6px 0;overflow:hidden}details.exp summary{background:#1e2530;padding:12px 16px;cursor:pointer;color:#90caf9;list-style:none;user-select:none}details.exp summary::-webkit-details-marker{display:none}details.exp summary::after{content:\' \\25BC\';font-size:.75rem;float:right;opacity:.7}details[open].exp summary::after{content:\' \\25B2\'}.exb{padding:14px 16px;background:#141920;color:#b0bec5;line-height:1.7}.tbl{width:100%;border-collapse:collapse;margin:12px 0;font-size:.85rem}.tbl th{background:#1e2530;color:#90caf9;padding:9px 12px;text-align:left;border:1px solid #2a3040}.tbl td{padding:8px 12px;border:1px solid #2a3040;color:#b0bec5}.tbl tr:nth-child(even) td{background:#141920}</style></head><body><div class="hdr"><h1>&#128218; Documentation</h1><div class="lbs"><button class="lb la" id="lb-en" onclick="sL(\'en\')">&#127468;&#127463; EN</button><button class="lb" id="lb-my" onclick="sL(\'my\')">&#127474;&#127474; MY</button></div></div><div class="tabs">'
-        + _tb_html + '</div>'
-        + _tp_html + _js + '</body></html>'
+        "<!DOCTYPE html><html><head><meta charset=utf-8>" + _css + "</head><body>"
+        + "<h1>&#128218; Documentation</h1>"
+        + '<div class="tabs">' + _tb + "</div>"
+        + _tp + _js + "</body></html>"
     )
-
     _components.html(_html, height=720, scrolling=True)
 
 def show_settings():
