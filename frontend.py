@@ -333,6 +333,24 @@ def get_threat_intel(topic: str = None):
             return response.json().get("findings", [])
     except Exception as e:
         logger.error(f"Failed to get threat intel: {e}")
+
+
+def get_all_vulnerabilities(source_tool: str = None, service: str = None, risk_level: str = None):
+    """Fetch structured vulnerability findings across all sessions from the DB."""
+    try:
+        params = {}
+        if source_tool:
+            params["source_tool"] = source_tool
+        if service:
+            params["service"] = service
+        if risk_level:
+            params["risk_level"] = risk_level
+        response = api_session.get(f"{API_BASE}/vulnerabilities", params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json().get("vulnerabilities", [])
+    except Exception as e:
+        logger.error(f"Failed to get global vulnerabilities: {e}")
+    return []
     return []
 
 
@@ -2012,22 +2030,116 @@ def show_credentials(session_details: Dict):
 
 
 def show_threat_intel():
-    """Threat Intel page - AI-directed open-web vulnerability research (core/threat_intel.py).
-    Builds a shared local reference cache that future pentest sessions automatically
-    cross-reference against (see core/orchestrator.py _run_vulnerability_analysis)."""
+    """Threat Intel page - structured DB findings + AI-directed open-web research cache."""
     st.markdown("<h1 class='main-header'>🔬 Threat Intel</h1>", unsafe_allow_html=True)
 
     if not check_backend_health():
         st.error("Backend is not available. Please start the FastAPI server.")
         return
 
+    # ── Section 1: Structured findings from the vulnerabilities DB ────────────
+    st.markdown("### 📊 Structured Vulnerability Database")
+    st.caption(
+        "Findings collected by the scan pipeline from verified sources: "
+        "NIST NVD API, local ExploitDB (searchsploit), and Nmap NSE vuln scripts. "
+        "These are attached to real scan sessions — not web research."
+    )
+
+    db_col1, db_col2, db_col3 = st.columns(3)
+    with db_col1:
+        src_filter = st.selectbox(
+            "Source", ["All", "nvd", "searchsploit", "nmap-vuln-script", "vulners"],
+            key="ti_src_filter"
+        )
+    with db_col2:
+        risk_filter = st.selectbox(
+            "Risk level", ["All", "high", "medium", "low", "unknown"],
+            key="ti_risk_filter"
+        )
+    with db_col3:
+        svc_filter = st.text_input("Service (substring)", key="ti_svc_filter", placeholder="e.g. http")
+
+    db_vulns = get_all_vulnerabilities(
+        source_tool=None if src_filter == "All" else src_filter,
+        service=svc_filter.strip() or None,
+        risk_level=None if risk_filter == "All" else risk_filter,
+    )
+
+    if not db_vulns:
+        st.info(
+            "No structured findings yet. Run a session scan — the pipeline automatically "
+            "queries NVD and searchsploit per discovered service and stores results here."
+        )
+    else:
+        # Counts by risk
+        high_n   = sum(1 for v in db_vulns if v.get("risk_level") == "high")
+        medium_n = sum(1 for v in db_vulns if v.get("risk_level") == "medium")
+        low_n    = sum(1 for v in db_vulns if v.get("risk_level") == "low")
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Total", len(db_vulns))
+        mc2.metric("🔴 High", high_n)
+        mc3.metric("🟠 Medium", medium_n)
+        mc4.metric("🟢 Low", low_n)
+
+        # Source trust badges
+        _SOURCE_BADGE = {
+            "nvd":             "✅ NVD (NIST)",
+            "searchsploit":    "🗃️ ExploitDB",
+            "nmap-vuln-script":"🔍 Nmap NSE",
+            "vulners":         "🌐 Vulners",
+        }
+        _RISK_ICON = {"high": "🔴", "medium": "🟠", "low": "🟢"}
+        risk_order = {"high": 0, "medium": 1, "low": 2, "unknown": 3}
+        sorted_db = sorted(db_vulns, key=lambda v: (risk_order.get(v.get("risk_level"), 3), v.get("discovered_at", "")))
+
+        for v in sorted_db:
+            risk      = v.get("risk_level", "unknown")
+            risk_icon = _RISK_ICON.get(risk, "⬜")
+            src_badge = _SOURCE_BADGE.get(v.get("source_tool", ""), v.get("source_tool", "unknown"))
+            cve_ids   = v.get("cve_ids") or []
+            cve_label = ", ".join(cve_ids) if cve_ids else "No CVE"
+            cvss_str  = f" · CVSS {v['cvss_score']:.1f}" if v.get("cvss_score") is not None else ""
+            target    = v.get("target_hostname") or v.get("target_ip") or v.get("host") or "?"
+            port_str  = f":{v['port']}" if v.get("port") else ""
+            label     = f"{risk_icon} {v.get('name', 'Unnamed')} — {cve_label}{cvss_str}"
+
+            with st.expander(label):
+                st.markdown(f"""
+                <div class='command-card {"high-risk" if risk=="high" else "medium-risk" if risk=="medium" else ""}'>
+                    <strong>Source:</strong> {src_badge}<br>
+                    <strong>Target:</strong> {target}{port_str} ({v.get('service') or '?'} {v.get('service_version') or ''})<br>
+                    <strong>Risk:</strong> {risk.upper()}{cvss_str}<br>
+                    <strong>CVE(s):</strong> {cve_label}<br>
+                    <strong>Session:</strong> {v.get('session_name') or v.get('session_id', '?')}<br>
+                    <strong>Discovered:</strong> {(v.get('discovered_at') or '')[:19]}
+                </div>
+                """, unsafe_allow_html=True)
+
+                if v.get("description"):
+                    st.markdown("**Description:**")
+                    st.write(v["description"])
+
+                refs = v.get("reference_urls") or []
+                if refs:
+                    st.markdown("**References:**")
+                    for url in refs:
+                        st.markdown(f"- {url}")
+                elif cve_ids:
+                    src = v.get("source_tool", "")
+                    if src == "nvd":
+                        st.markdown(f"**NVD:** https://nvd.nist.gov/vuln/detail/{cve_ids[0]}")
+                    elif src == "searchsploit":
+                        st.markdown(f"**ExploitDB search:** https://www.exploit-db.com/search?cve={cve_ids[0].replace('CVE-','')}")
+
+    st.markdown("---")
+
+    # ── Section 2: AI-directed open-web research ──────────────────────────────
+    st.markdown("### 🕸️ Open-Web Research Cache")
     st.warning(
-        "⚠️ **Unverified by design.** The AI searches the open web (no domain restriction) and "
-        "extracts vulnerability info with another AI call. Pages can be wrong, outdated, or "
-        "deliberately misleading (SEO spam, prompt-injection attempts). Treat every result below "
-        "as a lead to verify, not a confirmed fact - cross-check against Vulners/NVD/CISA KEV before "
-        "acting on it. This research runs independently of any live session and never issues shell "
-        "commands on its own."
+        "⚠️ **Unverified by design.** The AI searches the open web and extracts vulnerability "
+        "info with another AI call. Pages can be wrong, outdated, or misleading. "
+        "Treat every result here as a lead to verify against NVD/CISA KEV — not a confirmed fact. "
+        "This research runs independently of any live session."
     )
 
     with st.form("threat_intel_research_form"):
@@ -2043,21 +2155,18 @@ def show_threat_intel():
             else:
                 result = start_threat_intel_research(topic.strip())
                 if result:
-                    st.success(f"Research started for '{topic}'. This runs in the background - results appear below in a moment (page auto-refreshes every 5s).")
+                    st.success(f"Research started for '{topic}'. Results appear below in a moment.")
                 else:
                     st.error("Failed to start research. Check backend logs.")
-
-    st.markdown("---")
-    st.markdown("### 📚 Cached Findings")
 
     filter_topic = st.text_input("Filter by topic (optional)", key="ti_filter", placeholder="e.g. apache")
     findings = get_threat_intel(filter_topic.strip() if filter_topic else None)
 
     if not findings:
-        st.info("No cached findings yet. Research a topic above to get started.")
+        st.info("No cached web-research findings yet. Research a topic above to get started.")
         return
 
-    st.caption(f"{len(findings)} cached finding(s)")
+    st.caption(f"{len(findings)} cached web-research finding(s)")
 
     for f in findings:
         cve_label = ", ".join(f.get("cve_ids") or []) or "No CVE ID extracted"
