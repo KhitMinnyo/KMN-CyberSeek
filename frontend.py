@@ -2296,7 +2296,7 @@ def show_docs():
                 + '<div class="exb">' + a + '</div></details>')
 
     # Tab 0: &#128640; Getting Started
-    t0 = ""
+    html = ""
     html += _s('Quick Start')
     html += _c('1. Run <code>./start.sh</code>', 'Starts FastAPI (port 6000) and Streamlit (port 8501).', '#4caf50')
     html += _c('2. Settings &#8594; AI Configuration', 'Connect Ollama or enter a DeepSeek API key.', '#4caf50')
@@ -2316,9 +2316,10 @@ def show_docs():
     html += _c('<code>lateral_movement</code>', 'Pivoting to adjacent hosts using found credentials', '#6a1b9a')
     html += _c('<code>credential_reuse</code>', 'Credential spraying, pass-the-hash, Kerberoasting', '#2e7d32')
     html += _note('Local IP targets (10.x, 192.168.x, 172.16&#8211;31.x): OSINT phase is automatically skipped &#8212; Google Dorks return nothing useful for private addresses.')
+    t0 = html
 
     # Tab 1: &#128203; Session Guide
-    t1 = ""
+    html = ""
     html += _s('Session Buttons')
     html += _c('&#9654;&#65039; Resume', 'Continues AI analysis from current state &#8212; no re-scan. Safe on an already-running session (idempotent).', '#4caf50')
     html += _c('&#128260; Reset AI', 'Keeps nmap <b>scan data</b>. Clears AI decisions, commands, vulnerabilities. Re-runs AI from existing scan. Use when AI went off-track.', '#1976d2')
@@ -2341,9 +2342,10 @@ def show_docs():
     html += _c('OFF (default)', 'All commands go to the pending queue for manual review before execution.', '#c62828')
     html += _c('ON', 'All risk levels (LOW / MEDIUM / HIGH) execute automatically without waiting.', '#4caf50')
     html += _note('Two safeguards always apply:<br>(1) Allowlist gate &#8212; dangerous commands are always blocked.<br>(2) Depth checkpoint &#8212; after 15 auto-commands, one manual approval is required.')
+    t1 = html
 
     # Tab 2: &#129302; AI &amp; Commands
-    t2 = ""
+    html = ""
     html += _s('Risk Classification')
     html += _c('&#129001; LOW &#8212; Read-only / passive', 'No impact. Examples: <code>nmap</code>, <code>curl -I</code>, <code>whois</code>, <code>dig</code>. Auto-executes when auto-approve is ON.', '#4caf50')
     html += _c('&#128993; MEDIUM &#8212; Active / leaves traces', 'Enumeration &#8212; traces but no damage. Examples: <code>nikto</code>, <code>gobuster</code>, <code>nuclei</code>. Auto-executes when auto-approve is ON.', '#f9a825')
@@ -2359,9 +2361,10 @@ def show_docs():
     html += _s('OSINT &#8212; Google Dorks')
     html += _pre('site:<domain> filetype:pdf|xlsx|docx|pptx|sql|bak|env|config|log\nsite:<domain> inurl:admin|login|portal|dashboard\nsite:<domain> "index of" | "parent directory"\n"<domain>" ext:sql|bak|env|config|log\nsite:<domain> intext:"password"|"api_key"|"secret"')
     html += _note('OSINT / Google Dorks only run for domain targets. Private/local IPs (10.x, 192.168.x) skip OSINT automatically.')
+    t2 = html
 
     # Tab 3: &#128376;&#65039; Threat Intel
-    t3 = ""
+    html = ""
     html += _s('What is Threat Intel?')
     html += _c('Standalone research tool', 'The Threat Intel page builds a local vulnerability knowledge base over time. Completely separate from live pentest sessions &#8212; never issues shell commands.', '#7e57c2')
     html += _s('How It Works')
@@ -2377,9 +2380,10 @@ def show_docs():
     html += _c('<code>OpenSSH 7.2p2</code>', 'Example finding: Username enumeration CVE', '#00838f')
     html += _c('<code>GlassFish 4.1</code>', 'Example finding: CVE-2017-1000028 unauthenticated RCE', '#00838f')
     html += _c('<code>Tomcat 7.0</code>', 'Example finding: CVE-2020-1938 Ghostcat AJP RCE', '#00838f')
+    t3 = html
 
     # Tab 4: &#129504; Ollama Models
-    t4 = ""
+    html = ""
     html += _s('What the AI Needs to Do Well')
     html += _c('1. Structured JSON output', 'Every AI response must be valid JSON. A model that garbles this causes parse failures and halts the session.', '#1976d2')
     html += _c('2. Multi-step reasoning', 'The model must plan a full attack chain without skipping phases after just 3 commands.', '#1976d2')
@@ -2397,9 +2401,10 @@ def show_docs():
     html += _c('What happens when context overflows', 'Local models have a fixed context window. When session history exceeds it, the model silently forgets old content &#8212; causing repeated commands, stage regression, or hallucinated progress.', '#f57c00')
     html += _c('Built-in mitigations', '1. Episode summaries &#8212; every N commands, old history is compressed and re-injected.<br>2. Configurable context window &#8212; Settings &#8594; AI Configuration &#8594; Context window controls Ollama&#39;s <code>num_ctx</code>.', '#4caf50')
     html += '<table class="tbl"><tr><th>Model size</th><th>Safe context window</th></tr><tr><td>7&#8211;8B</td><td>16,384</td></tr><tr><td>13&#8211;14B</td><td>32,768</td></tr><tr><td>32B</td><td>32,768&#8211;65,536</td></tr><tr><td>70&#8211;72B</td><td>65,536&#8211;131,072</td></tr></table>'
+    t4 = html
 
     # Tab 5: &#128295; Troubleshooting
-    t5 = ""
+    html = ""
     html += _s('Common Issues')
     html += _exp('Session status FAILED but terminal still active', 'Asyncio tasks queued before failure finish running after status changed. Normal &#8212; backend drains queue then stops. Wait a few seconds, refresh, then use Reset AI.')
     html += _exp('&#39;AI response parsing error&#39; in command history', 'AI returned invalid JSON. Session now halts cleanly on parse failure. If seen on an old session, do a Reset AI. Switching to qwen2.5:14b reduces parse failures.')
@@ -2415,6 +2420,7 @@ def show_docs():
     html += _pre('# .env\nBACKEND_PORT=6000    # FastAPI backend\nFRONTEND_PORT=8501   # Streamlit frontend')
     html += _s('API Reference &#8212; Key Endpoints')
     html += '<table class="tbl"><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr><tr><td>POST</td><td>/api/sessions</td><td>Create new session</td></tr><tr><td>GET</td><td>/api/sessions/history</td><td>List all sessions</td></tr><tr><td>POST</td><td>/api/sessions/{id}/resume</td><td>Resume AI (idempotent)</td></tr><tr><td>POST</td><td>/api/sessions/{id}/restart</td><td>Reset AI, keep scan data</td></tr><tr><td>POST</td><td>/api/sessions/{id}/rescan</td><td>Full rescan &#8212; clear all, re-run nmap</td></tr><tr><td>POST</td><td>/api/sessions/{id}/approve/{cmd_id}</td><td>Approve pending command</td></tr><tr><td>DELETE</td><td>/api/sessions/{id}</td><td>Delete session</td></tr><tr><td>GET</td><td>/api/stats</td><td>Dashboard stats</td></tr></table>'
+    t5 = html
 
     _tabs = [t0, t1, t2, t3, t4, t5]
     _tb = '<button class="tb ta" onclick="sT(0)">&#128640; Getting Started</button><button class="tb" onclick="sT(1)">&#128203; Session Guide</button><button class="tb" onclick="sT(2)">&#129302; AI &amp; Commands</button><button class="tb" onclick="sT(3)">&#128376;&#65039; Threat Intel</button><button class="tb" onclick="sT(4)">&#129504; Ollama Models</button><button class="tb" onclick="sT(5)">&#128295; Troubleshooting</button>'
