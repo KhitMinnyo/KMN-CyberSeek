@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import time
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Any
@@ -172,6 +173,28 @@ _EXPLOIT_SIGNALS = (
 )
 
 
+def _detect_privilege_level(output: str) -> Optional[str]:
+    """Infer the privilege level proven by a command's output, or None if the
+    output doesn't clearly show a shell / code-execution context.
+
+    Ordered most-privileged first so 'root' wins over a generic 'user' match.
+    """
+    o = (output or "").lower()
+    # Highest privilege (Unix root / Windows SYSTEM)
+    if "uid=0" in o or re.search(r'\broot@', o) or "nt authority\\system" in o:
+        return "root/SYSTEM"
+    # Windows administrator
+    if re.search(r'\badministrator\b', o) and ("whoami" in o or "\\" in o):
+        return "administrator"
+    # Any confirmed shell but non-privileged user (uid=NNN where NNN != 0)
+    if re.search(r'uid=\d+', o) or "meterpreter" in o or "command shell session" in o:
+        return "user"
+    # Windows non-priv user context from `whoami` (domain\user)
+    if re.search(r'\b\w+\\\w+\b', o) and "whoami" in o:
+        return "user"
+    return None
+
+
 def _is_local_target(target: str) -> bool:
     """Return True if target is a private, loopback, or link-local IP address.
 
@@ -272,6 +295,11 @@ class Session:
         # completed commands). Cheaper than reflecting after every single step.
         self._planner_cmd_count: int = 0
         self._PLANNER_INTERVAL: int = int(os.getenv("PLANNER_INTERVAL", "5"))
+        # Stage the strategist last reflected on. Lets us trigger a fresh pass
+        # whenever the engagement advances a stage (a real milestone) instead of
+        # waiting for the every-N-commands cadence — which never fires if the
+        # session stalls before N commands, leaving objective_progress frozen.
+        self._last_strategist_stage: str = ""
 
         # Credential-reuse dispatch dedup: fingerprints of reuse commands already
         # generated, so the deterministic trigger never queues the same check twice.
@@ -291,6 +319,13 @@ class Session:
         # directive up to _MAX_EMPTY_RETRIES, then halt visibly.
         self._empty_response_count: int = 0
         self._MAX_EMPTY_RETRIES: int = int(os.getenv("MAX_EMPTY_RETRIES", "3"))
+
+        # Confirmed compromises: captured whenever a command's output proves code
+        # execution / shell access on a service. Each entry:
+        #   {service, host, port, command, privilege, signal, proof, timestamp}
+        # Surfaced to the AI so it pivots to post-exploitation instead of
+        # re-running the same exploit (a common cause of enumeration loops).
+        self.compromise_evidence: List[Dict] = []
 
     def to_dict(self) -> Dict:
         """Convert session to dictionary."""
@@ -322,6 +357,7 @@ class Session:
             "strategic_plan": self.strategic_plan,
             "reflections": self.reflections[-5:],
             "exhausted_services": self.exhausted_services,
+            "compromise_evidence": self.compromise_evidence,
         }
 
 
@@ -351,6 +387,20 @@ class Orchestrator:
         # Each manager holds the persistent msfconsole multi/handler process(es)
         # and tracks active meterpreter/shell connections for that session.
         self._shell_managers: Dict[str, ShellManager] = {}
+
+        # ── Stuck-session watchdog ────────────────────────────────────────────
+        # Detects sessions wedged in an active status (analyzing/executing) with
+        # no progress — a dead asyncio task, a hung await, etc. — and nudges them
+        # back into motion, then flags them if nudging doesn't help.
+        self._last_activity: Dict[str, float] = {}   # session_id -> monotonic ts
+        self._watchdog_nudges: Dict[str, int] = {}    # session_id -> nudge count
+        self._WATCHDOG_INTERVAL = int(os.getenv("WATCHDOG_INTERVAL", "60"))
+        # A running command self-terminates at COMMAND_TIMEOUT, so anything idle
+        # longer than that (plus a buffer) means the driving task has died.
+        self._WATCHDOG_STALL = int(
+            os.getenv("WATCHDOG_STALL_SECONDS", str(COMMAND_TIMEOUT + 180))
+        )
+        self._WATCHDOG_MAX_NUDGES = int(os.getenv("WATCHDOG_MAX_NUDGES", "2"))
 
         # Initialize database
         self._init_database()
@@ -1316,16 +1366,13 @@ class Orchestrator:
             # Prepare context for AI with CRITICAL RULE about domain usage
             _active_shells = self.get_shell_sessions(session_id)
 
-            # Exhausted attack vectors — injected so AI skips them automatically
-            _exhausted_ctx = ""
-            if session.exhausted_services:
-                _exhausted_ctx = (
-                    "\n=== EXHAUSTED ATTACK VECTORS — DO NOT RETRY ===\n"
-                    + "\n".join(f"- {s}" for s in session.exhausted_services)
-                    + "\nThese vectors have been looped on and abandoned. "
-                    "Choose a DIFFERENT service, port, or technique. "
-                    "Do not suggest any command that targets an exhausted vector.\n"
-                )
+            # Exhausted attack vectors — injected so AI skips them automatically.
+            _exhausted_ctx = self._exhausted_context_block(session)
+
+            # Confirmed compromises — tell the AI it already has access so it
+            # pivots to post-exploitation / privilege-escalation instead of
+            # re-running the exploit that already worked.
+            _exhausted_ctx += self._compromise_context_block(session)
 
             # Force-command directive — appended when recovering from an empty
             # response so the model is compelled to emit a concrete next command.
@@ -1407,10 +1454,12 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # Get AI decision, passing memory explicitly to format SYSTEM_PROMPT
             ai_response = await self.ai_connector.ask_ai_async(context, session_id, memory=memory_string)
             
-            # Check for empty AI response (API timeout, token limit, JSON parsing error)
+            # No AI response (API timeout, token limit, JSON parse error). Rather
+            # than dying at status=error (a non-resumable dead-end), route through
+            # the same retry+visible-halt recovery used for empty commands.
             if not ai_response:
-                logger.error(f"AI analysis returned empty for {session.session_id}")
-                session.status = "error"  # MUST be 'error', not 'ready'
+                logger.error(f"AI analysis returned no response for {session.session_id}")
+                await self._handle_empty_command(session_id, "analyze_no_response")
                 return
 
             # Store AI decision
@@ -1425,6 +1474,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             
             session.ai_decisions.append(decision)
             self._save_ai_decision(session_id, decision)
+            self._touch_activity(session_id)  # watchdog: analysis produced a decision
 
             # Advance stage: gate prevents regression and limits skipping to 1 step.
             new_stage = _advance_stage(session.current_stage, ai_response.attack_phase)
@@ -1724,7 +1774,8 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
         command_id = str(uuid.uuid4())
         session.status = "executing"
-        
+        self._touch_activity(session_id)  # watchdog: command is starting
+
         # Pre-execution safety check for non-interactive requirement
         safety_error = self._check_command_safety(command)
         if safety_error:
@@ -1863,6 +1914,11 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
             # Clear the live-output buffer now that the command is done.
             self._live_output.pop(session_id, None)
+
+            # Watchdog: a command completed → the loop is alive. Record progress
+            # and clear any accumulated nudge count for this session.
+            self._touch_activity(session_id)
+            self._watchdog_nudges.pop(session_id, None)
 
             # Update session status
             session.status = "ready"
@@ -2034,7 +2090,7 @@ Subdomains found: {len(session.discovered_subdomains)}{f' — [{", ".join(sessio
 Web apps found: {len(session.web_applications)}{f' — [{", ".join(a.get("url","") for a in session.web_applications[:5])}]' if session.web_applications else ''}
 API endpoints: {len(session.discovered_api_endpoints)}
 Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
-
+{self._exhausted_context_block(session)}{self._compromise_context_block(session)}
 Domain rule: If Target Domain is provided ({session.target_domain}), use domain name for all web tools — never IP.
 
 {self._get_relevant_threat_intel_context(session_id)}
@@ -2044,10 +2100,11 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             ai_response = await self.ai_connector.ask_ai_async(context, session_id, memory=memory_string)
 
             # Guard against None (JSON parse failure, model timeout, validation error).
-            # Log and stop this loop iteration cleanly — do NOT execute a fallback command.
+            # Route through retry+visible-halt recovery instead of the non-resumable
+            # status=error dead-end, so a transient model hiccup self-heals.
             if not ai_response:
-                logger.error(f"AI returned no valid response for session {session_id} (post-command). Halting loop.")
-                session.status = "error"
+                logger.error(f"AI returned no valid response for session {session_id} (post-command).")
+                await self._handle_empty_command(session_id, "post_command_no_response")
                 return
 
             # Store AI decision — include attack_phase so the frontend timeline
@@ -3639,6 +3696,88 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 
         self._sessions_to_auto_resume.clear()
 
+    # ── Stuck-session watchdog ────────────────────────────────────────────────
+
+    def _touch_activity(self, session_id: str) -> None:
+        """Record that the session just made progress (command ran, decision made).
+        The watchdog uses this timestamp to distinguish a busy session from a
+        wedged one."""
+        self._last_activity[session_id] = time.monotonic()
+
+    async def watchdog_loop(self) -> None:
+        """Long-running background task (started from FastAPI startup). Every
+        _WATCHDOG_INTERVAL seconds it checks for sessions stuck in an active
+        status with no progress and revives or flags them. Never raises."""
+        logger.info(
+            f"Stuck-session watchdog started (interval={self._WATCHDOG_INTERVAL}s, "
+            f"stall={self._WATCHDOG_STALL}s, max_nudges={self._WATCHDOG_MAX_NUDGES})"
+        )
+        while True:
+            await asyncio.sleep(self._WATCHDOG_INTERVAL)
+            try:
+                await self._watchdog_tick()
+            except Exception as e:
+                logger.error(f"Watchdog tick failed (non-fatal): {e}")
+
+    async def _watchdog_tick(self) -> None:
+        """One watchdog pass. 'analyzing'/'executing' are the only statuses that
+        should always be making progress; 'ready'/'failed'/'completed' are legit
+        resting states and are left alone."""
+        now = time.monotonic()
+        for sid, session in list(self.sessions.items()):
+            if session.status not in ("analyzing", "executing"):
+                # Not an active status — clear any stale nudge count so a future
+                # stall starts from a clean slate.
+                self._watchdog_nudges.pop(sid, None)
+                continue
+
+            last = self._last_activity.get(sid)
+            if last is None:
+                # First time we've seen this session active — arm the timer.
+                self._touch_activity(sid)
+                continue
+
+            idle = now - last
+            if idle < self._WATCHDOG_STALL:
+                continue
+
+            nudges = self._watchdog_nudges.get(sid, 0)
+            if nudges < self._WATCHDOG_MAX_NUDGES:
+                self._watchdog_nudges[sid] = nudges + 1
+                logger.warning(
+                    f"Watchdog: session {sid} idle {int(idle)}s in '{session.status}' "
+                    f"— nudging (attempt {nudges + 1}/{self._WATCHDOG_MAX_NUDGES})"
+                )
+                self._touch_activity(sid)
+                session.status = "analyzing"
+                self._save_session_status(sid, session)
+                asyncio.create_task(self._analyze_with_ai(sid))
+            else:
+                logger.error(
+                    f"Watchdog: session {sid} still stalled after "
+                    f"{self._WATCHDOG_MAX_NUDGES} nudges — flagging for attention."
+                )
+                session.status = "ready"
+                _d = {
+                    "timestamp": datetime.now().isoformat(),
+                    "reasoning": (
+                        f"WATCHDOG: session was stuck in an active state for "
+                        f"{int(idle)}s with no progress and did not recover after "
+                        f"{self._WATCHDOG_MAX_NUDGES} automatic nudges. Auto-execution "
+                        "paused. Click Resume to retry, or run the next step manually."
+                    ),
+                    "suggested_command": "",
+                    "risk_level": "high",
+                    "confidence": 1.0,
+                    "context": "watchdog_stalled",
+                }
+                session.ai_decisions.append(_d)
+                self._save_ai_decision(sid, _d)
+                self._save_session_status(sid, session)
+                # Reset so a later burst of activity can re-arm the watchdog.
+                self._watchdog_nudges.pop(sid, None)
+                self._last_activity.pop(sid, None)
+
     def _create_episode_summary(self, session_id: str) -> str:
         """Build a compact, structured text summary of the last _EPISODE_SIZE
         commands and the current known state.  Called automatically every
@@ -3733,9 +3872,22 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         if not session:
             return
         session._planner_cmd_count += 1
-        if session._planner_cmd_count < session._PLANNER_INTERVAL:
+
+        # Trigger conditions (any one fires a strategist pass):
+        #   1. Every _PLANNER_INTERVAL commands (steady cadence).
+        #   2. The stage advanced since the last pass (a real milestone).
+        #   3. No plan exists yet (bootstrap — so progress moves off its initial
+        #      value after the very first command instead of staying frozen until
+        #      command #5, which many stalled sessions never reached).
+        _interval_hit = session._planner_cmd_count >= session._PLANNER_INTERVAL
+        _stage_changed = session.current_stage != session._last_strategist_stage
+        _no_plan_yet = not session.strategic_plan
+
+        if not (_interval_hit or _stage_changed or _no_plan_yet):
             return
+
         session._planner_cmd_count = 0
+        session._last_strategist_stage = session.current_stage
         try:
             await self._run_strategist(session_id)
         except Exception as e:
@@ -4059,10 +4211,99 @@ Web apps: {webapps}
         if not success:
             return
         out_l = (output or "").lower()
-        exploited = any(sig in out_l for sig in _EXPLOIT_SIGNALS)
+        _matched = [sig for sig in _EXPLOIT_SIGNALS if sig in out_l]
+        exploited = bool(_matched)
         settle_state = "exploited" if exploited else "tested"
-        for svc in self._services_referenced(session, command):
+        referenced = self._services_referenced(session, command)
+        for svc in referenced:
             self._promote_service(svc, settle_state)
+        if exploited:
+            self._capture_exploitation_evidence(
+                session, command, output, referenced, _matched
+            )
+
+    def _capture_exploitation_evidence(self, session: "Session", command: str,
+                                       output: str, services: List[Dict],
+                                       matched_signals: List[str]) -> None:
+        """Record proof of a confirmed compromise: privilege level, the proof
+        snippet, and which service it landed on. Deduped per (service, privilege)
+        so repeated confirmations don't spam the evidence log. Best-effort — never
+        raises into the command loop."""
+        try:
+            privilege = _detect_privilege_level(output) or "unknown"
+            # Trimmed proof snippet centred on the first matched signal.
+            proof = (output or "").strip()
+            if matched_signals:
+                low = output.lower()
+                idx = low.find(matched_signals[0])
+                if idx != -1:
+                    start = max(0, idx - 120)
+                    proof = output[start:idx + 240].strip()
+            proof = proof[:400]
+
+            target_svc = services[0] if services else {}
+            svc_name = target_svc.get("service", "unknown")
+            host = target_svc.get("host", session.target_ip)
+            port = target_svc.get("port", "")
+
+            # Dedup: same service + privilege already captured → skip.
+            fp = f"{svc_name}:{port}:{privilege}"
+            if any(
+                f"{e.get('service')}:{e.get('port')}:{e.get('privilege')}" == fp
+                for e in session.compromise_evidence
+            ):
+                return
+
+            entry = {
+                "service": svc_name,
+                "host": host,
+                "port": port,
+                "command": command[:300],
+                "privilege": privilege,
+                "signal": ", ".join(matched_signals[:4]),
+                "proof": proof,
+                "timestamp": datetime.now().isoformat(),
+            }
+            session.compromise_evidence.append(entry)
+            logger.warning(
+                f"COMPROMISE CONFIRMED on {svc_name}:{port} ({host}) — "
+                f"privilege={privilege}, signal='{entry['signal']}'"
+            )
+            # Persist to the evidence table for the report.
+            self.add_evidence(session.session_id, "exploitation", entry)
+        except Exception as e:
+            logger.warning(f"Failed to capture exploitation evidence (non-fatal): {e}")
+
+    def _exhausted_context_block(self, session: "Session") -> str:
+        """Render exhausted attack vectors for the AI prompt. Empty when none."""
+        if not session.exhausted_services:
+            return ""
+        return (
+            "\n=== EXHAUSTED ATTACK VECTORS — DO NOT RETRY ===\n"
+            + "\n".join(f"- {s}" for s in session.exhausted_services)
+            + "\nThese vectors have been looped on and abandoned. Choose a DIFFERENT "
+            "service, port, or technique. Do not suggest a command targeting an "
+            "exhausted vector.\n"
+        )
+
+    def _compromise_context_block(self, session: "Session") -> str:
+        """Render confirmed compromises for the AI prompt. Empty string when none,
+        so it adds nothing to the context until access is actually proven."""
+        if not session.compromise_evidence:
+            return ""
+        lines = ["\n=== CONFIRMED COMPROMISES (you ALREADY have access here) ==="]
+        for e in session.compromise_evidence[-8:]:
+            lines.append(
+                f"- {e.get('service','?')}:{e.get('port','?')} on {e.get('host','?')} "
+                f"→ privilege={e.get('privilege','?')} via `{(e.get('command') or '')[:80]}`"
+            )
+        lines.append(
+            "Do NOT re-run the exploit on an already-compromised service. Instead "
+            "move to post-exploitation: enumerate the foothold, harvest credentials, "
+            "escalate privileges, or pivot to a new target. If privilege is 'user', "
+            "prioritise privilege escalation; if 'root/SYSTEM', document and pivot.\n"
+        )
+        return "\n".join(lines)
 
     def _service_state_counts(self, session: "Session") -> Dict[str, int]:
         counts = {k: 0 for k in _SERVICE_STATE_ORDER}

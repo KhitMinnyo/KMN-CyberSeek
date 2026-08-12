@@ -1044,6 +1044,12 @@ def show_session_overview(session_details: Dict):
             "⚠️ **Agentic loop error** — analysis of the last command's output failed. "
             "Auto-execution paused. Click **Resume** to retry, or run the next step manually."
         )
+    elif _last_ctx == "watchdog_stalled":
+        st.error(
+            "🐕 **Watchdog: session was stuck** — it stopped making progress and didn't "
+            "recover after automatic retries. Auto-execution paused. Click **Resume** to "
+            "try again, or run the next step manually via the **Command Console**."
+        )
     elif _last_ctx == "auto_pivot":
         if exhausted_services:
             st.info(
@@ -1058,6 +1064,22 @@ def show_session_overview(session_details: Dict):
 
     if exhausted_services:
         st.caption(f"🚫 Exhausted vectors (AI will skip): {', '.join(f'`{s}`' for s in exhausted_services)}")
+
+    # ── Confirmed compromises — proof of access captured from command output ──
+    compromises = session_details.get("compromise_evidence", [])
+    if compromises:
+        st.success(f"🎯 **{len(compromises)} confirmed compromise(s)** — access proven on the target.")
+        for _c in compromises[-6:]:
+            _priv = _c.get("privilege", "unknown")
+            _priv_icon = "👑" if "root" in _priv.lower() or "system" in _priv.lower() or "admin" in _priv.lower() else "👤"
+            with st.expander(
+                f"{_priv_icon} {_c.get('service','?')}:{_c.get('port','?')} on "
+                f"{_c.get('host','?')} — {_priv}",
+                expanded=False,
+            ):
+                st.caption(f"Via: `{_c.get('command','')}`  ·  Signal: {_c.get('signal','')}")
+                if _c.get("proof"):
+                    st.code(_c["proof"], language="text")
 
     # Check if session is in analyzing state and show loading indicator
     if session_details.get("status") == "analyzing":
@@ -1489,6 +1511,8 @@ def show_ai_decisions(session_details: Dict):
             _ctx_badge = " 🤔 no-step"
         elif _ctx == "loop_error":
             _ctx_badge = " ⚠️ error"
+        elif _ctx == "watchdog_stalled":
+            _ctx_badge = " 🐕 watchdog"
         elif _ctx == "self_critique_reject":
             _ctx_badge = " 🛡 vetoed"
 

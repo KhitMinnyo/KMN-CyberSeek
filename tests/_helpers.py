@@ -23,9 +23,11 @@ def make_orch(provider="api"):
     orch.pending_commands = {}
     orch._live_output = {}
     orch._findings_indexes = {}
-    # No-op the persistence + evidence side effects.
+    # No-op the persistence + evidence side effects so unit tests stay DB-free.
     orch.add_evidence = lambda *a, **k: None
     orch._save_credential_db = lambda *a, **k: None
+    orch._save_ai_decision = lambda *a, **k: None
+    orch._save_session_status = lambda *a, **k: None
 
     # Capture queued commands so tests can assert on them.
     orch.queued = []

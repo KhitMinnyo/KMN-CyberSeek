@@ -4,13 +4,25 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
-## [2.1.3] — 2026-08-10
+## [2.1.4] — 2026-08-12
+
+### Added
+- **Stuck-session watchdog** (`watchdog_loop` / `_watchdog_tick`) — background task (started at API startup) that detects sessions wedged in an active status (`analyzing`/`executing`) with no progress for `WATCHDOG_STALL_SECONDS` (default `COMMAND_TIMEOUT + 180`). It nudges them back into motion up to `WATCHDOG_MAX_NUDGES` (default 2), then logs a visible `watchdog_stalled` decision and returns to `ready`. `_touch_activity()` records progress at command start/finish and on every AI decision. Env-tunable: `WATCHDOG_INTERVAL`, `WATCHDOG_STALL_SECONDS`, `WATCHDOG_MAX_NUDGES`.
+- **Exploitation evidence capture** — when a command's output proves code execution/shell access, `_capture_exploitation_evidence()` records the service, host, port, command, **privilege level** (`_detect_privilege_level()` → root/SYSTEM, administrator, or user), matched signal, and a proof snippet. Persisted to the evidence table and deduped per (service, privilege).
+- **AI post-exploitation awareness** — confirmed compromises are injected into the AI context (`_compromise_context_block`) with an instruction to move to privilege-escalation/pivoting instead of re-running an exploit that already worked (a common enumeration-loop cause). Exhausted-vector context is now also shared with the tactical loop (`_exhausted_context_block`).
+- **Frontend — confirmed compromises panel** on the Overview tab: green success banner with per-compromise expanders (privilege icon, command, proof snippet). New AI-Decision badges: `🐕 watchdog`.
+- **Regression suite** `tests/test_agentic_loop.py` — 17 tests covering empty/no-response recovery, auto-pivot + limit, watchdog nudge/flag/rest, strategist triggers, and exploitation evidence capture + dedup.
 
 ### Fixed
 - **Agentic loop silently stalled at `ready` (reason-and-continue never progressed)** — the root cause was the LLM occasionally returning valid JSON with an **empty `suggested_command`**. Both `_analyze_with_ai()` and `_process_command_output()` handled this by doing nothing, leaving the session at `status=ready` with no pending command and no error — indistinguishable from "frozen." Now:
   - Empty commands route to `_handle_empty_command()`, which retries the analysis up to `MAX_EMPTY_RETRIES` (default 3) with a hard "you MUST return a concrete command" directive, then logs a visible `no_next_step` decision and returns to `ready`.
   - `_process_command_output()`'s previously-silent `except Exception` now records a visible `loop_error` decision instead of dying quietly.
   - Frontend surfaces both new states with banners and AI-Decision badges (`🤔 no-step`, `⚠️ error`).
+- **`None` AI response was a non-resumable dead-end** — a model timeout / JSON-parse failure set `status=error` and stopped. Both sites now route through the same retry+visible-halt recovery, so a transient hiccup self-heals.
+- **Strategist never ran → objective progress frozen** — the strategist only fired every `PLANNER_INTERVAL` (5) completed commands, so sessions that stalled before command #5 never advanced progress. It now also runs on the first command (bootstrap, when no plan exists) and whenever the engagement advances a stage.
+- **Unit tests broke on DB writes** — `make_orch` now stubs `_save_ai_decision` / `_save_session_status`, fixing `credential_reuse` and `strategist` tests that failed once AI-decision DB persistence was added.
+
+## [2.1.3] — 2026-08-10
 
 ### Added
 - **Auto-pivot on loop detection** (`core/orchestrator.py`) — when the anti-loop guardrail fires, the session no longer halts. Instead it automatically:
