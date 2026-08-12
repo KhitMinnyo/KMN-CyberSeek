@@ -1033,6 +1033,17 @@ def show_session_overview(session_details: Dict):
             "exhausted without success. Manual review required. Use **Command Console** "
             "to try a specific technique, or **Full Rescan** to reset."
         )
+    elif _last_ctx == "no_next_step":
+        st.warning(
+            "🤔 **AI returned no next command** — the model either considers the current "
+            "stage complete or is failing to produce output. Click **Resume** to ask again, "
+            "or advance manually via the **Command Console**."
+        )
+    elif _last_ctx == "loop_error":
+        st.error(
+            "⚠️ **Agentic loop error** — analysis of the last command's output failed. "
+            "Auto-execution paused. Click **Resume** to retry, or run the next step manually."
+        )
     elif _last_ctx == "auto_pivot":
         if exhausted_services:
             st.info(
@@ -1474,6 +1485,10 @@ def show_ai_decisions(session_details: Dict):
             _ctx_badge = " 🔄 pivot"
         elif _ctx == "pivot_limit_reached":
             _ctx_badge = " 🛑 pivot-limit"
+        elif _ctx == "no_next_step":
+            _ctx_badge = " 🤔 no-step"
+        elif _ctx == "loop_error":
+            _ctx_badge = " ⚠️ error"
         elif _ctx == "self_critique_reject":
             _ctx_badge = " 🛡 vetoed"
 

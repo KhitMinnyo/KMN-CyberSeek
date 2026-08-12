@@ -6,6 +6,12 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ## [2.1.3] — 2026-08-10
 
+### Fixed
+- **Agentic loop silently stalled at `ready` (reason-and-continue never progressed)** — the root cause was the LLM occasionally returning valid JSON with an **empty `suggested_command`**. Both `_analyze_with_ai()` and `_process_command_output()` handled this by doing nothing, leaving the session at `status=ready` with no pending command and no error — indistinguishable from "frozen." Now:
+  - Empty commands route to `_handle_empty_command()`, which retries the analysis up to `MAX_EMPTY_RETRIES` (default 3) with a hard "you MUST return a concrete command" directive, then logs a visible `no_next_step` decision and returns to `ready`.
+  - `_process_command_output()`'s previously-silent `except Exception` now records a visible `loop_error` decision instead of dying quietly.
+  - Frontend surfaces both new states with banners and AI-Decision badges (`🤔 no-step`, `⚠️ error`).
+
 ### Added
 - **Auto-pivot on loop detection** (`core/orchestrator.py`) — when the anti-loop guardrail fires, the session no longer halts. Instead it automatically:
   1. Detects which attack vector was being looped on (`_detect_exhausted_target()` heuristic).
