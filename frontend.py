@@ -1050,6 +1050,19 @@ def show_session_overview(session_details: Dict):
             "recover after automatic retries. Auto-execution paused. Click **Resume** to "
             "try again, or run the next step manually via the **Command Console**."
         )
+
+    # Live shell caught → celebratory, actionable banner pointing at the Shells tab.
+    if any(d.get("context") == "shell_caught" for d in ai_decisions):
+        st.success(
+            "🐚 **Live shell caught!** A session landed on the managed handler — "
+            "open the **🐚 Shells** tab to control it (whoami, sysinfo, hashdump…)."
+        )
+    elif _last_ctx == "handler_started":
+        st.info(
+            "🎧 **Listener up** — a Metasploit multi/handler was auto-started for the "
+            "exploitation phase. Exploits will deliver their shell here; caught sessions "
+            "appear in the **🐚 Shells** tab."
+        )
     elif _last_ctx == "auto_pivot":
         if exhausted_services:
             st.info(
@@ -1513,6 +1526,10 @@ def show_ai_decisions(session_details: Dict):
             _ctx_badge = " ⚠️ error"
         elif _ctx == "watchdog_stalled":
             _ctx_badge = " 🐕 watchdog"
+        elif _ctx == "handler_started":
+            _ctx_badge = " 🎧 listener"
+        elif _ctx == "shell_caught":
+            _ctx_badge = " 🐚 shell!"
         elif _ctx == "self_critique_reject":
             _ctx_badge = " 🛡 vetoed"
 

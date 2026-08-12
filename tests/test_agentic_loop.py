@@ -250,3 +250,64 @@ def test_compromise_context_block_tells_ai_to_pivot():
     assert "post-exploitation" in block.lower()
     # empty when nothing proven
     assert orch._compromise_context_block(make_session()) == ""
+
+
+# ── auto-handler for autonomous exploitation ────────────────────────────────
+
+def test_guess_default_payload_windows_vs_linux():
+    orch = _loop_orch()
+    win = make_session(services=[svc(445, "microsoft-ds"), svc(3389, "ms-wbt-server")])
+    lin = make_session(services=[svc(22, "ssh"), svc(80, "http")])
+    assert "windows" in orch._guess_default_payload(win)
+    assert "linux" in orch._guess_default_payload(lin)
+
+
+def test_ensure_handler_starts_once_and_records_config():
+    orch = _loop_orch()
+    s = make_session(services=[svc(445, "microsoft-ds")])
+    orch.sessions[s.session_id] = s
+    orch.db_path = ":memory:"  # persistence writes are best-effort/no-op here
+
+    # Fake ShellManager whose start_handler returns a handler-like object.
+    fake_handler = MagicMock()
+    fake_handler.handler_id = "h1"
+    fake_handler.status = "listening"
+    fake_handler.started_at = "t0"
+    fake_handler.info = {"handler_id": "h1"}
+    fake_mgr = MagicMock()
+    fake_mgr.start_handler = AsyncMock(return_value=fake_handler)
+    orch._get_shell_manager = lambda sid: fake_mgr
+
+    _run(orch._ensure_exploitation_handler(s.session_id))
+    assert s._auto_handler_started is True
+    assert s.exploit_lhost and s.exploit_lport and s.exploit_payload
+    assert s.ai_decisions[-1]["context"] == "handler_started"
+    fake_mgr.start_handler.assert_awaited_once()
+
+    # Second call is idempotent — no second handler.
+    _run(orch._ensure_exploitation_handler(s.session_id))
+    fake_mgr.start_handler.assert_awaited_once()
+
+
+def test_handler_context_block_directs_payload_delivery():
+    orch = _loop_orch()
+    s = make_session()
+    assert orch._handler_context_block(s) == ""  # nothing until handler is up
+    s.exploit_lhost = "10.10.14.9"
+    s.exploit_lport = 4444
+    s.exploit_payload = "windows/x64/meterpreter/reverse_tcp"
+    block = orch._handler_context_block(s)
+    assert "10.10.14.9" in block and "4444" in block
+    assert "do NOT" in block.lower() or "do not" in block.lower()
+    assert "shells tab" in block.lower()
+
+
+def test_persist_shell_session_logs_caught_shell_decision():
+    orch = _loop_orch()
+    s = make_session()
+    orch.sessions[s.session_id] = s
+    orch.db_path = ":memory:"
+    info = {"shell_id": "abc", "msf_id": 1, "type": "meterpreter",
+            "target_ip": "10.0.0.5", "status": "open", "opened_at": "t0"}
+    orch._persist_shell_session(s.session_id, "h1", info)
+    assert s.ai_decisions[-1]["context"] == "shell_caught"

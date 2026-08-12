@@ -4,6 +4,16 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.1.5] — 2026-08-12
+
+### Added
+- **Autonomous shell capture — AI catches its own sessions in the Shells tab.** Previously an exploit the AI fired opened its session inside a throwaway `msfconsole` process the manager never monitored, so it never appeared in the UI. Now the loop wires exploitation to the managed handler end-to-end:
+  - **Auto-started listener** — when the engagement reaches an exploitation stage (`exploitation`/`post_exploitation`/`privilege_escalation`/`lateral_movement`/`credential_reuse`), `_ensure_exploitation_handler()` spins up one managed `multi/handler` (idempotent per session). LHOST defaults to the local IP (`EXPLOIT_LHOST` override), LPORT to `4444` (`EXPLOIT_LPORT`), payload auto-guessed from the target OS (`_guess_default_payload()`; `EXPLOIT_PAYLOAD` override).
+  - **AI payload directive** — `_handler_context_block()` injects the live LHOST/LPORT/payload into every AI prompt with hard rules: deliver reverse shells to this listener, use these values in msfvenom / MSF modules, and never start your own handler.
+  - **Session-opened callback** — `MsfHandlerProcess` now fires `on_session_opened`; the orchestrator persists each caught session to `shell_sessions_log` and logs a visible `shell_caught` decision. Caught sessions surface in the **🐚 Shells** tab automatically (no polling).
+  - **Frontend** — Overview shows a green "Live shell caught!" banner (and a "Listener up" info banner when the handler starts); new AI-Decision badges `🎧 listener`, `🐚 shell!`.
+  - New env vars: `EXPLOIT_LHOST`, `EXPLOIT_LPORT`, `EXPLOIT_PAYLOAD`.
+
 ## [2.1.4] — 2026-08-12
 
 ### Added

