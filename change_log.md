@@ -4,6 +4,11 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.2.1] — 2026-08-12
+
+### Changed
+- **Steer & Ask is now a floating chat bubble** (Facebook-style) pinned bottom-right, open from **any** tab of a session — not just the Overview. Click **💬 AI Chat** to pop open the Steer + Ask box; the bubble shows a badge with the count of active operator instructions. Implemented with `st.popover` + fixed-position CSS; on older Streamlit (< 1.31, no `st.popover`) it gracefully falls back to the inline panel on the Overview tab.
+
 ## [2.2.0] — 2026-08-12
 
 ### Added

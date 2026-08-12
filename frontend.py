@@ -995,6 +995,94 @@ def display_session_details(session_details: Dict):
     with tab8:
         show_shells(session_details)
 
+    # Floating 💬 AI chat bubble — visible from any tab of this session.
+    render_floating_chat(session_details)
+
+
+def _render_steer_ask_widgets(session_id: str, session_details: Dict):
+    """The Steer + Ask controls, shared between the floating chat popover and the
+    inline fallback (older Streamlit without st.popover)."""
+    active_instr = session_details.get("operator_instructions", [])
+    if active_instr:
+        st.caption("AI is following: " + " · ".join(f"`{i}`" for i in active_instr[-4:]))
+
+    st.markdown("**🎯 Steer** — applies on the AI's next decision")
+    steer_txt = st.text_input(
+        "Instruction", key=f"steer_input_{session_id}",
+        placeholder="Focus on GlassFish 4848; skip SMB; try Ghostcat on 8009",
+        label_visibility="collapsed",
+    )
+    if st.button("Send instruction", key=f"steer_btn_{session_id}", use_container_width=True):
+        if steer_txt.strip():
+            res = steer_session(session_id, steer_txt.strip())
+            if res.get("status") == "success":
+                st.success("Sent — AI follows it next step.")
+                time.sleep(0.4)
+                st.rerun()
+            else:
+                st.error(res.get("message", "Failed."))
+        else:
+            st.warning("Type an instruction first.")
+
+    st.markdown("**💬 Ask** — read-only question about this session")
+    ask_txt = st.text_input(
+        "Question", key=f"ask_input_{session_id}",
+        placeholder="What have you found? What's blocking you? What next?",
+        label_visibility="collapsed",
+    )
+    if st.button("Ask the AI", key=f"ask_btn_{session_id}", use_container_width=True):
+        if ask_txt.strip():
+            with st.spinner("Asking the AI..."):
+                res = ask_session(session_id, ask_txt.strip())
+            st.session_state[f"ask_answer_{session_id}"] = (
+                res.get("answer", "") if res.get("status") == "success"
+                else "⚠️ " + res.get("message", "Failed to get an answer.")
+            )
+        else:
+            st.warning("Type a question first.")
+    _ans = st.session_state.get(f"ask_answer_{session_id}")
+    if _ans:
+        st.info(_ans)
+
+
+def render_floating_chat(session_details: Dict):
+    """Facebook-style floating chat bubble (bottom-right) for steering / asking the
+    AI while any tab of the session is open. Uses st.popover (Streamlit ≥1.31);
+    on older versions the inline panel in the Overview tab is used instead."""
+    session_id = session_details.get("session_id")
+    if not session_id or not hasattr(st, "popover"):
+        return
+
+    # Pin the popover trigger to the bottom-right and style it like a messenger bubble.
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stPopover"] {
+            position: fixed !important;
+            bottom: 24px; right: 24px;
+            z-index: 1000; width: auto !important;
+        }
+        div[data-testid="stPopover"] button {
+            border-radius: 24px !important;
+            padding: 10px 20px !important;
+            font-weight: 600 !important;
+            color: #fff !important;
+            background: linear-gradient(135deg, #d32f2f, #b43a2f) !important;
+            border: none !important;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.45) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    active_instr = session_details.get("operator_instructions", [])
+    label = "💬 AI Chat" + (f" · {len(active_instr)}" if active_instr else "")
+    with st.popover(label, use_container_width=False):
+        st.markdown(f"### 🧭 Steer & Ask")
+        st.caption(f"Session `{session_id}` · {session_details.get('status','?')}")
+        _render_steer_ask_widgets(session_id, session_details)
+
 
 def show_session_overview(session_details: Dict):
     """Show session overview."""
@@ -1251,58 +1339,14 @@ def show_session_overview(session_details: Dict):
             except Exception as e:
                 st.error(f"Could not reach backend: {e}")
     
-    # ── Steer / Ask the AI live ───────────────────────────────────────────────
-    st.markdown("### 🧭 Steer & Ask")
-    active_instr = session_details.get("operator_instructions", [])
-    if active_instr:
-        st.caption("Active operator instructions the AI is following: "
-                   + " · ".join(f"`{i}`" for i in active_instr[-6:]))
-
-    steer_col, ask_col = st.columns(2)
-    with steer_col:
-        st.markdown("**🎯 Steer** — direct the AI (applies on its next decision)")
-        steer_txt = st.text_input(
-            "Instruction", key=f"steer_input_{session_id}",
-            placeholder="e.g. Focus on GlassFish 4848; skip SMB; try Ghostcat on 8009",
-            label_visibility="collapsed",
-        )
-        if st.button("Send instruction", key=f"steer_btn_{session_id}",
-                     use_container_width=True):
-            if steer_txt.strip():
-                res = steer_session(session_id, steer_txt.strip())
-                if res.get("status") == "success":
-                    st.success("Instruction sent — the AI will follow it on its next step.")
-                    time.sleep(0.5)
-                    st.rerun()
-                else:
-                    st.error(res.get("message", "Failed to send instruction."))
-            else:
-                st.warning("Type an instruction first.")
-    with ask_col:
-        st.markdown("**💬 Ask** — question about the current session (read-only)")
-        ask_txt = st.text_input(
-            "Question", key=f"ask_input_{session_id}",
-            placeholder="e.g. What have you found so far? What's blocking you?",
-            label_visibility="collapsed",
-        )
-        if st.button("Ask the AI", key=f"ask_btn_{session_id}",
-                     use_container_width=True):
-            if ask_txt.strip():
-                with st.spinner("Asking the AI..."):
-                    res = ask_session(session_id, ask_txt.strip())
-                if res.get("status") == "success":
-                    st.session_state[f"ask_answer_{session_id}"] = res.get("answer", "")
-                else:
-                    st.session_state[f"ask_answer_{session_id}"] = (
-                        "⚠️ " + res.get("message", "Failed to get an answer.")
-                    )
-            else:
-                st.warning("Type a question first.")
-        _ans = st.session_state.get(f"ask_answer_{session_id}")
-        if _ans:
-            st.info(_ans)
-
-    st.markdown("---")
+    # ── Steer / Ask the AI ────────────────────────────────────────────────────
+    # Modern Streamlit shows the floating 💬 chat bubble (bottom-right, rendered in
+    # display_session_details). Only fall back to an inline panel when st.popover
+    # isn't available.
+    if not hasattr(st, "popover"):
+        st.markdown("### 🧭 Steer & Ask")
+        _render_steer_ask_widgets(session_id, session_details)
+        st.markdown("---")
 
     # Session timeline - dynamically determined based on current_stage
     st.markdown("### 📅 Session Timeline")
