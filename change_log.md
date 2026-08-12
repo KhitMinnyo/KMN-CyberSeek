@@ -4,6 +4,17 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.1.9] — 2026-08-12
+
+### Fixed
+- **NVD CVE lookups hammered the API and got HTTP 429 (Too Many Requests).** NVD's public limit is 5 requests / 30 s without a key (≈6 s apart), but the caller waited only 0.7 s — so after ~10 services every lookup 429'd and returned nothing. Rate limiting now lives inside `cve_lookup.lookup_cves_nvd()` behind a module-level lock (`NVD_MIN_INTERVAL`, default 6.5 s; 0.6 s when `NVD_API_KEY` is set) with exponential backoff + retry on 429. The redundant caller-side sleep was removed.
+- **NVD keyword queries returned 0 hits from noisy banners.** Nmap version strings like `Apache httpd 2.4.38 ((Win64) OpenSSL/1.0.2q PHP/5.6.40)` were sent verbatim and matched nothing. `_clean_nvd_query()` now trims everything from the first `(` so NVD sees `Apache httpd 2.4.38`.
+- **Wasted NVD requests on generic services.** `msrpc`, `netbios-ssn`, `microsoft-ds`, `ms-wbt-server`, etc. never yield keyword CVEs; they're now skipped, cutting request volume (and 429 pressure) substantially.
+- **`_parse_response()` (Vulners) returned `None`.** The function built its `results` list but never returned it, so `lookup_cves()` yielded `None` instead of a list. Added the missing `return` (regression-tested).
+
+### Note
+- The `429`/`0 CVE` lines in earlier logs are the symptom above — the free NVD path now paces itself correctly. For faster/looser limits, set `NVD_API_KEY` in `.env` (free from nvd.nist.gov).
+
 ## [2.1.8] — 2026-08-12
 
 ### Fixed

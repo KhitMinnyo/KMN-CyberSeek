@@ -1257,11 +1257,19 @@ class Orchestrator:
                 logger.warning(f"[{session_id}] searchsploit error for {svc_name} {version}: {e}")
 
         # ── 3. Per-service NVD (NIST) CVE lookup — free, no key required ─────
-        _nvd_delay = 0.7  # 5 req/30s without key → ~6s/5 req; 0.7s is safe
+        # Generic OS/RPC service names never yield useful keyword CVEs and only
+        # burn the shared NVD rate limit — skip them. (Rate limiting + 429 retry
+        # is enforced inside cve_lookup.lookup_cves_nvd, so no sleep is needed here.)
+        _NVD_SKIP = {
+            "msrpc", "netbios-ssn", "microsoft-ds", "ms-wbt-server", "netbios-ns",
+            "rpcbind", "tcpwrapped", "unknown", "loc-srv", "epmap", "llmnr",
+        }
         for svc in session.discovered_services:
             svc_name = (svc.get('service') or '').strip()
             version  = (svc.get('version') or '').strip()
             if not svc_name or not version or svc_name.lower() in ('unknown', ''):
+                continue
+            if svc_name.lower() in _NVD_SKIP:
                 continue
             _svc_key = f"{svc_name.lower()}_{version.lower()}"[:55]
             marker = f"nvd_{_svc_key}"
@@ -1286,7 +1294,6 @@ class Orchestrator:
                         "reference_urls": [hit["url"]] if hit.get("url") else [],
                         "source_tool": "nvd",
                     })
-                await _asyncio.sleep(_nvd_delay)   # respect NVD rate limit
             except Exception as e:
                 logger.warning(f"[{session_id}] NVD lookup error for {svc_name} {version}: {e}")
 

@@ -24,9 +24,11 @@ failures are logged and an empty result is returned so the rest of the scan
 pipeline is unaffected.
 """
 
+import asyncio
 import logging
 import os
 import re
+import time
 from typing import Dict, List, Optional
 
 import httpx
@@ -40,6 +42,31 @@ _CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 # Keep this conservative: enrichment runs once per discovered service on every
 # recon pass, so a slow/hanging API must not be allowed to stall the session.
 _REQUEST_TIMEOUT_SECONDS = 15.0
+
+# ── NVD rate limiting ────────────────────────────────────────────────────────
+# NVD's public rate limit is 5 requests per rolling 30 s WITHOUT an API key
+# (≈6 s/request) and 50 per 30 s WITH one (≈0.6 s/request). The old caller waited
+# only 0.7 s and got hammered with HTTP 429. We enforce the correct spacing here,
+# behind a module-level lock, so it's correct regardless of the caller.
+_nvd_lock = asyncio.Lock()
+_nvd_last_request_ts: float = 0.0
+
+
+def _nvd_min_interval() -> float:
+    return 0.6 if (os.getenv("NVD_API_KEY", "").strip()) else float(
+        os.getenv("NVD_MIN_INTERVAL", "6.5")
+    )
+
+
+def _clean_nvd_query(service: str, version: str) -> str:
+    """Build a keyword query that NVD can actually match. Nmap version banners
+    carry parenthetical noise (e.g. '((Win64) OpenSSL/1.0.2q PHP/5.6.40)') that
+    tanks keyword search; strip it and keep product + version."""
+    # Everything from the first '(' onward is Nmap's extra-info blob (OS, SSL,
+    # PHP, etc.) — nested/unbalanced, so just cut it entirely.
+    v = (version or "").split("(", 1)[0]
+    q = re.sub(r"\s+", " ", f"{service} {v}").strip()
+    return q
 
 
 def get_api_key() -> Optional[str]:
@@ -163,6 +190,8 @@ def _parse_response(data: Dict, max_results: int) -> List[Dict]:
             "url": source.get("href", "") or (f"https://vulners.com/cve/{cve_ids[0]}" if cve_ids else "")
         })
 
+    return results
+
 
 async def lookup_cves_nvd(
     service: str,
@@ -186,19 +215,50 @@ async def lookup_cves_nvd(
     if not service:
         return []
 
-    query = f"{service} {version}".strip()
+    query = _clean_nvd_query(service, version)
+    if not query:
+        return []
     nvd_key = os.getenv("NVD_API_KEY", "").strip() or None
     headers = {"apiKey": nvd_key} if nvd_key else {}
 
+    # Rate-limited request with retry on 429. The lock serialises NVD calls so
+    # concurrent sessions can't collectively blow the shared rate limit.
+    async def _do_request() -> Optional[httpx.Response]:
+        global _nvd_last_request_ts
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            async with _nvd_lock:
+                wait = _nvd_min_interval() - (time.monotonic() - _nvd_last_request_ts)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                try:
+                    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+                        r = await client.get(
+                            NVD_API_URL,
+                            params={"keywordSearch": query, "resultsPerPage": max_results},
+                            headers=headers,
+                        )
+                finally:
+                    _nvd_last_request_ts = time.monotonic()
+            if r.status_code == 429:
+                # Backoff grows with each attempt; NVD's window is 30s.
+                backoff = min(30.0, _nvd_min_interval() * (attempt + 1) * 2)
+                logger.warning(
+                    f"NVD 429 for {query!r} (attempt {attempt}/{max_attempts}); "
+                    f"backing off {backoff:.0f}s"
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(backoff)
+                    continue
+                return r
+            return r
+        return None
+
     try:
-        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-            resp = await client.get(
-                NVD_API_URL,
-                params={"keywordSearch": query, "resultsPerPage": max_results},
-                headers=headers,
-            )
-        if resp.status_code != 200:
-            logger.warning(f"NVD API returned HTTP {resp.status_code} for {query!r}")
+        resp = await _do_request()
+        if resp is None or resp.status_code != 200:
+            code = resp.status_code if resp is not None else "no response"
+            logger.warning(f"NVD API returned HTTP {code} for {query!r}")
             return []
 
         data = resp.json()
