@@ -35,7 +35,7 @@ import os
 import re
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +104,18 @@ class ShellSession:
 class MsfHandlerProcess:
     """Wraps a single long-running msfconsole multi/handler subprocess."""
 
-    def __init__(self, lhost: str, lport: int, payload: str):
+    def __init__(self, lhost: str, lport: int, payload: str,
+                 on_session_opened: Optional[Callable[[str, Dict], None]] = None):
         self.handler_id   = uuid.uuid4().hex[:8]
         self.lhost        = lhost
         self.lport        = lport
         self.payload      = payload
         self.status       = "starting"    # starting | listening | stopped | error
         self.started_at   = datetime.now().isoformat()
+        # Fired with (handler_id, session_dict) whenever a new meterpreter/shell
+        # session is detected in stdout. Lets the orchestrator persist the caught
+        # session and surface it without polling. Best-effort — never blocks.
+        self._on_session_opened = on_session_opened
 
         self._process: Optional[asyncio.subprocess.Process] = None
         self._monitor_task: Optional[asyncio.Task]          = None
@@ -221,6 +226,7 @@ class MsfHandlerProcess:
                     f"[Handler {self.handler_id}] Meterpreter session {msf_id} "
                     f"from {target_ip}"
                 )
+                self._notify_session_opened(sess)
                 continue
 
             # Command shell session opened
@@ -234,6 +240,7 @@ class MsfHandlerProcess:
                 logger.info(
                     f"[Handler {self.handler_id}] Shell session {msf_id} from {target_ip}"
                 )
+                self._notify_session_opened(sess)
                 continue
 
             # Output-capture marker (sent by run_command)
@@ -244,6 +251,17 @@ class MsfHandlerProcess:
         for sess in self._sessions.values():
             sess.status = "closed"
         logger.info(f"[Handler {self.handler_id}] Process exited")
+
+    def _notify_session_opened(self, sess: "ShellSession") -> None:
+        """Fire the on_session_opened callback (best-effort, never raises)."""
+        if not self._on_session_opened:
+            return
+        try:
+            info = sess.to_dict()
+            info["handler_id"] = self.handler_id
+            self._on_session_opened(self.handler_id, info)
+        except Exception as e:
+            logger.warning(f"[Handler {self.handler_id}] on_session_opened callback failed: {e}")
 
     # ── Command execution ─────────────────────────────────────────────────────
 
@@ -366,6 +384,7 @@ class ShellManager:
 
     async def start_handler(self, lhost: str, lport: int,
                             payload: str = "windows/x64/meterpreter/reverse_tcp",
+                            on_session_opened: Optional[Callable[[str, Dict], None]] = None,
                             ) -> MsfHandlerProcess:
         """Start (or reuse) a multi/handler for the given LHOST:LPORT:payload."""
         key = f"{lhost}:{lport}"
@@ -375,7 +394,7 @@ class ShellManager:
                 logger.info(f"Reusing handler {h.handler_id} for {key}")
                 return h
 
-        handler = MsfHandlerProcess(lhost, lport, payload)
+        handler = MsfHandlerProcess(lhost, lport, payload, on_session_opened=on_session_opened)
         self._handlers[handler.handler_id] = handler
         await handler.start()
         return handler
