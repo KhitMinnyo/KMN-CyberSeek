@@ -465,6 +465,36 @@ async def download_session_report_pdf(session_id: str):
     )
 
 
+@app.get("/api/sessions/{session_id}/report/md")
+async def download_session_report_md(session_id: str):
+    """Generate and download a Markdown penetration-test report. Pure Python —
+    no external dependencies, so this always works even when python-docx / fpdf2
+    are not installed. Includes all findings, every executed command, and every
+    attack decision in chronological order."""
+    try:
+        report_data = orchestrator.get_session_report(session_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    try:
+        from core.report_generator import generate_markdown_report
+        import tempfile
+        out_dir = tempfile.gettempdir()
+        out_path = os.path.join(out_dir, f"kmn_report_{session_id[:12]}.md")
+        generate_markdown_report(report_data, output_path=out_path)
+    except Exception as e:
+        logger.error(f"Markdown report generation failed for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Markdown report generation failed: {e}")
+
+    filename = f"kmn_report_{session_id[:12]}.md"
+    return FileResponse(
+        path=out_path,
+        media_type="text/markdown",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
 @app.get("/api/schedules")
 async def list_schedules():
     """List all non-deleted scheduled scans."""
