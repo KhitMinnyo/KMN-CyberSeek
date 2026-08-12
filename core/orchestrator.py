@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import time
@@ -1832,12 +1833,17 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # stdin=DEVNULL: close stdin so tools that prompt for a password
             # (smbclient, mysql, ftp, etc.) receive EOF instead of blocking on
             # terminal input. All credentials must be embedded in command flags.
+            # start_new_session=True puts the tool in its own process group so a
+            # timeout can kill the WHOLE tree. Without it, process.kill() would
+            # only kill the /bin/sh wrapper and leave the real tool (nmap, hydra,
+            # smbclient…) orphaned and running.
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd="/tmp"  # Safe directory
+                cwd="/tmp",  # Safe directory
+                start_new_session=True,
             )
 
             # Stream stdout + stderr line-by-line, broadcasting each chunk to
@@ -1891,8 +1897,19 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                     timeout=COMMAND_TIMEOUT
                 )
             except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
+                # Kill the whole process group so the real tool dies, not just
+                # the shell wrapper (which would leave an orphaned nmap/hydra).
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
                 logger.warning(f"Command timed out after {COMMAND_TIMEOUT}s for session {session_id}: {command[:80]}")
 
             await process.wait()

@@ -4,6 +4,16 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.1.6] — 2026-08-12
+
+### Fixed
+- **Session stuck at "scanning" long past the timeout (scan never returned).** Scans launch via `create_subprocess_shell`, so the process handle is the `/bin/sh` wrapper and nmap is its child. On timeout the old code called `process.kill()` (kills only the shell) then `await process.communicate()` — which **blocked until nmap finished on its own** because the still-running child held the stdout pipe open. Effect: the 5-minute `SCAN_TIMEOUT` never actually fired; on a host with many slow services (RMI/JMX/GIOP/GlassFish) the session sat in `scanning` for as long as nmap ran (10+ minutes). Fixes:
+  - New `_run_shell_bounded()` / `_kill_process_group()` helpers launch scans with `start_new_session=True` and, on timeout, `killpg` the **whole process group** (child included), then collect output with a bounded 5s wait.
+  - `perform_nmap_scan`, `perform_vulnerability_scan`, and `perform_vulnerability_scan_port` all use the bounded runner and now **parse partial output** on timeout instead of discarding it.
+  - nmap profiles gained `--host-timeout` (SCAN_TIMEOUT − 60s) + `--max-retries 2` so nmap self-bounds and returns graceful partial results before the hard kill.
+  - Initial recon (`default` profile) dropped `-sC` default scripts — the slowest phase on service-heavy hosts; targeted script/vuln scans still run in the background NSE pass and via AI-proposed commands.
+  - `orchestrator.execute_command` had the same shell-wrapper bug (a hung tool orphaned the real process); it now launches with `start_new_session=True` and `killpg`s the group on timeout.
+
 ## [2.1.5] — 2026-08-12
 
 ### Added
