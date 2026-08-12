@@ -177,6 +177,14 @@ class ApprovalRequest(BaseModel):
     command_id: str = Field(..., description="Command identifier")
     approve: bool = Field(True, description="Approve or deny the command")
 
+class SteerRequest(BaseModel):
+    """Free-text operator steering instruction, injected into the AI's next decision."""
+    instruction: str = Field(..., description="Natural-language directive for the AI")
+
+class AskRequest(BaseModel):
+    """Operator question about the current session (read-only status chat)."""
+    question: str = Field(..., description="Natural-language question about the engagement")
+
 # Known context windows for common Ollama models — used as fallback when
 # /api/show doesn't expose the model_info.context_length field.
 _KNOWN_CTX: dict = {
@@ -827,6 +835,30 @@ async def resume_session(session_id: str):
     session.status = "analyzing"
     asyncio.create_task(orchestrator._analyze_with_ai(session_id))
     return {"status": "success", "message": "AI analysis resumed"}
+
+
+@app.post("/api/sessions/{session_id}/steer")
+async def steer_session(session_id: str, request: SteerRequest):
+    """Send a live natural-language steering instruction to the running AI.
+    Takes effect on the next AI decision — does not interrupt the current command."""
+    if session_id not in orchestrator.sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    result = orchestrator.add_operator_instruction(session_id, request.instruction)
+    if result.get("status") != "success":
+        raise HTTPException(status_code=400, detail=result.get("message", "Failed"))
+    return result
+
+
+@app.post("/api/sessions/{session_id}/ask")
+async def ask_session(session_id: str, request: AskRequest):
+    """Ask the AI about the current engagement (read-only status chat). Does not
+    execute anything or alter the loop."""
+    if session_id not in orchestrator.sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    result = await orchestrator.answer_operator_question(session_id, request.question)
+    if result.get("status") != "success":
+        raise HTTPException(status_code=400, detail=result.get("message", "Failed"))
+    return result
 
 
 @app.post("/api/sessions/{session_id}/restart")

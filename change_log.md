@@ -4,6 +4,13 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.2.0] — 2026-08-12
+
+### Added
+- **Live operator steering** — send the running AI a free-text instruction mid-engagement ("Focus on GlassFish 4848", "skip SMB", "try Ghostcat on 8009"). It's injected as a **HIGHEST-PRIORITY** block into every subsequent AI decision, so you can redirect the autonomous loop without stopping it. Applies on the AI's next decision (doesn't interrupt a running command). Persists across restarts (rebuilt from the logged `operator_instruction` decisions). Endpoint: `POST /api/sessions/{id}/steer`.
+- **Status chat** — ask the AI about the current engagement ("What have you found?", "What's blocking you?", "What next?") and get a concise, state-grounded answer. Read-only: it runs a one-off summary call over live session state and never executes anything or touches the loop. Endpoint: `POST /api/sessions/{id}/ask`.
+- **Frontend "🧭 Steer & Ask" panel** on the session Overview: a Steer input + an Ask input with the AI's answer inline, plus a line showing the active operator instructions. New AI-Decision badge `🧭 steer`.
+
 ## [2.1.9] — 2026-08-12
 
 ### Fixed
