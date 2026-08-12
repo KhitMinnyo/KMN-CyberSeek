@@ -4,6 +4,12 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.1.8] — 2026-08-12
+
+### Fixed
+- **Every session failed at ~5 commands: `'Orchestrator' object has no attribute '_EPISODE_SIZE'`.** `_create_episode_summary()` referenced `self._EPISODE_SIZE`, but `_EPISODE_SIZE` is a **Session** attribute — so once a session reached the episode-summary interval (5 commands), `execute_command` raised `AttributeError`, was caught by its outer handler, and the session was marked `failed` (the loop stopped and the UI stopped updating). Now reads `session._EPISODE_SIZE`. Regression test added.
+- **`GET /api/vulnerabilities` → 500 (`no such column: s.target_hostname`).** The global vulnerabilities query joined non-existent columns `s.target_hostname` and `s.name`. The `sessions` table has `target_ip` + `target_domain` (and `session_id` doubles as the name). Query corrected — the Threat Intel structured-vuln table and dashboard vuln widget load again.
+
 ## [2.1.7] — 2026-08-12
 
 ### Added

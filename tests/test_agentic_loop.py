@@ -311,3 +311,21 @@ def test_persist_shell_session_logs_caught_shell_decision():
             "target_ip": "10.0.0.5", "status": "open", "opened_at": "t0"}
     orch._persist_shell_session(s.session_id, "h1", info)
     assert s.ai_decisions[-1]["context"] == "shell_caught"
+
+
+# ── episode summary (regressions) ───────────────────────────────────────────
+
+def test_create_episode_summary_uses_session_episode_size():
+    """Regression: _create_episode_summary referenced self._EPISODE_SIZE (an
+    orchestrator attr that doesn't exist) → AttributeError crashed the whole
+    command loop and failed the session. Must read session._EPISODE_SIZE."""
+    orch = _loop_orch()
+    s = make_session(services=[svc(80, "http")])
+    orch.sessions[s.session_id] = s
+    s.commands_executed = [
+        {"command": f"cmd{i}", "output": f"out{i}", "success": True}
+        for i in range(6)
+    ]
+    summary = orch._create_episode_summary(s.session_id)  # must not raise
+    assert summary and "EPISODE 1 SUMMARY" in summary
+    assert s.episode_summaries and s.episode_summaries[-1] == summary

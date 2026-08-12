@@ -3968,14 +3968,16 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             return ""
 
         episode_num = len(session.episode_summaries) + 1
-        # The N commands that belong to this episode
+        # The N commands that belong to this episode. _EPISODE_SIZE is a SESSION
+        # attribute, not an orchestrator one — using self._EPISODE_SIZE here raised
+        # AttributeError and crashed execute_command, failing the whole session.
         episode_cmds = session.commands_executed[
-            -self._EPISODE_SIZE:
+            -session._EPISODE_SIZE:
         ] if session.commands_executed else []
 
         lines: List[str] = [
             f"=== EPISODE {episode_num} SUMMARY "
-            f"(commands {max(0, len(session.commands_executed) - self._EPISODE_SIZE + 1)}"
+            f"(commands {max(0, len(session.commands_executed) - session._EPISODE_SIZE + 1)}"
             f"–{len(session.commands_executed)}) ===",
         ]
 
