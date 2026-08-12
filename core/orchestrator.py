@@ -285,6 +285,13 @@ class Session:
         self._auto_pivot_count: int = 0
         self._MAX_AUTO_PIVOTS: int = int(os.getenv("MAX_AUTO_PIVOTS", "6"))
 
+        # Empty-response recovery: the LLM (esp. local Ollama / DeepSeek) sometimes
+        # returns valid JSON with an EMPTY suggested_command. Without handling, the
+        # agentic loop silently halts at status=ready. We retry with an explicit
+        # directive up to _MAX_EMPTY_RETRIES, then halt visibly.
+        self._empty_response_count: int = 0
+        self._MAX_EMPTY_RETRIES: int = int(os.getenv("MAX_EMPTY_RETRIES", "3"))
+
     def to_dict(self) -> Dict:
         """Convert session to dictionary."""
         return {
@@ -1282,12 +1289,17 @@ class Orchestrator:
             f"{len(session.vulnerabilities)} total finding(s) recorded"
         )
 
-    async def _analyze_with_ai(self, session_id: str):
-        """Analyze scan results with AI."""
+    async def _analyze_with_ai(self, session_id: str, force_command: bool = False):
+        """Analyze scan results with AI.
+
+        force_command: when True, append a hard directive instructing the model to
+        return a concrete non-empty command. Used by _handle_empty_command() to
+        recover from empty-command responses that would otherwise stall the loop.
+        """
         session = self.sessions.get(session_id)
         if not session:
             return
-        
+
         logger.info(f"Starting AI analysis for {session_id}")
         
         try:
@@ -1313,6 +1325,18 @@ class Orchestrator:
                     + "\nThese vectors have been looped on and abandoned. "
                     "Choose a DIFFERENT service, port, or technique. "
                     "Do not suggest any command that targets an exhausted vector.\n"
+                )
+
+            # Force-command directive — appended when recovering from an empty
+            # response so the model is compelled to emit a concrete next command.
+            if force_command:
+                _exhausted_ctx += (
+                    "\n=== MANDATORY: RETURN A CONCRETE COMMAND ===\n"
+                    "Your previous response had an EMPTY suggested_command. That is not "
+                    "acceptable. You MUST return a single concrete, non-interactive shell "
+                    "command in suggested_command that advances the engagement toward the "
+                    "objective. Pick the most promising untried service or technique. "
+                    "Do NOT return an empty command.\n"
                 )
 
             _shell_ctx = ""
@@ -1418,20 +1442,27 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # Persist stage + status so a restart resumes from the correct point.
             self._save_session_status(session_id, session)
 
-            _cmd = ai_response.suggested_command
+            _cmd = (ai_response.suggested_command or "").strip()
             logger.info(f"AI analysis completed for {session_id}, suggested command: {_cmd}")
+
+            # Empty command → the loop would silently stall. Route to recovery.
+            if not _cmd:
+                await self._handle_empty_command(session_id, "analyze")
+                return
+
+            # A real command was produced — reset the empty-response counter.
+            session._empty_response_count = 0
 
             # Kick off execution or queue for approval.
             # When auto_approve=True the session operator has accepted full autonomy —
             # treat it identically to FULL_AUTO_MODE (all risk levels auto-execute).
-            if _cmd:
-                if FULL_AUTO_MODE or session.auto_approve:
-                    logger.info(f"Auto-executing initial command for session {session_id}: {_cmd[:100]}")
-                    asyncio.create_task(self.execute_command(session_id, _cmd))
-                else:
-                    self.queue_for_approval(session_id, _cmd)
-                    logger.info(f"Initial command queued for approval: {_cmd[:100]}")
-            
+            if FULL_AUTO_MODE or session.auto_approve:
+                logger.info(f"Auto-executing initial command for session {session_id}: {_cmd[:100]}")
+                asyncio.create_task(self.execute_command(session_id, _cmd))
+            else:
+                self.queue_for_approval(session_id, _cmd)
+                logger.info(f"Initial command queued for approval: {_cmd[:100]}")
+
         except Exception as e:
             logger.error(f"AI analysis failed for session {session_id}: {e}")
             session.status = "failed"
@@ -2195,6 +2226,14 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     _queued_already = True
                     self.queue_for_approval(session_id, ai_response.suggested_command)
 
+            # Empty command → recover instead of silently stalling / queuing "".
+            if not (ai_response.suggested_command or "").strip():
+                await self._handle_empty_command(session_id, "post_command")
+                return
+
+            # A real command was produced — reset the empty-response counter.
+            session._empty_response_count = 0
+
             if should_auto_execute:
                 # Check for critical findings in output to reset auto depth counter
                 output_lower = output.lower()
@@ -2215,9 +2254,29 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 # Manual mode (auto_approve=False, FULL_AUTO_MODE=False) and no prior queue call.
                 # Queue for operator review regardless of risk level — don't silently drop commands.
                 self.queue_for_approval(session_id, ai_response.suggested_command)
-            
+
         except Exception as e:
-            logger.error(f"Failed to process command output: {e}")
+            # Do NOT silently die — a swallowed exception here leaves the session
+            # stuck at status=ready with no pending command and no visible reason.
+            logger.error(f"Failed to process command output for {session_id}: {e}", exc_info=True)
+            _sess = self.sessions.get(session_id)
+            if _sess:
+                _sess.status = "ready"
+                _d = {
+                    "timestamp": datetime.now().isoformat(),
+                    "reasoning": (
+                        f"Loop error while analyzing command output: {e}. "
+                        "Auto-execution paused. Click Resume to retry, or run the next "
+                        "step manually via the Command Console."
+                    ),
+                    "suggested_command": "",
+                    "risk_level": "high",
+                    "confidence": 1.0,
+                    "context": "loop_error",
+                }
+                _sess.ai_decisions.append(_d)
+                self._save_ai_decision(session_id, _d)
+                self._save_session_status(session_id, _sess)
     
     def approve_command(self, session_id: str, command_id: str) -> Dict:
         """Approve and execute a pending command."""
@@ -2367,6 +2426,54 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             conn.close()
         except sqlite3.Error as e:
             logger.warning(f"Failed to persist session status for {session_id}: {e}")
+
+    async def _handle_empty_command(self, session_id: str, source: str) -> None:
+        """Recover when the AI returns a valid response but an EMPTY command.
+
+        This is the #1 cause of the loop silently stalling at status=ready with
+        no pending command and no error. Instead of dying quietly we:
+          1. Retry the analysis up to _MAX_EMPTY_RETRIES times, each time nudging
+             the model to emit a concrete next command.
+          2. After the cap, log a visible 'no_next_step' decision and set the
+             session to 'ready' so the operator sees the AI is out of ideas.
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        session._empty_response_count += 1
+        logger.warning(
+            f"Session {session_id}: AI returned EMPTY command from {source} "
+            f"(attempt {session._empty_response_count}/{session._MAX_EMPTY_RETRIES})."
+        )
+
+        if session._empty_response_count > session._MAX_EMPTY_RETRIES:
+            session._empty_response_count = 0
+            session.status = "ready"
+            _d = {
+                "timestamp": datetime.now().isoformat(),
+                "reasoning": (
+                    "AI returned no next command after "
+                    f"{session._MAX_EMPTY_RETRIES} retries. The model may consider the "
+                    "current stage complete, or is failing to produce valid output. "
+                    "Advance the stage manually via the Command Console, or click "
+                    "Resume to ask again."
+                ),
+                "suggested_command": "",
+                "risk_level": "low",
+                "confidence": 1.0,
+                "context": "no_next_step",
+            }
+            session.ai_decisions.append(_d)
+            self._save_ai_decision(session_id, _d)
+            self._save_session_status(session_id, session)
+            return
+
+        # Retry: re-run analysis with a directive forcing a concrete command.
+        session.status = "analyzing"
+        self._save_session_status(session_id, session)
+        await asyncio.sleep(2)
+        await self._analyze_with_ai(session_id, force_command=True)
 
     async def _auto_pivot(self, session_id: str, loop_reason: str) -> None:
         """Auto-pivot when the AI loops on a failing attack vector.
