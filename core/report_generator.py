@@ -138,6 +138,10 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
     commands: List[Dict]            = session_report.get("commands_executed", [])
     credentials: List[Dict]         = session_report.get("credentials", [])
     ai_decisions: List[Dict]        = session_report.get("ai_decisions", [])
+    compromises: List[Dict]         = session.get("compromise_evidence", []) or []
+    strategic_plan: List[Dict]      = session.get("strategic_plan", []) or []
+    operator_instructions: List[str] = session.get("operator_instructions", []) or []
+    reflections: List[str]          = session.get("reflections", []) or []
 
     if not output_path:
         output_path = f"/tmp/kmn_report_{session_id[:12]}.docx"
@@ -411,6 +415,80 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
     doc.add_paragraph("")
 
     # ============================================================
+    # 4a. CONFIRMED COMPROMISES
+    # ============================================================
+    _add_section_heading(doc, "4.1  Confirmed Compromises")
+    if compromises:
+        cmp_headers = ["#", "Service:Port", "Host", "Privilege", "Via Command", "Signal"]
+        cmp_widths  = [int(total_w * p) for p in [0.05, 0.16, 0.15, 0.14, 0.34, 0.16]]
+        cmp_widths[-1] = total_w - sum(cmp_widths[:-1])
+        ctab = doc.add_table(rows=1 + len(compromises), cols=6)
+        ctab.style = "Table Grid"
+        _add_table_header_row(ctab, cmp_headers, cmp_widths)
+        for i, comp in enumerate(compromises):
+            row = ctab.rows[i + 1]
+            vals = [
+                str(i + 1),
+                f"{comp.get('service','?')}:{comp.get('port','?')}",
+                str(comp.get("host") or ""),
+                str(comp.get("privilege") or "?"),
+                (comp.get("command") or "")[:60],
+                (comp.get("signal") or "")[:20],
+            ]
+            for j, (cell, val, w) in enumerate(zip(row.cells, vals, cmp_widths)):
+                cell.width = w
+                run = cell.paragraphs[0].add_run(val)
+                run.font.size = Pt(8)
+                if j == 3 and "root" in str(comp.get("privilege", "")).lower():
+                    run.bold = True
+                    run.font.color.rgb = RGBColor(*_RISK_COLORS["high"])
+        # Proof snippets
+        for i, comp in enumerate(compromises):
+            proof = (comp.get("proof") or "").strip()
+            if not proof:
+                continue
+            pp = doc.add_paragraph()
+            pr = pp.add_run(f"[{i+1}] proof ({comp.get('service','?')}:{comp.get('port','?')}):")
+            pr.bold = True
+            pr.font.size = Pt(8)
+            op = doc.add_paragraph()
+            op.paragraph_format.left_indent = Inches(0.3)
+            orr = op.add_run(proof[:500])
+            orr.font.name = "Courier New"
+            orr.font.size = Pt(7)
+    else:
+        doc.add_paragraph("No confirmed code-execution / shell access was recorded.")
+
+    doc.add_paragraph("")
+
+    # ============================================================
+    # 4b. ATTACK PLAN & OPERATOR STEERING
+    # ============================================================
+    _add_section_heading(doc, "4.2  Attack Plan & Operator Steering")
+    if strategic_plan:
+        pp = doc.add_paragraph()
+        pp.add_run("Strategic plan (AI planner):").bold = True
+        for step in strategic_plan:
+            sp = doc.add_paragraph(style="List Bullet")
+            sp.add_run(f"[{step.get('status','pending')}] {step.get('step','')}").font.size = Pt(9)
+    if operator_instructions:
+        pp = doc.add_paragraph()
+        pp.add_run("Operator steering instructions (chronological):").bold = True
+        for instr in operator_instructions:
+            ip = doc.add_paragraph(style="List Bullet")
+            ip.add_run(str(instr)).font.size = Pt(9)
+    if reflections:
+        pp = doc.add_paragraph()
+        pp.add_run("Latest strategist reflections:").bold = True
+        for refl in reflections[-3:]:
+            rp = doc.add_paragraph(style="List Bullet")
+            rp.add_run(str(refl)[:400]).font.size = Pt(9)
+    if not (strategic_plan or operator_instructions or reflections):
+        doc.add_paragraph("No strategic plan or operator instructions recorded.")
+
+    doc.add_paragraph("")
+
+    # ============================================================
     # 5. EXECUTED COMMANDS LOG
     # ============================================================
     _add_section_heading(doc, "5. Executed Commands Log")
@@ -444,34 +522,51 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
         doc.add_paragraph("No commands executed in this session.")
 
     # ============================================================
-    # 6. AI DECISIONS SUMMARY (last 10)
+    # 6. ATTACK DECISIONS & IDEAS (full, chronological)
     # ============================================================
     if ai_decisions:
         doc.add_page_break()
-        _add_section_heading(doc, "6. AI Decision Log (last 10)")
-        for decision in ai_decisions[-10:]:
+        _add_section_heading(
+            doc, f"6. Attack Decisions & Ideas — chronological ({len(ai_decisions)})"
+        )
+        _CTX_TAG = {
+            "auto_pivot": "PIVOT", "pivot_limit_reached": "PIVOT-LIMIT",
+            "loop_prevention": "LOOP", "loop_error": "ERROR",
+            "no_next_step": "NO-STEP", "watchdog_stalled": "WATCHDOG",
+            "operator_instruction": "OPERATOR", "handler_started": "LISTENER",
+            "shell_caught": "SHELL", "self_critique_reject": "VETOED",
+        }
+        for idx, decision in enumerate(ai_decisions, 1):
+            ctx = decision.get("context", "")
+            tag = _CTX_TAG.get(ctx, "")
+            ts = (decision.get("timestamp") or "")[:19].replace("T", " ")
             p = doc.add_paragraph()
-            tr2 = p.add_run(f"Phase: {decision.get('attack_phase','?')}  |  "
-                            f"Risk: {decision.get('risk_level','?')}  |  "
-                            f"Confidence: {decision.get('confidence', 0):.0%}")
+            head = f"[{idx}] {ts}  |  Phase: {decision.get('attack_phase', ctx or '?')}"
+            if decision.get("risk_level"):
+                head += f"  |  Risk: {decision.get('risk_level')}"
+            if tag:
+                head += f"  |  {tag}"
+            tr2 = p.add_run(head)
             tr2.bold = True
             tr2.font.size = Pt(9)
+            if tag in ("SHELL", "OPERATOR"):
+                tr2.font.color.rgb = RGBColor(*_RISK_COLORS["high"])
 
-            cmd_p = doc.add_paragraph()
-            cmd_p.paragraph_format.left_indent = Inches(0.3)
-            cr = cmd_p.add_run(f"Suggested: {decision.get('suggested_command','')[:120]}")
-            cr.font.name = "Courier New"
-            cr.font.size = Pt(8)
+            cmd = (decision.get("suggested_command") or "").strip()
+            if cmd:
+                cmd_p = doc.add_paragraph()
+                cmd_p.paragraph_format.left_indent = Inches(0.3)
+                cr = cmd_p.add_run(f"$ {cmd[:160]}")
+                cr.font.name = "Courier New"
+                cr.font.size = Pt(8)
 
-            reasoning = (decision.get("reasoning") or "")[:400]
+            reasoning = (decision.get("reasoning") or "")[:600]
             if reasoning:
                 rp = doc.add_paragraph()
                 rp.paragraph_format.left_indent = Inches(0.3)
                 rr = rp.add_run(reasoning)
                 rr.font.size = Pt(8)
                 rr.font.color.rgb = RGBColor(0x33, 0x33, 0x55)
-
-            doc.add_paragraph("")
 
     # ============================================================
     # DISCLAIMER FOOTER
@@ -497,6 +592,258 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
 
     doc.save(output_path)
     logger.info(f"Report saved to {output_path}")
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# Markdown report generator — pure Python, ZERO dependencies. Always available
+# (no python-docx / fpdf2 needed), so it's the reliable fallback format. Renders
+# EVERYTHING the session captured, in order: findings, all executed commands,
+# and every attack decision/idea chronologically.
+# ---------------------------------------------------------------------------
+
+def generate_markdown_report(session_report: Dict, output_path: Optional[str] = None) -> str:
+    """Build a complete Markdown pentest report from a session report dict.
+
+    Includes (in order): metadata, executive summary, discovered services,
+    vulnerability findings, credentials, confirmed compromises, attack plan +
+    operator steering, the FULL executed-command log (chronological, with output),
+    and the FULL attack-decision/idea log (chronological). No third-party deps.
+    """
+    session = session_report.get("session", {})
+    sid = session.get("session_id", "unknown")
+    target_ip = session.get("target_ip", "N/A")
+    target_domain = session.get("target_domain") or ""
+    created = (session.get("created_at") or "")[:19].replace("T", " ")
+    status = session.get("status", "unknown")
+    stage = session.get("current_stage", "unknown")
+    gen = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+
+    services = session_report.get("discovered_services", []) or []
+    hosts = session_report.get("discovered_hosts", []) or []
+    vulns = session_report.get("vulnerabilities", []) or []
+    commands = session_report.get("commands_executed", []) or []
+    creds = session_report.get("credentials", []) or []
+    decisions = session_report.get("ai_decisions", []) or []
+    compromises = session.get("compromise_evidence", []) or []
+    plan = session.get("strategic_plan", []) or []
+    operator_instructions = session.get("operator_instructions", []) or []
+    reflections = session.get("reflections", []) or []
+    exhausted = session.get("exhausted_services", []) or []
+
+    high = sum(1 for v in vulns if v.get("risk_level") == "high")
+    med = sum(1 for v in vulns if v.get("risk_level") == "medium")
+    low = sum(1 for v in vulns if v.get("risk_level") == "low")
+
+    def esc(x) -> str:
+        # Keep table cells intact: strip newlines and escape pipes.
+        return str(x if x is not None else "").replace("|", "\\|").replace("\n", " ").strip()
+
+    L: List[str] = []
+    a = L.append
+
+    a(f"# KMN-CyberSeek — Penetration Test Report")
+    a("")
+    a(f"**Target:** `{target_ip}`" + (f" / `{target_domain}`" if target_domain else ""))
+    a(f"**Session ID:** `{sid}`  ")
+    a(f"**Created:** {created}  ")
+    a(f"**Report generated:** {gen}  ")
+    a(f"**Final status:** {status}  **Final stage:** {stage}")
+    a("")
+    a("---")
+    a("")
+
+    # 1. Executive summary
+    a("## 1. Executive Summary")
+    a("")
+    a(f"An AI-directed penetration test of **{target_ip}**"
+      + (f" ({target_domain})" if target_domain else "")
+      + f" discovered **{len(hosts)} host(s)** and **{len(services)} service(s)**. "
+      + f"**{len(vulns)} vulnerability finding(s)** were recorded "
+      + f"({high} high, {med} medium, {low} low), "
+      + f"**{len(creds)} credential(s)** captured, "
+      + f"**{len(compromises)} confirmed compromise(s)**, "
+      + f"across **{len(commands)} executed command(s)** and "
+      + f"**{len(decisions)} AI decision(s)**.")
+    a("")
+
+    # 2. Services
+    a("## 2. Discovered Services")
+    a("")
+    if services:
+        a("| Host | Port | Service | Version | State |")
+        a("|------|------|---------|---------|-------|")
+        for s in services:
+            a(f"| {esc(s.get('host') or target_ip)} | {esc(s.get('port'))} | "
+              f"{esc(s.get('service'))} | {esc(s.get('version'))} | "
+              f"{esc(s.get('state') or s.get('test_state') or 'open')} |")
+    else:
+        a("_No services discovered._")
+    a("")
+
+    # 3. Vulnerabilities
+    a("## 3. Vulnerability Findings")
+    a("")
+    if vulns:
+        ordered = sorted(vulns, key=lambda v: {"high": 0, "medium": 1, "low": 2}
+                         .get(v.get("risk_level", ""), 3))
+        a("| # | Risk | Name | Host:Port | CVE(s) | Source | Status |")
+        a("|---|------|------|-----------|--------|--------|--------|")
+        for i, v in enumerate(ordered, 1):
+            cids = v.get("cve_ids") or []
+            if isinstance(cids, str):
+                cids = [cids]
+            hp = esc(v.get("host") or "")
+            if v.get("port"):
+                hp += f":{v.get('port')}"
+            a(f"| {i} | {esc((v.get('risk_level') or 'unknown').upper())} | "
+              f"{esc(v.get('name'))} | {hp} | {esc(', '.join(cids) or '—')} | "
+              f"{esc(v.get('source_tool'))} | {esc(v.get('status') or 'confirmed')} |")
+        a("")
+        # Details for high/medium
+        detail = [v for v in ordered if v.get("risk_level") in ("high", "medium")]
+        if detail:
+            a("### 3.1 Finding Details")
+            a("")
+            for i, v in enumerate(detail, 1):
+                a(f"**[{i}] {v.get('name') or 'Unnamed'}** "
+                  f"({(v.get('risk_level') or '').upper()})")
+                if v.get("description"):
+                    a(f"- Description: {esc(v.get('description'))[:600]}")
+                if v.get("service_version"):
+                    a(f"- Affected: {esc(v.get('service_version'))}")
+                cids = v.get("cve_ids") or []
+                if cids:
+                    a(f"- CVE(s): {esc(', '.join(cids if isinstance(cids, list) else [cids]))}")
+                refs = v.get("reference_urls") or []
+                if refs:
+                    a(f"- References: {esc('; '.join(refs[:3]))}")
+                a("")
+    else:
+        a("_No vulnerabilities recorded._")
+    a("")
+
+    # 4. Credentials
+    a("## 4. Credentials Captured")
+    a("")
+    if creds:
+        a("| Username | Secret | Type | Service | Discovered |")
+        a("|----------|--------|------|---------|------------|")
+        for c in creds:
+            a(f"| {esc(c.get('username'))} | {esc((c.get('secret') or '')[:64])} | "
+              f"{esc(c.get('secret_type') or 'password')} | {esc(c.get('service'))} | "
+              f"{esc((c.get('discovered_at') or '')[:19])} |")
+    else:
+        a("_No credentials captured._")
+    a("")
+
+    # 4.1 Confirmed compromises
+    a("## 4.1 Confirmed Compromises")
+    a("")
+    if compromises:
+        a("| # | Service:Port | Host | Privilege | Via | Signal |")
+        a("|---|--------------|------|-----------|-----|--------|")
+        for i, c in enumerate(compromises, 1):
+            a(f"| {i} | {esc(c.get('service'))}:{esc(c.get('port'))} | {esc(c.get('host'))} | "
+              f"**{esc(c.get('privilege'))}** | {esc((c.get('command') or '')[:70])} | "
+              f"{esc(c.get('signal'))} |")
+        a("")
+        for i, c in enumerate(compromises, 1):
+            if c.get("proof"):
+                a(f"Proof [{i}] — {esc(c.get('service'))}:{esc(c.get('port'))}:")
+                a("```")
+                a(str(c.get("proof"))[:600])
+                a("```")
+    else:
+        a("_No confirmed code-execution / shell access recorded._")
+    a("")
+
+    # 4.2 Attack plan & operator steering
+    a("## 4.2 Attack Plan & Operator Steering")
+    a("")
+    if plan:
+        a("**Strategic plan (AI planner):**")
+        for step in plan:
+            a(f"- [{esc(step.get('status') or 'pending')}] {esc(step.get('step'))}")
+        a("")
+    if operator_instructions:
+        a("**Operator steering instructions (chronological):**")
+        for ins in operator_instructions:
+            a(f"- {esc(ins)}")
+        a("")
+    if reflections:
+        a("**Latest strategist reflections:**")
+        for r in reflections[-3:]:
+            a(f"- {esc(r)[:400]}")
+        a("")
+    if exhausted:
+        a(f"**Exhausted vectors:** {esc(', '.join(exhausted))}")
+        a("")
+    if not (plan or operator_instructions or reflections or exhausted):
+        a("_No strategic plan or operator instructions recorded._")
+        a("")
+
+    # 5. Executed commands (full, chronological)
+    a(f"## 5. Executed Commands Log ({len(commands)})")
+    a("")
+    if commands:
+        for i, cmd in enumerate(commands, 1):
+            ok = "✓" if cmd.get("success") else "✗"
+            ts = (cmd.get("timestamp") or "")[:19].replace("T", " ")
+            a(f"**[{i}] {ok} `{esc(cmd.get('command'))}`**  \n_{ts}_")
+            out = (cmd.get("output") or "").strip()
+            if out:
+                a("```")
+                a(out[:1500])
+                a("```")
+            a("")
+    else:
+        a("_No commands executed._")
+    a("")
+
+    # 6. Attack decisions & ideas (full, chronological)
+    a(f"## 6. Attack Decisions & Ideas — chronological ({len(decisions)})")
+    a("")
+    _CTX_TAG = {
+        "auto_pivot": "PIVOT", "pivot_limit_reached": "PIVOT-LIMIT",
+        "loop_prevention": "LOOP", "loop_error": "ERROR", "no_next_step": "NO-STEP",
+        "watchdog_stalled": "WATCHDOG", "operator_instruction": "OPERATOR",
+        "handler_started": "LISTENER", "shell_caught": "SHELL",
+        "self_critique_reject": "VETOED",
+    }
+    if decisions:
+        for i, d in enumerate(decisions, 1):
+            ctx = d.get("context", "")
+            tag = _CTX_TAG.get(ctx, "")
+            ts = (d.get("timestamp") or "")[:19].replace("T", " ")
+            head = (f"**[{i}] {ts} · {esc(d.get('attack_phase', ctx or '?'))}**"
+                    + (f" · _{esc(d.get('risk_level'))}_" if d.get("risk_level") else "")
+                    + (f" · **{tag}**" if tag else ""))
+            a(head)
+            cmd = (d.get("suggested_command") or "").strip()
+            if cmd:
+                a(f"- Suggested: `{esc(cmd)}`")
+            reason = (d.get("reasoning") or "").strip()
+            if reason:
+                a(f"- Reasoning: {esc(reason)[:800]}")
+            a("")
+    else:
+        a("_No AI decisions recorded._")
+    a("")
+
+    a("---")
+    a("")
+    a("> **Legal disclaimer.** Generated by KMN-CyberSeek. All activity herein was "
+      "performed only against systems with explicit prior written authorisation. "
+      "Findings from unverified web research must be independently corroborated. "
+      "The operator is solely responsible for the legality and scope of all testing.")
+    a("")
+
+    if not output_path:
+        output_path = f"/tmp/kmn_report_{sid[:12]}.md"
+    with open(output_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(L))
+    logger.info(f"Markdown report saved to {output_path}")
     return output_path
 
 
@@ -535,10 +882,15 @@ def generate_pdf_report(session_report: Dict, output_path: Optional[str] = None)
     generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     vulns: List[Dict] = session_report.get("vulnerabilities", [])
-    commands: List[Dict] = session_report.get("commands", [])
-    services: List[Dict] = session_report.get("services", [])
+    # NOTE: get_session_report() uses keys 'commands_executed' and
+    # 'discovered_services' — the old 'commands'/'services' keys were wrong and
+    # silently produced empty sections.
+    commands: List[Dict] = session_report.get("commands_executed", []) or session_report.get("commands", [])
+    services: List[Dict] = session_report.get("discovered_services", []) or session_report.get("services", [])
     credentials: List[Dict] = session_report.get("credentials", [])
     ai_decisions: List[Dict] = session_report.get("ai_decisions", [])
+    compromises: List[Dict] = meta.get("compromise_evidence", []) or []
+    operator_instructions: List[str] = meta.get("operator_instructions", []) or []
 
     # Risk summary
     high_c = sum(1 for v in vulns if v.get("risk_level") == "high")
@@ -631,7 +983,15 @@ def generate_pdf_report(session_report: Dict, output_path: Optional[str] = None)
             host = v.get("host", "—")
             port = v.get("port") or "—"
             svc  = v.get("service", "—")
-            cves = ", ".join(json.loads(v.get("cve_ids") or "[]") or []) or "—"
+            # cve_ids is already a list (get_session_report); tolerate a JSON
+            # string too, for safety.
+            _cids = v.get("cve_ids") or []
+            if isinstance(_cids, str):
+                try:
+                    _cids = json.loads(_cids)
+                except Exception:
+                    _cids = [_cids] if _cids else []
+            cves = ", ".join(_cids) or "—"
             desc = v.get("description", "")
 
             # Risk colour
@@ -692,19 +1052,66 @@ def generate_pdf_report(session_report: Dict, output_path: Optional[str] = None)
             pdf.ln()
         pdf.ln(2)
 
-    # ── Commands ──────────────────────────────────────────────────────────
+    # ── Confirmed compromises ─────────────────────────────────────────────
+    if compromises:
+        _h1(f"Confirmed Compromises ({len(compromises)})")
+        for i, comp in enumerate(compromises, start=1):
+            priv = str(comp.get("privilege", "?"))
+            rc = (211, 47, 47) if ("root" in priv.lower() or "system" in priv.lower()
+                                   or "admin" in priv.lower()) else (245, 127, 23)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(*rc)
+            pdf.cell(0, 6, f"{i}. {comp.get('service','?')}:{comp.get('port','?')} "
+                           f"on {comp.get('host','?')} - {priv}", ln=True)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.multi_cell(0, 5, f"via: {str(comp.get('command',''))[:160]}")
+            proof = str(comp.get("proof") or "").strip()
+            if proof:
+                pdf.set_font("Helvetica", "I", 7)
+                pdf.multi_cell(0, 4, proof[:300])
+            pdf.ln(1)
+
+    # ── Operator steering ─────────────────────────────────────────────────
+    if operator_instructions:
+        _h1(f"Operator Steering Instructions ({len(operator_instructions)})")
+        pdf.set_font("Helvetica", "", 8)
+        for i, instr in enumerate(operator_instructions, start=1):
+            pdf.multi_cell(0, 5, f"{i}. {str(instr)[:200]}")
+        pdf.ln(1)
+
+    # ── Commands (full, chronological) ────────────────────────────────────
     if commands:
         _h1(f"Commands Log ({len(commands)})")
-        for i, cmd in enumerate(commands[-30:], start=1):   # last 30 max
+        for i, cmd in enumerate(commands, start=1):
             ok = cmd.get("success", False)
             pdf.set_font("Helvetica", "B", 8)
             pdf.set_text_color(30, 100, 30) if ok else pdf.set_text_color(180, 30, 30)
-            pdf.cell(0, 5, f"{'✓' if ok else '✗'}  {str(cmd.get('command', ''))[:100]}", ln=True)
+            pdf.cell(0, 5, f"{i}. {'✓' if ok else '✗'}  {str(cmd.get('command', ''))[:100]}", ln=True)
             pdf.set_text_color(0, 0, 0)
             pdf.set_font("Helvetica", "", 7)
             out = str(cmd.get("output") or "").strip()[:400]
             if out:
                 pdf.multi_cell(0, 4, out)
+            pdf.ln(1)
+
+    # ── Attack decisions & ideas (full, chronological) ────────────────────
+    if ai_decisions:
+        _h1(f"Attack Decisions & Ideas ({len(ai_decisions)})")
+        for i, d in enumerate(ai_decisions, start=1):
+            ctx = d.get("context", "")
+            pdf.set_font("Helvetica", "B", 8)
+            pdf.multi_cell(0, 5, f"{i}. [{(d.get('timestamp') or '')[:19]}] "
+                                 f"{d.get('attack_phase', ctx or '?')}"
+                                 + (f"  ({ctx})" if ctx else ""))
+            cmd = str(d.get("suggested_command") or "").strip()
+            if cmd:
+                pdf.set_font("Helvetica", "", 7)
+                pdf.multi_cell(0, 4, f"$ {cmd[:160]}")
+            reason = str(d.get("reasoning") or "").strip()
+            if reason:
+                pdf.set_font("Helvetica", "I", 7)
+                pdf.multi_cell(0, 4, reason[:300])
             pdf.ln(1)
 
     # ── Legal disclaimer ──────────────────────────────────────────────────

@@ -4,6 +4,14 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.2.2] — 2026-08-12
+
+### Added
+- **Markdown report (zero-dependency)** — new `📝 Download Markdown Report` button + `GET /api/sessions/{id}/report/md`. Pure Python, no `python-docx`/`fpdf2` needed, so it always works. Renders the FULL engagement in order: metadata, executive summary, services, vulnerability findings (+ details), credentials, **confirmed compromises with proof snippets**, attack plan + operator steering + exhausted vectors, the **complete executed-command log (chronological, with output)**, and **every attack decision/idea (chronological, with pivot/operator/shell tags)**. Regression-tested (`tests/test_report.py`).
+
+### Fixed
+- **DOCX/PDF reports were incomplete or broken.** DOCX truncated the AI decision log to the last 10 and omitted confirmed compromises, the attack plan, and operator steering. The PDF read the wrong session keys (`commands`/`services` instead of `commands_executed`/`discovered_services`) — producing empty command/service sections — and crashed on `cve_ids` (already a list, not JSON). All now render every finding, command, and decision in order; DOCX adds Confirmed Compromises + Attack Plan & Operator Steering sections and the full chronological decision log.
+
 ## [2.2.1] — 2026-08-12
 
 ### Changed

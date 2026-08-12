@@ -1321,24 +1321,43 @@ def show_session_overview(session_details: Dict):
             time.sleep(0.5)
             st.rerun()
 
-    # Report download
-    if st.button("📄 Download DOCX Report", use_container_width=True):
-        with st.spinner("Generating report…"):
-            try:
-                resp = api_session.get(f"{API_BASE}/sessions/{session_id}/report", timeout=60)
-                if resp.status_code == 200:
-                    st.download_button(
-                        label="💾 Save DOCX",
-                        data=resp.content,
-                        file_name=f"kmn_report_{session_id[:12]}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True,
-                    )
-                else:
-                    st.error(f"Report generation failed ({resp.status_code}): {resp.text[:200]}")
-            except Exception as e:
-                st.error(f"Could not reach backend: {e}")
-    
+    # Report download — Markdown (no deps, always works) + DOCX.
+    rep_col1, rep_col2 = st.columns(2)
+    with rep_col1:
+        if st.button("📝 Download Markdown Report", use_container_width=True):
+            with st.spinner("Generating report…"):
+                try:
+                    resp = api_session.get(f"{API_BASE}/sessions/{session_id}/report/md", timeout=60)
+                    if resp.status_code == 200:
+                        st.download_button(
+                            label="💾 Save Markdown (.md)",
+                            data=resp.content,
+                            file_name=f"kmn_report_{session_id[:12]}.md",
+                            mime="text/markdown",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.error(f"Report failed ({resp.status_code}): {resp.text[:200]}")
+                except Exception as e:
+                    st.error(f"Could not reach backend: {e}")
+    with rep_col2:
+        if st.button("📄 Download DOCX Report", use_container_width=True):
+            with st.spinner("Generating report…"):
+                try:
+                    resp = api_session.get(f"{API_BASE}/sessions/{session_id}/report", timeout=60)
+                    if resp.status_code == 200:
+                        st.download_button(
+                            label="💾 Save DOCX",
+                            data=resp.content,
+                            file_name=f"kmn_report_{session_id[:12]}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.error(f"DOCX needs python-docx ({resp.status_code}). Use Markdown instead.")
+                except Exception as e:
+                    st.error(f"Could not reach backend: {e}")
+
     # ── Steer / Ask the AI ────────────────────────────────────────────────────
     # Modern Streamlit shows the floating 💬 chat bubble (bottom-right, rendered in
     # display_session_details). Only fall back to an inline panel when st.popover
