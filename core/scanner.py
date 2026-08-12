@@ -6,16 +6,66 @@ Handles network scanning and reconnaissance operations.
 import asyncio
 import json
 import logging
+import os
 import re
 import shlex
+import signal
 import subprocess
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import nmap  # python-nmap
 
 from core.validators import is_valid_target, is_cidr
 
 logger = logging.getLogger(__name__)
+
+
+async def _kill_process_group(process) -> None:
+    """Kill the entire process group of a shell-launched command.
+
+    CRITICAL: commands are launched via create_subprocess_shell, so `process`
+    is the `/bin/sh` wrapper and the real tool (nmap, etc.) is its CHILD.
+    Calling process.kill() alone kills only the shell — the child keeps running
+    and holds the stdout pipe open, so a following communicate() BLOCKS until the
+    child finishes on its own (this made scan timeouts never actually fire).
+    Killing the whole process group (requires start_new_session=True at launch)
+    terminates the child too. Best-effort — never raises.
+    """
+    if process.returncode is not None:
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+
+async def _run_shell_bounded(cmd: str, timeout: int, cwd: str = "/tmp"
+                             ) -> Tuple[bytes, bytes, Optional[int], bool]:
+    """Run a shell command in its own process group with a hard timeout that
+    kills the whole tree. Returns (stdout, stderr, returncode, timed_out).
+    On timeout, whatever output the tool already produced is collected
+    best-effort so partial scan results are not lost."""
+    process = await asyncio.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        start_new_session=True,   # own process group → killable as a unit
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        return stdout, stderr, process.returncode, False
+    except asyncio.TimeoutError:
+        await _kill_process_group(process)
+        stdout, stderr = b"", b""
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+        except Exception:
+            pass
+        return stdout, stderr, process.returncode, True
 
 _CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 
@@ -65,17 +115,25 @@ class Scanner:
         import os as _os
         SCAN_TIMEOUT = int(_os.getenv("SCAN_TIMEOUT", "300"))
 
+        # Per-host nmap-internal time cap. Set a bit below SCAN_TIMEOUT so nmap
+        # bounds ITSELF and returns graceful partial results, rather than relying
+        # only on our external hard kill (which yields empty output). --max-retries
+        # keeps slow/filtered ports from dragging the whole scan out.
+        _host_timeout = max(60, SCAN_TIMEOUT - 60)
+        _bound = f"--host-timeout {_host_timeout}s --max-retries 2"
+
         # Define scan profiles.
-        # "full" previously used -p- (all 65535 ports) which takes hours on
-        # internet targets. Replaced with --top-ports 5000 + aggressive timing
-        # for a thorough-but-bounded scan. Use "allports" if you truly need -p-.
+        # NOTE: the initial recon ("default") deliberately drops -sC (default
+        # scripts). On hosts with many/slow services (RMI, JMX, GIOP, GlassFish)
+        # -sC version+script probing can take 10+ minutes; the AI queues targeted
+        # script/vuln scans later, and the background vuln pass runs NSE per port.
         scan_profiles = {
-            "quick":    "-T4 -F --open",                               # top 100, fast
-            "default":  "-T4 -sV -sC --top-ports 1000 --open",        # top 1000 + scripts
-            "full":     "-T4 -sV -sC --top-ports 5000 --open",        # top 5000 (bounded)
-            "stealth":  "-sS -T2 -sV --top-ports 1000 --open",        # stealth SYN
-            "vuln":     "-T4 -sV --script vuln --top-ports 1000",      # vuln NSE
-            "allports": "-T4 -sV -sC -p- --open",                     # all 65535 (slow!)
+            "quick":    f"-T4 -F --open {_bound}",                          # top 100, fast
+            "default":  f"-T4 -sV --top-ports 1000 --open {_bound}",        # top 1000, no scripts
+            "full":     f"-T4 -sV -sC --top-ports 5000 --open {_bound}",    # top 5000 + scripts
+            "stealth":  f"-sS -T2 -sV --top-ports 1000 --open {_bound}",    # stealth SYN
+            "vuln":     f"-T4 -sV --script vuln --top-ports 1000 {_bound}", # vuln NSE
+            "allports": f"-T4 -sV -sC -p- --open {_bound}",                 # all 65535 (slow!)
         }
 
         scan_options = scan_profiles.get(scan_type, scan_profiles["default"])
@@ -84,44 +142,52 @@ class Scanner:
             # target is validated above; shlex.quote is defense-in-depth against injection.
             cmd = f"nmap {scan_options} {shlex.quote(target)}"
 
-            process = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd="/tmp"
+            stdout, stderr, returncode, timed_out = await _run_shell_bounded(
+                cmd, SCAN_TIMEOUT
             )
+            raw_output = (stdout or b"").decode(errors="replace")
 
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=SCAN_TIMEOUT
+            if timed_out:
+                # nmap was force-killed at the hard cap. If it printed partial
+                # results before dying, parse and return them instead of nothing.
+                logger.warning(
+                    f"Nmap scan hit hard timeout ({SCAN_TIMEOUT}s) for {target}; "
+                    f"{'parsing partial output' if raw_output.strip() else 'no output captured'}"
                 )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.communicate()
-                logger.warning(f"Nmap scan timed out after {SCAN_TIMEOUT}s for {target}")
+                if raw_output.strip():
+                    parsed_results = self._parse_nmap_output(raw_output)
+                    return {
+                        "target": target,
+                        "success": True,
+                        "scan_type": scan_type,
+                        "scan_options": scan_options,
+                        "partial": True,
+                        "raw_output": raw_output,
+                        "parsed_results": parsed_results,
+                        "timestamp": self._get_timestamp(),
+                    }
                 return {
                     "target": target,
                     "success": False,
-                    "error": f"Scan timed out after {SCAN_TIMEOUT}s. Use a quicker scan type or increase SCAN_TIMEOUT in .env.",
+                    "error": f"Scan timed out after {SCAN_TIMEOUT}s with no output. "
+                             "Increase SCAN_TIMEOUT or use a quicker scan type.",
                     "raw_output": "",
                     "parsed_results": {}
                 }
 
-            if process.returncode != 0:
-                logger.error(f"Nmap scan failed: {stderr.decode()}")
+            if returncode != 0:
+                logger.error(f"Nmap scan failed: {(stderr or b'').decode(errors='replace')}")
                 return {
                     "target": target,
                     "success": False,
-                    "error": stderr.decode(),
-                    "raw_output": "",
+                    "error": (stderr or b"").decode(errors="replace"),
+                    "raw_output": raw_output,
                     "parsed_results": {}
                 }
-            
-            raw_output = stdout.decode()
-            
+
             # Parse the results
             parsed_results = self._parse_nmap_output(raw_output)
-            
+
             logger.info(f"Nmap scan completed for {target}, found {len(parsed_results.get('hosts', []))} hosts")
             
             return {
@@ -387,20 +453,12 @@ class Scanner:
                 f"{shlex.quote(target)}"
             )
 
-            process = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd="/tmp"
+            stdout, stderr, returncode, timed_out = await _run_shell_bounded(
+                cmd, VULN_SCAN_TIMEOUT
             )
+            raw_output = (stdout or b"").decode(errors="replace")
 
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=VULN_SCAN_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.communicate()
+            if timed_out and not raw_output.strip():
                 logger.warning(
                     f"Vulnerability scan timed out after {VULN_SCAN_TIMEOUT}s for {target} — "
                     "continuing without NSE vuln findings"
@@ -412,16 +470,16 @@ class Scanner:
                     "vulnerabilities": [],
                 }
 
-            if process.returncode != 0:
-                logger.error(f"Vulnerability scan failed: {stderr.decode()}")
+            if not timed_out and returncode not in (0, None):
+                logger.error(f"Vulnerability scan failed: {(stderr or b'').decode(errors='replace')}")
                 return {
                     "target": target,
                     "success": False,
-                    "error": stderr.decode(),
+                    "error": (stderr or b"").decode(errors="replace"),
                     "vulnerabilities": []
                 }
 
-            raw_output = stdout.decode()
+            # Parse whatever we got (full result, or partial output on timeout).
             vulnerabilities = self._parse_vulnerability_output(raw_output)
 
             logger.info(f"Vulnerability scan completed for {target}, found {len(vulnerabilities)} issues")
@@ -471,19 +529,9 @@ class Scanner:
                 f'--script "vuln and not intrusive" --script-timeout 20 '
                 f"{shlex.quote(target)}"
             )
-            process = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd="/tmp",
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.communicate()
+            stdout, stderr, returncode, timed_out = await _run_shell_bounded(cmd, timeout)
+            raw = (stdout or b"").decode(errors="replace")
+            if timed_out and not raw.strip():
                 logger.warning(f"Per-port vuln scan timed out after {timeout}s: {target}:{port}")
                 return {
                     "target": target, "port": port,
@@ -491,7 +539,6 @@ class Scanner:
                     "vulnerabilities": [], "raw_output": "",
                 }
 
-            raw = stdout.decode(errors="replace")
             vulns = self._parse_vulnerability_output(raw)
             logger.info(f"Per-port vuln scan done: {target}:{port} — {len(vulns)} finding(s)")
             return {
