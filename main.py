@@ -732,8 +732,11 @@ async def list_all_vulnerabilities(
     try:
         conn = _sqlite3.connect(orchestrator.db_path)
         conn.row_factory = _sqlite3.Row
+        # NOTE: the sessions table has target_ip + target_domain (no
+        # target_hostname / name columns). session_id doubles as the display name.
         query = """
-            SELECT v.*, s.target_ip, s.target_hostname, s.name AS session_name
+            SELECT v.*, s.target_ip, s.target_domain,
+                   s.session_id AS session_name
             FROM vulnerabilities v
             LEFT JOIN sessions s ON s.session_id = v.session_id
             WHERE 1=1
