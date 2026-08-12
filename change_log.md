@@ -4,6 +4,16 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.1.7] — 2026-08-12
+
+### Added
+- **Session History management** — the History page now lets you clean up recorded sessions (previously they could only accumulate):
+  - Per-session **🗑️ Delete** button on every card (failed/completed included), with an inline confirm.
+  - **🗑️ Clear ALL History** (two-step confirm) and **🧹 Clear Failed (N)** bulk actions.
+
+### Fixed
+- **Session delete left orphaned shell rows** — `delete_session` / `delete_all_sessions` now also clear the `shell_handlers` and `shell_sessions_log` tables and stop any live `ShellManager` for the deleted session(s).
+
 ## [2.1.6] — 2026-08-12
 
 ### Fixed

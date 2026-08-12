@@ -2679,6 +2679,51 @@ def show_history():
 
     st.markdown("---")
 
+    # ── Bulk history actions ──────────────────────────────────────────────────
+    act1, act2, _act3 = st.columns([1.2, 1.2, 2.6])
+    with act1:
+        if st.session_state.get("confirm_clear_all_history"):
+            st.warning("Delete **all** session history? This cannot be undone.")
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                if st.button("⚠️ Confirm", type="primary", key="confirm_clear_all_btn",
+                             use_container_width=True):
+                    r = api_session.delete(f"{API_BASE}/sessions")
+                    st.session_state.confirm_clear_all_history = False
+                    st.session_state.selected_session = None
+                    if r.status_code == 200:
+                        st.success("All history cleared.")
+                    else:
+                        st.error("Failed to clear history.")
+                    time.sleep(0.5)
+                    st.rerun()
+            with cc2:
+                if st.button("Cancel", key="cancel_clear_all_btn", use_container_width=True):
+                    st.session_state.confirm_clear_all_history = False
+                    st.rerun()
+        else:
+            if st.button("🗑️ Clear ALL History", key="clear_all_hist_btn",
+                         use_container_width=True):
+                st.session_state.confirm_clear_all_history = True
+                st.rerun()
+    with act2:
+        failed_ids = [s["session_id"] for s in history if s.get("status") == "failed"]
+        if failed_ids:
+            if st.button(f"🧹 Clear Failed ({len(failed_ids)})", key="clear_failed_btn",
+                         use_container_width=True):
+                _ok = 0
+                for fid in failed_ids:
+                    try:
+                        if api_session.delete(f"{API_BASE}/sessions/{fid}").status_code == 200:
+                            _ok += 1
+                    except Exception:
+                        pass
+                st.success(f"Cleared {_ok} failed session(s).")
+                time.sleep(0.5)
+                st.rerun()
+
+    st.markdown("---")
+
     # Status filter
     status_filter = st.selectbox(
         "Filter by status",
@@ -2758,6 +2803,35 @@ def show_history():
                             else:
                                 st.error(result.get("message", "Failed to complete session."))
                             st.rerun()
+
+                # Delete — available for EVERY session (failed/completed included).
+                if st.session_state.get(f"confirm_del_{sid}"):
+                    st.caption("Delete this session permanently?")
+                    dc1, dc2 = st.columns(2)
+                    with dc1:
+                        if st.button("⚠️ Yes", key=f"confirm_del_btn_{sid}",
+                                     type="primary", use_container_width=True):
+                            r = api_session.delete(f"{API_BASE}/sessions/{sid}")
+                            st.session_state[f"confirm_del_{sid}"] = False
+                            if st.session_state.get("selected_session") == sid:
+                                st.session_state.selected_session = None
+                            if r.status_code == 200:
+                                st.success("Deleted.")
+                            else:
+                                st.error("Delete failed.")
+                            time.sleep(0.4)
+                            st.rerun()
+                    with dc2:
+                        if st.button("Cancel", key=f"cancel_del_btn_{sid}",
+                                     use_container_width=True):
+                            st.session_state[f"confirm_del_{sid}"] = False
+                            st.rerun()
+                else:
+                    if st.button("🗑️ Delete", key=f"del_hist_{sid}",
+                                 help="Permanently delete this session and all its data",
+                                 use_container_width=True):
+                        st.session_state[f"confirm_del_{sid}"] = True
+                        st.rerun()
 
 
 def _doc_card(title: str, body: str, accent: str = "#4f8ef7"):

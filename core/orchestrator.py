@@ -4851,11 +4851,25 @@ Web apps: {webapps}
             cursor.execute('DELETE FROM vulnerabilities WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM credentials WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM ai_decisions WHERE session_id = ?', (session_id,))
+            # Shell tables (best-effort: older DBs may not have them yet).
+            for _tbl in ("shell_handlers", "shell_sessions_log"):
+                try:
+                    cursor.execute(f'DELETE FROM {_tbl} WHERE session_id = ?', (session_id,))
+                except sqlite3.OperationalError:
+                    pass
             cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
-            
+
             conn.commit()
             conn.close()
-            
+
+            # Stop and drop any live shell manager for this session.
+            _mgr = self._shell_managers.pop(session_id, None)
+            if _mgr is not None:
+                try:
+                    asyncio.create_task(_mgr.stop_all())
+                except Exception:
+                    pass
+
             # Remove from memory
             if session_id in self.sessions:
                 del self.sessions[session_id]
@@ -4896,10 +4910,23 @@ Web apps: {webapps}
             cursor.execute('DELETE FROM vulnerabilities')
             cursor.execute('DELETE FROM credentials')
             cursor.execute('DELETE FROM ai_decisions')
+            for _tbl in ("shell_handlers", "shell_sessions_log"):
+                try:
+                    cursor.execute(f'DELETE FROM {_tbl}')
+                except sqlite3.OperationalError:
+                    pass
             cursor.execute('DELETE FROM sessions')
-            
+
             conn.commit()
             conn.close()
+
+            # Stop all live shell managers.
+            for _mgr in list(self._shell_managers.values()):
+                try:
+                    asyncio.create_task(_mgr.stop_all())
+                except Exception:
+                    pass
+            self._shell_managers.clear()
 
             # Clear memory (capture count before clearing so we report it accurately)
             deleted_count = len(self.sessions)
