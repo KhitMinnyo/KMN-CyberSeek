@@ -315,6 +315,44 @@ def test_persist_shell_session_logs_caught_shell_decision():
 
 # ── episode summary (regressions) ───────────────────────────────────────────
 
+def test_operator_instruction_injected_into_context():
+    orch = _loop_orch()
+    s = make_session()
+    orch.sessions[s.session_id] = s
+    assert orch._operator_context_block(s) == ""  # none yet
+    res = orch.add_operator_instruction(s.session_id, "Focus on GlassFish 4848; skip SMB")
+    assert res["status"] == "success"
+    assert "Focus on GlassFish" in s.operator_instructions[-1]
+    block = orch._operator_context_block(s)
+    assert "OPERATOR INSTRUCTIONS" in block
+    assert "GlassFish" in block
+    # logged as a decision so it persists + shows in the timeline
+    assert s.ai_decisions[-1]["context"] == "operator_instruction"
+
+
+def test_operator_instruction_rejects_empty():
+    orch = _loop_orch()
+    s = make_session(); orch.sessions[s.session_id] = s
+    assert orch.add_operator_instruction(s.session_id, "   ")["status"] == "error"
+    assert s.operator_instructions == []
+
+
+def test_answer_operator_question_uses_state():
+    orch = _loop_orch()
+    s = make_session(services=[svc(4848, "glassfish")])
+    orch.sessions[s.session_id] = s
+    orch.ai_connector.ask_raw_async = AsyncMock(
+        return_value={"answer": "Found GlassFish on 4848; trying default creds next."}
+    )
+    res = _run(orch.answer_operator_question(s.session_id, "what have you found?"))
+    assert res["status"] == "success"
+    assert "GlassFish" in res["answer"]
+    # the state summary must have been passed to the model
+    _, kwargs = orch.ai_connector.ask_raw_async.call_args
+    args = orch.ai_connector.ask_raw_async.call_args[0]
+    assert any("glassfish" in str(a).lower() for a in args)
+
+
 def test_create_episode_summary_uses_session_episode_size():
     """Regression: _create_episode_summary referenced self._EPISODE_SIZE (an
     orchestrator attr that doesn't exist) → AttributeError crashed the whole

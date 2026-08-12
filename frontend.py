@@ -436,6 +436,34 @@ def get_shell_history(session_id: str, handler_id: str, msf_id: int) -> list:
     return []
 
 
+def steer_session(session_id: str, instruction: str) -> dict:
+    """Send a live natural-language steering instruction to the running AI."""
+    try:
+        r = api_session.post(
+            f"{API_BASE}/sessions/{session_id}/steer",
+            json={"instruction": instruction}, timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json()
+        return {"status": "error", "message": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def ask_session(session_id: str, question: str) -> dict:
+    """Ask the AI about the current engagement (read-only status chat)."""
+    try:
+        r = api_session.post(
+            f"{API_BASE}/sessions/{session_id}/ask",
+            json={"question": question}, timeout=60,
+        )
+        if r.status_code == 200:
+            return r.json()
+        return {"status": "error", "message": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 def get_stats_api():
     try:
         r = api_session.get(f"{API_BASE}/stats", timeout=5)
@@ -1223,9 +1251,62 @@ def show_session_overview(session_details: Dict):
             except Exception as e:
                 st.error(f"Could not reach backend: {e}")
     
+    # ── Steer / Ask the AI live ───────────────────────────────────────────────
+    st.markdown("### 🧭 Steer & Ask")
+    active_instr = session_details.get("operator_instructions", [])
+    if active_instr:
+        st.caption("Active operator instructions the AI is following: "
+                   + " · ".join(f"`{i}`" for i in active_instr[-6:]))
+
+    steer_col, ask_col = st.columns(2)
+    with steer_col:
+        st.markdown("**🎯 Steer** — direct the AI (applies on its next decision)")
+        steer_txt = st.text_input(
+            "Instruction", key=f"steer_input_{session_id}",
+            placeholder="e.g. Focus on GlassFish 4848; skip SMB; try Ghostcat on 8009",
+            label_visibility="collapsed",
+        )
+        if st.button("Send instruction", key=f"steer_btn_{session_id}",
+                     use_container_width=True):
+            if steer_txt.strip():
+                res = steer_session(session_id, steer_txt.strip())
+                if res.get("status") == "success":
+                    st.success("Instruction sent — the AI will follow it on its next step.")
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error(res.get("message", "Failed to send instruction."))
+            else:
+                st.warning("Type an instruction first.")
+    with ask_col:
+        st.markdown("**💬 Ask** — question about the current session (read-only)")
+        ask_txt = st.text_input(
+            "Question", key=f"ask_input_{session_id}",
+            placeholder="e.g. What have you found so far? What's blocking you?",
+            label_visibility="collapsed",
+        )
+        if st.button("Ask the AI", key=f"ask_btn_{session_id}",
+                     use_container_width=True):
+            if ask_txt.strip():
+                with st.spinner("Asking the AI..."):
+                    res = ask_session(session_id, ask_txt.strip())
+                if res.get("status") == "success":
+                    st.session_state[f"ask_answer_{session_id}"] = res.get("answer", "")
+                else:
+                    st.session_state[f"ask_answer_{session_id}"] = (
+                        "⚠️ " + res.get("message", "Failed to get an answer.")
+                    )
+            else:
+                st.warning("Type a question first.")
+        _ans = st.session_state.get(f"ask_answer_{session_id}")
+        if _ans:
+            st.info(_ans)
+
+    st.markdown("---")
+
     # Session timeline - dynamically determined based on current_stage
     st.markdown("### 📅 Session Timeline")
-    
+
     # Get current stage from session details
     current_stage = session_details.get('current_stage', '').lower()
     
@@ -1530,6 +1611,8 @@ def show_ai_decisions(session_details: Dict):
             _ctx_badge = " 🎧 listener"
         elif _ctx == "shell_caught":
             _ctx_badge = " 🐚 shell!"
+        elif _ctx == "operator_instruction":
+            _ctx_badge = " 🧭 steer"
         elif _ctx == "self_critique_reject":
             _ctx_badge = " 🛡 vetoed"
 

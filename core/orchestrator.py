@@ -348,6 +348,13 @@ class Session:
         self.exploit_payload: str = ""
         self._auto_handler_started: bool = False
 
+        # Operator steering: free-text instructions the user sends mid-engagement
+        # ("focus on GlassFish", "skip SMB", "try Ghostcat on 8009"). Injected as a
+        # HIGHEST-PRIORITY block into every subsequent AI decision so the human can
+        # redirect the autonomous loop without stopping it. Rebuilt on restart from
+        # the persisted ai_decisions (context="operator_instruction").
+        self.operator_instructions: List[str] = []
+
     def to_dict(self) -> Dict:
         """Convert session to dictionary."""
         return {
@@ -379,6 +386,7 @@ class Session:
             "reflections": self.reflections[-5:],
             "exhausted_services": self.exhausted_services,
             "compromise_evidence": self.compromise_evidence,
+            "operator_instructions": self.operator_instructions,
         }
 
 
@@ -1394,8 +1402,11 @@ class Orchestrator:
             # Prepare context for AI with CRITICAL RULE about domain usage
             _active_shells = self.get_shell_sessions(session_id)
 
+            # Operator steering — highest priority, first in the block.
+            _exhausted_ctx = self._operator_context_block(session)
+
             # Exhausted attack vectors — injected so AI skips them automatically.
-            _exhausted_ctx = self._exhausted_context_block(session)
+            _exhausted_ctx += self._exhausted_context_block(session)
 
             # Confirmed compromises — tell the AI it already has access so it
             # pivots to post-exploitation / privilege-escalation instead of
@@ -2143,7 +2154,7 @@ Subdomains found: {len(session.discovered_subdomains)}{f' — [{", ".join(sessio
 Web apps found: {len(session.web_applications)}{f' — [{", ".join(a.get("url","") for a in session.web_applications[:5])}]' if session.web_applications else ''}
 API endpoints: {len(session.discovered_api_endpoints)}
 Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
-{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}
+{self._operator_context_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}
 Domain rule: If Target Domain is provided ({session.target_domain}), use domain name for all web tools — never IP.
 
 {self._get_relevant_threat_intel_context(session_id)}
@@ -3794,6 +3805,14 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     if ctx:
                         _dec["context"] = ctx
                     session.ai_decisions.append(_dec)
+                    # Rebuild active operator instructions so live steering
+                    # survives a backend restart.
+                    if ctx == "operator_instruction":
+                        _txt = (reasoning or "").replace("OPERATOR INSTRUCTION:", "").strip()
+                        if _txt:
+                            session.operator_instructions.append(_txt)
+                if len(session.operator_instructions) > 12:
+                    session.operator_instructions = session.operator_instructions[-12:]
 
                 # Load pending commands into orchestrator's pending_commands dict
                 cursor.execute('''
@@ -4471,6 +4490,126 @@ Web apps: {webapps}
             "service, port, or technique. Do not suggest a command targeting an "
             "exhausted vector.\n"
         )
+
+    def add_operator_instruction(self, session_id: str, instruction: str) -> Dict:
+        """Record a free-text steering instruction from the human operator. It is
+        injected (highest priority) into every subsequent AI decision so the loop
+        can be redirected live without being stopped. Logged as an ai_decision so
+        it shows in the timeline and survives a backend restart."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return {"status": "error", "message": "Session not found"}
+        instruction = (instruction or "").strip()
+        if not instruction:
+            return {"status": "error", "message": "Empty instruction"}
+
+        session.operator_instructions.append(instruction)
+        # Keep the active set bounded so the prompt doesn't grow without limit.
+        if len(session.operator_instructions) > 12:
+            session.operator_instructions = session.operator_instructions[-12:]
+
+        _d = {
+            "timestamp": datetime.now().isoformat(),
+            "reasoning": f"OPERATOR INSTRUCTION: {instruction}",
+            "suggested_command": "",
+            "risk_level": "low",
+            "confidence": 1.0,
+            "context": "operator_instruction",
+        }
+        session.ai_decisions.append(_d)
+        self._save_ai_decision(session_id, _d)
+        logger.info(f"Session {session_id}: operator instruction added: {instruction[:120]}")
+        return {"status": "success", "instruction": instruction,
+                "active_count": len(session.operator_instructions)}
+
+    def _status_summary_for_operator(self, session: "Session") -> str:
+        """Compact plain-text snapshot of the engagement for the status-chat AI."""
+        svcs = ", ".join(
+            f"{s.get('service','?')}:{s.get('port','?')}({s.get('test_state','untested')})"
+            for s in session.discovered_services[:25]
+        ) or "none"
+        creds = ", ".join(
+            f"{c.get('username','?')}@{c.get('service','?')}" for c in session.credentials[:10]
+        ) or "none"
+        vulns = "; ".join(
+            f"{v.get('name','?')}[{v.get('risk_level','?')}]" for v in session.vulnerabilities[:12]
+        ) or "none"
+        comps = "; ".join(
+            f"{c.get('service','?')}:{c.get('port','?')}={c.get('privilege','?')}"
+            for c in session.compromise_evidence[:8]
+        ) or "none"
+        last_cmds = "; ".join(
+            (c.get("command", "") or "")[:70] for c in session.commands_executed[-6:]
+        ) or "none"
+        plan = "; ".join(
+            f"{p.get('step','')}[{p.get('status','')}]" for p in session.strategic_plan[:8]
+        ) or "none"
+        return (
+            f"TARGET: {session.target_ip} ({session.target_domain or 'no domain'})\n"
+            f"STATUS: {session.status}  STAGE: {session.current_stage}\n"
+            f"OBJECTIVE: {session.objective}\n"
+            f"PROGRESS: {int(session.objective_progress * 100)}% — {session.objective_progress_note or 'n/a'}\n"
+            f"PLAN: {plan}\n"
+            f"SERVICES ({len(session.discovered_services)}): {svcs}\n"
+            f"CREDENTIALS ({len(session.credentials)}): {creds}\n"
+            f"VULNERABILITIES ({len(session.vulnerabilities)}): {vulns}\n"
+            f"CONFIRMED COMPROMISES ({len(session.compromise_evidence)}): {comps}\n"
+            f"EXHAUSTED VECTORS: {', '.join(session.exhausted_services) or 'none'}\n"
+            f"RECENT COMMANDS: {last_cmds}\n"
+            f"TOTAL COMMANDS: {len(session.commands_executed)}  DECISIONS: {len(session.ai_decisions)}"
+        )
+
+    async def answer_operator_question(self, session_id: str, question: str) -> Dict:
+        """One-off status-chat: answer the operator's question about the CURRENT
+        engagement from live session state. Read-only — does NOT touch the agentic
+        loop or execute anything. Returns {"status","answer"}."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return {"status": "error", "message": "Session not found"}
+        question = (question or "").strip()
+        if not question:
+            return {"status": "error", "message": "Empty question"}
+
+        summary = self._status_summary_for_operator(session)
+        system_prompt = (
+            "You are the assistant to a penetration tester, reporting on an autonomous "
+            "engagement in progress. Answer the operator's question CONCISELY and "
+            "factually using ONLY the session state provided. If asked what to do next, "
+            "give a brief recommendation grounded in the discovered services/vulns. "
+            "Do not fabricate findings. Respond as JSON: {\"answer\": \"...\"}."
+        )
+        user_prompt = (
+            f"=== CURRENT SESSION STATE ===\n{summary}\n\n"
+            f"OPERATOR QUESTION: {question}\n\n"
+            "Return ONLY JSON: {\"answer\": \"...\"}"
+        )
+        try:
+            data = await self.ai_connector.ask_raw_async(system_prompt, user_prompt)
+            answer = ""
+            if isinstance(data, dict):
+                answer = str(data.get("answer") or "").strip()
+            if not answer:
+                answer = "The AI did not return a usable answer. Try rephrasing the question."
+            return {"status": "success", "answer": answer}
+        except Exception as e:
+            logger.warning(f"answer_operator_question failed for {session_id}: {e}")
+            return {"status": "error", "message": f"AI query failed: {e}"}
+
+    def _operator_context_block(self, session: "Session") -> str:
+        """Render active operator instructions for the AI prompt. Highest priority
+        — placed so the model treats these as overriding directives. Empty when
+        the operator hasn't sent any."""
+        if not session.operator_instructions:
+            return ""
+        lines = ["\n=== OPERATOR INSTRUCTIONS (HIGHEST PRIORITY — FOLLOW THESE) ==="]
+        for i, instr in enumerate(session.operator_instructions[-8:], 1):
+            lines.append(f"{i}. {instr}")
+        lines.append(
+            "These are direct orders from the human operator running this engagement. "
+            "Obey them over your own default methodology. If an instruction says to "
+            "focus on / skip / avoid something, do exactly that in your next command.\n"
+        )
+        return "\n".join(lines)
 
     def _handler_context_block(self, session: "Session") -> str:
         """Tell the AI a managed listener is live and how to deliver shells to it.
