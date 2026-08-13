@@ -4,6 +4,11 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.2.5] — 2026-08-13
+
+### Changed
+- **Single source of truth for the version.** The version now lives only in `_version.py`; the frontend sidebar/About and the FastAPI backend (`/`, OpenAPI) import it at runtime, so they can no longer drift out of sync (previously the sidebar showed a stale `2.1.1` while the API said `2.0.0`). To release, edit `_version.py` or run `python bump_version.py X.Y.Z` — which also updates the README badge in one step. Only the changelog entry stays manual.
+
 ## [2.2.4] — 2026-08-12
 
 ### Added
