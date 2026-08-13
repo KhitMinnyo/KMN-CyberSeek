@@ -22,6 +22,17 @@ Building the shift from opportunistic LLM-guessing to methodology-driven coverag
   classification, and command rendering. Pure data (no orchestrator coupling yet) —
   unit-tested (`tests/test_playbooks.py`). Not yet wired into the live loop; that
   integration lands behind a `COVERAGE_ENGINE` flag next.
+- **M1 (part 2) — Coverage model** (`core/coverage.py`). Per-service step tracking
+  (pending/done/skipped), monotonic service state
+  (untested→enumerated→tested→exploited→post_ex), coverage ratio, and a
+  **coverage-derived objective progress** formula plus an `is_objective_complete()`
+  guard that blocks premature completion (requires a foothold **and** ≥85% service
+  coverage **and** ≥85% progress). Targets a field bug: a run marked "OBJECTIVE
+  COMPLETE 100%" on a single MySQL foothold while ~30 vulns were untouched.
+  Unit-tested (`tests/test_coverage.py`).
+  **Benchmark check (2026-08-13 completed run, pre-engine):** touched 17/35
+  (48.6%), confirmed 1/35 (2.9%) — barely above baseline; the number the engine
+  must beat.
 
 ---
 
