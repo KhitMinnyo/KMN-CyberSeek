@@ -100,6 +100,31 @@ SCOPE_ALLOWLIST=10.0.0.0/8,lab.local
 FULL_AUTO_MODE=false   # true = no approval prompts — isolated labs only
 ```
 
+### Advanced tuning (optional)
+
+All have sensible defaults; set only if needed.
+
+```env
+# Autonomous shell capture — the managed multi/handler the AI delivers shells to
+EXPLOIT_LHOST=            # default: auto-detected local IP (set if it guesses wrong)
+EXPLOIT_LPORT=4444
+EXPLOIT_PAYLOAD=          # default: guessed from target OS
+
+# CVE enrichment (NVD). Free key raises the rate limit and avoids HTTP 429.
+NVD_API_KEY=             # https://nvd.nist.gov/developers/request-an-api-key
+NVD_MIN_INTERVAL=6.5     # seconds between NVD calls when no key is set
+
+# Scan / command timeouts (seconds)
+SCAN_TIMEOUT=300
+VULN_SCAN_TIMEOUT=120
+COMMAND_TIMEOUT=600
+
+# Agentic-loop safety
+MAX_AUTO_PIVOTS=6        # auto-pivots before pausing for manual review
+MAX_EMPTY_RETRIES=3      # retries when the model returns no command
+WATCHDOG_STALL_SECONDS=  # default: COMMAND_TIMEOUT + 180 (stuck-session revival)
+```
+
 ---
 
 ## Further Reading
