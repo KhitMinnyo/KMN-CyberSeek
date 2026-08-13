@@ -4,6 +4,21 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [Unreleased] — Coverage Engine (v2.3.0, in progress)
+
+Building the shift from opportunistic LLM-guessing to methodology-driven coverage
+(design: `docs/coverage-engine-design.md`, plan: `docs/coverage-engine-buildplan.md`).
+
+### Added
+- **M0 — Benchmark harness.** `benchmarks/score.py` scores an engagement report
+  against a lab's ground-truth vulnerability set (`benchmarks/labs/kmn_training_win.json`,
+  35 items) — turning "did it improve?" into a number (touched % + confirmed %,
+  per-category, missed list). Dependency-free; unit-tested (`tests/test_benchmark.py`).
+  **Baseline (v2.2.7 run):** touched 16/35 (45.7%), confirmed 1/35 (2.9%); web_cms
+  and windows_system at 0 — recorded in `benchmarks/README.md`.
+
+---
+
 ## [2.2.7] — 2026-08-13
 
 ### Fixed

@@ -1,0 +1,46 @@
+{
+  "lab": "KMN-Training-Win",
+  "description": "Windows Server 2019 training lab (192.168.100.194). Ground-truth vulnerability set used to score autonomous engagement coverage.",
+  "match_notes": "An item is 'touched' if ANY of its `any` signals appears anywhere in the report text (case-insensitive substring), and 'confirmed' if a signal appears in a confirmed section (Confirmed Compromises / Credentials Captured / Vulnerability Findings). Signals are chosen to be specific enough to avoid inflated matches.",
+  "items": [
+    {"id": "web.webdav_put", "category": "web_cms", "title": "WebDAV unauthenticated HTTP PUT enabled (/webdav/downloads)", "any": ["webdav", "http put method", "put method enabled", "davtest"]},
+    {"id": "web.webdav_rce", "category": "web_cms", "title": "WebDAV arbitrary file upload -> RCE", "any": ["webdav arbitrary", "webdav upload", "webdav rce", "put shell", "davtest --move"]},
+    {"id": "web.wp_filemanager_rce", "category": "web_cms", "title": "WordPress WP File Manager unauth RCE (CVE-2020-25213)", "any": ["cve-2020-25213", "wp-file-manager", "wp file manager", "connector.minimal.php"]},
+    {"id": "web.wp_reflex_gallery", "category": "web_cms", "title": "WordPress Reflex Gallery arbitrary file upload", "any": ["reflex gallery", "reflexgallery"]},
+    {"id": "web.wp_disk_usage_xss", "category": "web_cms", "title": "WordPress Disk Usage Sunburst XSS", "any": ["disk usage sunburst", "sunburst", "disk-usage"]},
+    {"id": "web.iis_slowloris", "category": "web_cms", "title": "Slowloris DoS / resource exhaustion", "any": ["slowloris"]},
+
+    {"id": "app.tomcat_weak_creds", "category": "app_servers", "title": "Tomcat weak manager credentials", "any": ["tomcat:tomcat", "dbadmin:creative77", "admin:temito27", "manager/html", "tomcat manager"]},
+    {"id": "app.tomcat_war_rce", "category": "app_servers", "title": "Tomcat malicious WAR upload RCE", "any": ["war file", "war deploy", "malicious war", "manager/text/deploy", ".war"]},
+    {"id": "app.tomcat_rmi", "category": "app_servers", "title": "Exposed Java RMI ports", "any": ["java rmi", "rmi registry", "jmxrmi", "rmi-dumpregistry", "1099"]},
+    {"id": "app.jenkins_groovy", "category": "app_servers", "title": "Jenkins unsecured Groovy script console", "any": ["groovy script console", "script console", "/script", "jenkins"]},
+    {"id": "app.jenkins_rce", "category": "app_servers", "title": "Jenkins RCE via system commands", "any": ["jenkins rce", "groovy execute", "cmd.exe", "def proc =", "script console rce"]},
+    {"id": "app.glassfish_weak_creds", "category": "app_servers", "title": "GlassFish weak/default admin credentials", "any": ["glassfish", "admin:admin", "4848", "j_security_check"]},
+    {"id": "app.glassfish_lfi", "category": "app_servers", "title": "GlassFish path traversal / LFI (CVE-2017-1000028)", "any": ["cve-2017-1000028", "path traversal", "local file inclusion", "%c0%af", "theme/meta-inf"]},
+    {"id": "app.glassfish_war_rce", "category": "app_servers", "title": "GlassFish malicious WAR deployment RCE", "any": ["glassfish war", "asadmin deploy", "war deploy", "management/domain/applications"]},
+
+    {"id": "net.smb_v1", "category": "network_fileshare", "title": "SMBv1 legacy protocol enabled", "any": ["smbv1", "smb1", "smb 1.0", "legacy smb"]},
+    {"id": "net.smb_null", "category": "network_fileshare", "title": "SMB null / anonymous session enabled", "any": ["null session", "anonymous access", "smb anonymous", "-u '' -p ''", "enum4linux"]},
+    {"id": "net.smb_share", "category": "network_fileshare", "title": "Insecure share (SecretShare anon read/write)", "any": ["secretshare", "secret share", "anonymous read/write", "smbmap", "writable share"]},
+    {"id": "net.ftp_anon", "category": "network_fileshare", "title": "FTP anonymous login enabled", "any": ["anonymous ftp", "anonymous login", "ftp anon", "230 anonymous"]},
+    {"id": "net.ftp_write", "category": "network_fileshare", "title": "FTP arbitrary file write / upload", "any": ["ftp upload", "stor ", "arbitrary file write", "ftp put"]},
+    {"id": "net.ftp_weak", "category": "network_fileshare", "title": "FTP weak user credentials", "any": ["ftpuser:password", "ftp weak cred", "ftp brute"]},
+
+    {"id": "rad.ssh_weak", "category": "remote_admin_db", "title": "SSH weak credentials", "any": ["backup:123456", "password123!", "ssh weak", "khit minnyo:password"]},
+    {"id": "rad.ssh_brute", "category": "remote_admin_db", "title": "SSH susceptible to brute-force", "any": ["hydra ssh", "ssh brute", "password dictionary", "medusa ssh", "ncrack ssh"]},
+    {"id": "rad.winrm_http", "category": "remote_admin_db", "title": "WinRM unencrypted HTTP transport", "any": ["winrm", "5985", "unencrypted http"]},
+    {"id": "rad.winrm_basic", "category": "remote_admin_db", "title": "WinRM basic auth / evil-winrm access", "any": ["evil-winrm", "winrm basic", "basic authentication"]},
+    {"id": "rad.rdp_nla", "category": "remote_admin_db", "title": "RDP NLA disabled", "any": ["nla disabled", "network level authentication", "rdp-ntlm-info", "3389"]},
+    {"id": "rad.rdp_brute", "category": "remote_admin_db", "title": "RDP susceptible to brute-force / spraying", "any": ["rdp brute", "rdp spray", "hydra rdp", "crowbar", "xfreerdp"]},
+    {"id": "rad.mysql_root_nopass", "category": "remote_admin_db", "title": "MySQL remote root access, no/weak password", "any": ["root/system", "root@localhost", "grant all privileges", "mysql -h", "mysql -u root"]},
+    {"id": "rad.mysql_weak", "category": "remote_admin_db", "title": "MySQL weak user credentials", "any": ["kmn:creator_28", "mysql weak cred"]},
+    {"id": "rad.mysql_outfile", "category": "remote_admin_db", "title": "MySQL arbitrary file write via INTO OUTFILE", "any": ["into outfile", "into dumpfile", "lib_mysqludf_sys", "udf"]},
+
+    {"id": "win.llmnr", "category": "windows_system", "title": "LLMNR / NBT-NS enabled (Responder MITM)", "any": ["llmnr", "nbt-ns", "responder", "nbns poisoning"]},
+    {"id": "win.ipv6_mitm6", "category": "windows_system", "title": "IPv6 enabled (mitm6 NTLM relay)", "any": ["mitm6", "ipv6 dns spoof", "ntlm relay", "ntlmrelayx"]},
+    {"id": "win.defender_disabled", "category": "windows_system", "title": "Windows Defender disabled", "any": ["defender disabled", "disablerealtimemonitoring", "windows defender completely disabled", "defender is off"]},
+    {"id": "win.firewall_disabled", "category": "windows_system", "title": "Windows Defender Firewall disabled", "any": ["firewall disabled", "firewall off", "netsh advfirewall set allprofiles state off"]},
+    {"id": "win.uac_weak", "category": "windows_system", "title": "UAC weakened (Never Notify)", "any": ["uac", "never notify", "consentpromptbehavioradmin", "enablelua"]},
+    {"id": "win.weak_admin", "category": "windows_system", "title": "Weak admin password / excessive privileges", "any": ["administrator:p@ssw0rd", "guest account", "guest in administrators", "excessive privilege", "p@ssw0rd!"]}
+  ]
+}
