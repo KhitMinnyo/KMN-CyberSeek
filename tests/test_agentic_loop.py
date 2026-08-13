@@ -45,6 +45,7 @@ def _loop_orch():
     orch._last_activity = {}
     orch._watchdog_nudges = {}
     orch._WATCHDOG_STALL = 100
+    orch._WATCHDOG_STALL_IDLE = 100
     orch._WATCHDOG_MAX_NUDGES = 2
     return orch
 
@@ -157,13 +158,42 @@ def test_watchdog_flags_after_max_nudges():
     assert s.ai_decisions[-1]["context"] == "watchdog_stalled"
 
 
-def test_watchdog_ignores_resting_sessions():
+def test_watchdog_revives_idle_ready_session():
+    # A 'ready' session with no pending approval that has gone idle must be
+    # revived (FULL_AUTO sessions should never rest at ready).
     orch = _loop_orch()
     s = make_session(); s.status = "ready"
     orch.sessions[s.session_id] = s
+    orch.pending_commands = {}
+    orch._analyze_with_ai = AsyncMock()
     orch._last_activity[s.session_id] = -10_000
     _run(orch._watchdog_tick())
-    # ready is a legit resting state — no nudge, no flag decision
+    assert orch._watchdog_nudges[s.session_id] == 1
+    assert s.status == "analyzing"
+
+
+def test_watchdog_skips_ready_with_pending_approval():
+    # A 'ready' session waiting for the operator to approve a command is NOT
+    # stuck — the watchdog must leave it alone.
+    orch = _loop_orch()
+    s = make_session(); s.status = "ready"
+    orch.sessions[s.session_id] = s
+    orch.pending_commands = {
+        "c1": {"session_id": s.session_id, "status": "pending"}
+    }
+    orch._analyze_with_ai = AsyncMock()
+    orch._last_activity[s.session_id] = -10_000
+    _run(orch._watchdog_tick())
+    assert s.session_id not in orch._watchdog_nudges
+    assert s.status == "ready"
+
+
+def test_watchdog_ignores_completed_sessions():
+    orch = _loop_orch()
+    s = make_session(); s.status = "completed"
+    orch.sessions[s.session_id] = s
+    orch._last_activity[s.session_id] = -10_000
+    _run(orch._watchdog_tick())
     assert s.session_id not in orch._watchdog_nudges
     assert not any(d.get("context") == "watchdog_stalled" for d in s.ai_decisions)
 

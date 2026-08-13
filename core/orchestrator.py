@@ -437,6 +437,9 @@ class Orchestrator:
         self._WATCHDOG_STALL = int(
             os.getenv("WATCHDOG_STALL_SECONDS", str(COMMAND_TIMEOUT + 180))
         )
+        # 'analyzing'/'ready' have NO command running, so they should never idle
+        # for long — a much shorter stall revives a stuck-at-ready session quickly.
+        self._WATCHDOG_STALL_IDLE = int(os.getenv("WATCHDOG_STALL_IDLE_SECONDS", "120"))
         self._WATCHDOG_MAX_NUDGES = int(os.getenv("WATCHDOG_MAX_NUDGES", "2"))
 
         # Initialize database
@@ -3964,15 +3967,41 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             except Exception as e:
                 logger.error(f"Watchdog tick failed (non-fatal): {e}")
 
+    def _session_has_pending_approval(self, session_id: str) -> bool:
+        """True if the session has a command queued and awaiting manual approval.
+        Such a session legitimately rests at 'ready' — the watchdog must NOT nudge
+        it (that would bypass the human)."""
+        return any(
+            c.get("session_id") == session_id and c.get("status") == "pending"
+            for c in self.pending_commands.values()
+        )
+
     async def _watchdog_tick(self) -> None:
-        """One watchdog pass. 'analyzing'/'executing' are the only statuses that
-        should always be making progress; 'ready'/'failed'/'completed' are legit
-        resting states and are left alone."""
+        """One watchdog pass. Revives sessions stuck with no progress:
+          - 'executing'  → a command may legitimately run up to COMMAND_TIMEOUT,
+            so use the long stall.
+          - 'analyzing'/'ready' → no command is running, so these should never sit
+            idle; use the short idle-stall. EXCEPT a 'ready' session that has a
+            command awaiting manual approval — that's a legit wait, leave it.
+          - 'failed'/'completed'/'initialized'/'scanning' → left alone.
+        """
         now = time.monotonic()
         for sid, session in list(self.sessions.items()):
-            if session.status not in ("analyzing", "executing"):
-                # Not an active status — clear any stale nudge count so a future
-                # stall starts from a clean slate.
+            status = session.status
+            if status in ("executing", "analyzing"):
+                # Active states — a command or AI call may legitimately be running,
+                # so use the long stall to avoid nudging (and duplicating) real work.
+                stall = self._WATCHDOG_STALL
+            elif status == "ready":
+                # 'ready' is a RESTING state (no task running). If it's waiting for
+                # the operator to approve a command that's legit — skip it. Otherwise
+                # a FULL_AUTO session should never rest here, so revive it quickly.
+                if self._session_has_pending_approval(sid):
+                    self._watchdog_nudges.pop(sid, None)
+                    continue
+                stall = self._WATCHDOG_STALL_IDLE
+            else:
+                # Not a revivable status (initialized/scanning/failed/completed).
                 self._watchdog_nudges.pop(sid, None)
                 continue
 
@@ -3983,7 +4012,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 continue
 
             idle = now - last
-            if idle < self._WATCHDOG_STALL:
+            if idle < stall:
                 continue
 
             nudges = self._watchdog_nudges.get(sid, 0)

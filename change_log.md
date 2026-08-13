@@ -4,6 +4,11 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.2.7] — 2026-08-13
+
+### Fixed
+- **Session silently went idle at `ready` and never recovered** (log showed ~9 minutes of pure UI polling — no AI calls, no commands — while the header still said "Session Active"). The stuck-session watchdog only revived `analyzing`/`executing` sessions and deliberately left `ready` alone, so a FULL_AUTO session that stopped at `ready` (e.g. after an auto-pivot or a soft loop) was never restarted. The watchdog now also revives an idle `ready` session — quickly (`WATCHDOG_STALL_IDLE_SECONDS`, default 120s) — **unless** it has a command awaiting manual approval (a legitimate wait, left untouched). `analyzing`/`executing` keep the long stall so genuinely-running work isn't interrupted. New env var: `WATCHDOG_STALL_IDLE_SECONDS`.
+
 ## [2.2.6] — 2026-08-13
 
 ### Fixed
