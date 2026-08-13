@@ -447,17 +447,37 @@ def test_coverage_engine_wiring_when_enabled():
         orch_mod.COVERAGE_ENGINE = _orig
 
 
+def test_feature_flags_default_on_and_toggle():
+    import core.orchestrator as orch_mod
+    flags = orch_mod.get_feature_flags()
+    assert flags["coverage_engine"] is True and flags["bruteforce_enabled"] is True
+
+    _covled = orch_mod.COVERAGE_ENGINE
+    try:
+        gname = orch_mod.set_feature_flag("coverage_engine", False)
+        assert gname == "COVERAGE_ENGINE"
+        assert orch_mod.COVERAGE_ENGINE is False
+        assert orch_mod.get_feature_flags()["coverage_engine"] is False
+        # unknown flag rejected
+        assert orch_mod.set_feature_flag("bogus", True) is None
+    finally:
+        orch_mod.set_feature_flag("coverage_engine", _covled)
+
+
 def test_coverage_engine_off_is_noop():
     import core.orchestrator as orch_mod
     orch = _loop_orch()
     s = make_session(services=[svc(445, "smb", host="10.0.0.5")])
     s.discovered_services = [{"service": "smb", "port": 445, "host": "10.0.0.5"}]
     orch.sessions[s.session_id] = s
-    # default OFF
-    assert orch_mod.COVERAGE_ENGINE is False
-    orch._ensure_coverage(s)
-    assert s.service_coverage == {}
-    assert orch._coverage_context_block(s) == ""
+    _orig = orch_mod.COVERAGE_ENGINE
+    orch_mod.set_feature_flag("coverage_engine", False)  # force off for this test
+    try:
+        orch._ensure_coverage(s)
+        assert s.service_coverage == {}
+        assert orch._coverage_context_block(s) == ""
+    finally:
+        orch_mod.set_feature_flag("coverage_engine", _orig)
 
 
 def test_chat_history_records_question_and_answer():

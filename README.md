@@ -1,6 +1,6 @@
 # KMN-CyberSeek
 
-![Version](https://img.shields.io/badge/Version-2.3.0-brightgreen)
+![Version](https://img.shields.io/badge/Version-2.3.1-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
@@ -124,17 +124,22 @@ MAX_AUTO_PIVOTS=6        # auto-pivots before pausing for manual review
 MAX_EMPTY_RETRIES=3      # retries when the model returns no command
 WATCHDOG_STALL_SECONDS=  # default: COMMAND_TIMEOUT + 180 (stuck-session revival)
 
-# Coverage engine (experimental) — methodology-driven per-service playbooks,
-# known-exploit hints, coverage-derived progress. Off by default; target-agnostic.
-COVERAGE_ENGINE=false
+# Coverage engine — methodology-driven per-service playbooks, known-exploit hints,
+# coverage-derived progress. ON by default; toggle live in Settings → Engine Features
+# (no .env editing needed). Target-agnostic.
+COVERAGE_ENGINE=true
 
-# Decoupled brute-force worker — produces credentials in the background from
-# discovered auth services (SSH/FTP/RDP/MySQL/SMB/WinRM). Off by default.
-BRUTEFORCE_ENABLED=false
+# Decoupled brute-force worker — background credential brute-force on discovered
+# auth services (SSH/FTP/RDP/MySQL/SMB/WinRM). ON by default; toggle in Settings.
+BRUTEFORCE_ENABLED=true
 BRUTEFORCE_TIER=default            # default | rockyou | full
 BRUTEFORCE_MAX_SECONDS_PER_SERVICE=600
 BRUTEFORCE_CONCURRENCY=2
 ```
+
+> **Tip:** Coverage Engine, Brute-force, and Full-Auto mode can be toggled at
+> runtime from **Settings → Engine Features** — changes apply immediately and are
+> saved to `.env` automatically, so end users never need to edit files.
 
 ---
 

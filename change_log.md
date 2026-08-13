@@ -4,6 +4,18 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.3.1] — 2026-08-13
+
+### Changed
+- **Coverage Engine and Brute-force worker now default ON**, and are toggleable
+  live from the UI — **Settings → 🚀 Engine Features** (Coverage Engine, Brute-force,
+  Full-Auto mode). Changes apply immediately (mutate the live flag) **and** persist
+  to `.env` (`POST /api/settings/features`), so end users never edit files. Field
+  note that prompted this: a v2.3.0 lab run still stopped early / didn't lift
+  coverage because the flags were left OFF in `.env`; defaulting ON + a Settings
+  toggle removes that footgun. New API: `GET/POST /api/settings/features`,
+  `orchestrator.get_feature_flags()/set_feature_flag()`. Unit-tested.
+
 ## [2.3.0] — 2026-08-13 — Coverage Engine
 
 The shift from opportunistic LLM-guessing to **methodology-driven coverage**
