@@ -4,6 +4,11 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.2.6] — 2026-08-13
+
+### Fixed
+- **Session view froze on "Scanning" while the AI was actually running.** The `pref_auto_refresh` setting was saved but never actually used — nothing re-ran the page — so the Overview showed whatever snapshot was first loaded and never reflected backend progress (hosts/services/commands/decisions/stage). The AI loop was working fine in the backend the whole time; only the UI was stale. Live auto-refresh is now implemented: while a session is active (scanning/analyzing/executing/ready) the page re-runs every `Refresh interval` seconds (default 5). Added a manual **🔄 Refresh** button + a `🟢 live`/`⏸ manual` indicator. Turn auto-refresh off in **Settings** for uninterrupted chatting.
+
 ## [2.2.5] — 2026-08-13
 
 ### Changed

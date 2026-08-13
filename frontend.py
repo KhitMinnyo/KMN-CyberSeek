@@ -961,6 +961,14 @@ def display_session_details(session_details: Dict):
         st.markdown(f"**Status:** <span class='status-badge {status_class}'>{status.upper()}</span>", unsafe_allow_html=True)
         stage_display = session_details.get('current_stage', 'N/A').replace('_', ' ').title()
         st.markdown(f"**Stage:** {stage_display}")
+        _auto_on = st.session_state.get("pref_auto_refresh", True)
+        _rc1, _rc2 = st.columns([1, 1])
+        with _rc1:
+            if st.button("🔄 Refresh", key=f"manual_refresh_{session_details.get('session_id','')}",
+                         use_container_width=True):
+                st.rerun()
+        with _rc2:
+            st.caption("🟢 live" if _auto_on else "⏸ manual")
 
     st.markdown("---")
     
@@ -1003,6 +1011,18 @@ def display_session_details(session_details: Dict):
 
     # Floating 💬 AI chat bubble — visible from any tab of this session.
     render_floating_chat(session_details)
+
+    # ── Live auto-refresh ─────────────────────────────────────────────────────
+    # The AI loop runs autonomously in the backend; without this the Overview
+    # would freeze on whatever snapshot was first loaded (e.g. "Scanning") and
+    # never reflect progress. While the session is actively working, re-run the
+    # page on an interval so hosts/services/commands/decisions update live.
+    _st_status = (session_details.get("status") or "").lower()
+    _auto = st.session_state.get("pref_auto_refresh", True)
+    if _auto and _st_status in ("scanning", "analyzing", "executing", "ready"):
+        _interval = max(4, int(st.session_state.get("pref_refresh_interval", 5)))
+        time.sleep(_interval)
+        st.rerun()
 
 
 def _render_chat_history(session_details: Dict):
