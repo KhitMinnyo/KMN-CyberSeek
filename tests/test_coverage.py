@@ -66,6 +66,28 @@ def test_progress_formula_bounds_and_weights():
     assert abs(p - 0.125) < 1e-6
 
 
+def test_match_and_mark_by_tool():
+    c = cov.build_service_coverage({"service": "microsoft-ds", "port": 445, "host": "10.0.0.5"})
+    done = cov.match_and_mark(c, "enum4linux-ng -A 10.0.0.5")
+    assert "smb.enum4linux" in done
+    assert c["steps"]["smb.enum4linux"] == cov.DONE
+    # already-done step isn't re-reported
+    assert cov.match_and_mark(c, "enum4linux-ng -A 10.0.0.5") == []
+
+
+def test_match_and_mark_ai_step_by_signal():
+    c = cov.build_service_coverage({"service": "mysql", "port": 3306, "host": "10.0.0.5"})
+    done = cov.match_and_mark(c, "mysql -h 10.0.0.5 -u root -e \"SELECT ... INTO OUTFILE '/x/shell.php'\"")
+    assert "mysql.file_write" in done
+
+
+def test_pending_steps_shrinks_as_marked():
+    c = cov.build_service_coverage({"service": "ftp", "port": 21, "host": "10.0.0.5"})
+    before = len(cov.pending_steps(c))
+    cov.match_and_mark(c, "curl -s ftp://10.0.0.5/ --user anonymous:anonymous")
+    assert len(cov.pending_steps(c)) < before
+
+
 def test_objective_complete_guard_blocks_premature():
     # One foothold but low coverage → NOT complete (the field bug: 100% on a
     # single win while most services untouched).

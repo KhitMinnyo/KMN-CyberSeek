@@ -46,6 +46,8 @@ from core.validators import is_valid_target, is_target_in_scope, is_allowlisted_
 from core import cve_lookup
 from core import threat_intel
 from core.shell_manager import ShellManager, get_local_ip, COMMON_PAYLOADS
+from core import playbooks as _playbooks
+from core import coverage as _coverage
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,11 @@ COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "600"))
 # regardless of risk_level. The operator sets this deliberately in .env.
 # Session-level authorization_confirmed is still required to create a session.
 FULL_AUTO_MODE: bool = os.getenv("FULL_AUTO_MODE", "false").lower() == "true"
+
+# COVERAGE_ENGINE: when true, the orchestrator drives a per-service methodology
+# (playbooks) and derives objective progress from measured coverage instead of the
+# strategist's estimate. Default OFF so behaviour is unchanged until opted in.
+COVERAGE_ENGINE: bool = os.getenv("COVERAGE_ENGINE", "false").lower() == "true"
 
 # Canonical stage progression order. The AI reports attack_phase in its JSON
 # responses; this list is the source of truth for valid transitions.
@@ -362,6 +369,10 @@ class Session:
         # can be reviewed later.
         self.chat_history: List[Dict] = []
 
+        # Coverage engine (opt-in): per-service methodology coverage, keyed by
+        # "host:port". Only populated when COVERAGE_ENGINE is enabled.
+        self.service_coverage: Dict[str, dict] = {}
+
     def to_dict(self) -> Dict:
         """Convert session to dictionary."""
         return {
@@ -395,6 +406,14 @@ class Session:
             "compromise_evidence": self.compromise_evidence,
             "operator_instructions": self.operator_instructions,
             "chat_history": self.chat_history[-100:],
+            "service_coverage": {
+                k: {
+                    "pct": round(_coverage.coverage_ratio(v) * 100),
+                    "state": _coverage.service_state(v),
+                    "pending": [st.intent for st in _coverage.pending_steps(v)][:6],
+                }
+                for k, v in self.service_coverage.items()
+            } if self.service_coverage else {},
         }
 
 
@@ -880,7 +899,11 @@ class Orchestrator:
             discovered_hosts = self.scanner.parse_nmap_results(scan_results)
             self._merge_hosts(session, discovered_hosts)
             self._merge_services(session, discovered_hosts)
-            
+
+            # Coverage engine: seed per-service playbooks from the scan (no-op off).
+            self._ensure_coverage(session)
+            self._recompute_coverage_progress(session)
+
             # Nmap done: move to enumeration (the next logical step after port scanning).
             # Vulnerability analysis runs as a background task and does not block
             # enumeration commands — the AI will advance through vulnerability_analysis
@@ -1427,6 +1450,10 @@ class Orchestrator:
 
             # Operator steering — highest priority, first in the block.
             _exhausted_ctx = self._operator_context_block(session)
+
+            # Methodology coverage — guide the AI through the per-service playbook.
+            self._ensure_coverage(session)
+            _exhausted_ctx += self._coverage_context_block(session)
 
             # Exhausted attack vectors — injected so AI skips them automatically.
             _exhausted_ctx += self._exhausted_context_block(session)
@@ -1987,6 +2014,12 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 session, command, sanitized_output, success=(return_code == 0)
             )
 
+            # Coverage engine: mark playbook steps this command attempted, and
+            # recompute coverage-derived progress. No-op unless COVERAGE_ENGINE on.
+            self._ensure_coverage(session)
+            self._update_coverage_from_command(session, command)
+            self._recompute_coverage_progress(session)
+
             # Feed this command's result into the hybrid retrieval index so it can
             # be surfaced later even after it falls out of the recent-history window.
             if return_code == 0 and sanitized_output:
@@ -2020,6 +2053,9 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # command benefits from the fresh plan. If it declares the objective
             # met, halt the loop and stop here (no further command is chosen).
             await self._maybe_run_strategist(session_id)
+            # Coverage engine owns the progress number + completion when enabled,
+            # overriding the strategist's estimate (prevents premature 100%).
+            self._recompute_coverage_progress(session)
             if session.objective_complete:
                 logger.info(
                     f"Session {session_id}: objective complete — halting agentic loop."
@@ -2177,7 +2213,7 @@ Subdomains found: {len(session.discovered_subdomains)}{f' — [{", ".join(sessio
 Web apps found: {len(session.web_applications)}{f' — [{", ".join(a.get("url","") for a in session.web_applications[:5])}]' if session.web_applications else ''}
 API endpoints: {len(session.discovered_api_endpoints)}
 Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
-{self._operator_context_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}
+{self._operator_context_block(session)}{self._coverage_context_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}
 Domain rule: If Target Domain is provided ({session.target_domain}), use domain name for all web tools — never IP.
 
 {self._get_relevant_threat_intel_context(session_id)}
@@ -4693,6 +4729,92 @@ Web apps: {webapps}
             conn.close()
         except sqlite3.Error as e:
             logger.warning(f"Failed to persist chat message for {session_id}: {e}")
+
+    # ── Coverage engine (opt-in via COVERAGE_ENGINE) ──────────────────────────
+
+    @staticmethod
+    def _svc_key(svc: dict) -> str:
+        return f"{svc.get('host') or ''}:{svc.get('port') or ''}"
+
+    def _ensure_coverage(self, session: "Session") -> None:
+        """Build/refresh per-service playbook coverage for discovered services.
+        Idempotent; no-op unless COVERAGE_ENGINE is enabled."""
+        if not COVERAGE_ENGINE:
+            return
+        for svc in session.discovered_services:
+            key = self._svc_key(svc)
+            if key and key not in session.service_coverage:
+                try:
+                    session.service_coverage[key] = _coverage.build_service_coverage(svc)
+                except Exception as e:
+                    logger.warning(f"coverage build failed for {key}: {e}")
+
+    def _update_coverage_from_command(self, session: "Session", command: str) -> None:
+        """After a command runs, mark any playbook steps it attempted as done."""
+        if not COVERAGE_ENGINE or not command:
+            return
+        for cov in session.service_coverage.values():
+            try:
+                _coverage.match_and_mark(cov, command)
+            except Exception:
+                pass
+
+    def _recompute_coverage_progress(self, session: "Session") -> None:
+        """Derive objective progress + completion from measured coverage."""
+        if not COVERAGE_ENGINE or not session.service_coverage:
+            return
+        covs = list(session.service_coverage.values())
+        enum_cov = [_coverage.enumeration_coverage(c) for c in covs]
+        covered_ratio = (
+            sum(1 for c in covs if _coverage.is_service_covered(c)) / len(covs)
+            if covs else 0.0
+        )
+        vulns = session.vulnerabilities or []
+        validated = sum(1 for v in vulns if (v.get("status") or "") == "confirmed")
+        vuln_ratio = (validated / len(vulns)) if vulns else 0.0
+        footholds = len(session.compromise_evidence or [])
+        progress = _coverage.compute_progress(
+            recon_done=bool(session.discovered_services),
+            enum_coverages=enum_cov,
+            validated_vuln_ratio=vuln_ratio,
+            footholds=footholds,
+            post_ex_coverage=0.0,
+        )
+        session.objective_progress = progress
+        session.objective_complete = _coverage.is_objective_complete(
+            progress, covered_ratio, footholds
+        )
+
+    def _coverage_context_block(self, session: "Session") -> str:
+        """Render the per-service methodology checklist (pending steps) for the AI
+        so it works the full playbook and does not abandon a service early."""
+        if not COVERAGE_ENGINE or not session.service_coverage:
+            return ""
+        lines = ["\n=== METHODOLOGY COVERAGE (work every pending step; do NOT skip a service) ==="]
+        shown = 0
+        for svc in session.discovered_services:
+            key = self._svc_key(svc)
+            cov = session.service_coverage.get(key)
+            if not cov:
+                continue
+            pend = _coverage.pending_steps(cov)
+            if not pend:
+                continue
+            svc_name = svc.get("service", "?")
+            ratio = int(_coverage.coverage_ratio(cov) * 100)
+            lines.append(f"- {svc_name} ({key}) [{ratio}% covered] pending:")
+            for st in pend[:6]:
+                lines.append(f"    · {st.intent}")
+            shown += 1
+            if shown >= 8:
+                break
+        if shown == 0:
+            return ""
+        lines.append(
+            "Choose your next command to complete a pending step above. A service is "
+            "only done when its whole checklist is attempted.\n"
+        )
+        return "\n".join(lines)
 
     def _operator_context_block(self, session: "Session") -> str:
         """Render active operator instructions for the AI prompt. Highest priority

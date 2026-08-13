@@ -123,6 +123,10 @@ COMMAND_TIMEOUT=600
 MAX_AUTO_PIVOTS=6        # auto-pivots before pausing for manual review
 MAX_EMPTY_RETRIES=3      # retries when the model returns no command
 WATCHDOG_STALL_SECONDS=  # default: COMMAND_TIMEOUT + 180 (stuck-session revival)
+
+# Coverage engine (experimental) — methodology-driven per-service playbooks +
+# coverage-derived progress. Off by default; opt in per-target-agnostic runs.
+COVERAGE_ENGINE=false
 ```
 
 ---
