@@ -65,13 +65,38 @@ COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "600"))
 FULL_AUTO_MODE: bool = os.getenv("FULL_AUTO_MODE", "false").lower() == "true"
 
 # COVERAGE_ENGINE: when true, the orchestrator drives a per-service methodology
-# (playbooks) and derives objective progress from measured coverage instead of the
-# strategist's estimate. Default OFF so behaviour is unchanged until opted in.
-COVERAGE_ENGINE: bool = os.getenv("COVERAGE_ENGINE", "false").lower() == "true"
+# (playbooks) and derives objective progress from measured coverage. Default ON —
+# toggleable at runtime from the Settings page (no .env editing required).
+COVERAGE_ENGINE: bool = os.getenv("COVERAGE_ENGINE", "true").lower() == "true"
 
 # BRUTEFORCE_ENABLED: run the decoupled brute-force worker against discovered auth
-# services (produces credentials the main loop reuses). Default OFF.
-BRUTEFORCE_ENABLED: bool = os.getenv("BRUTEFORCE_ENABLED", "false").lower() == "true"
+# services (produces credentials the main loop reuses). Default ON.
+BRUTEFORCE_ENABLED: bool = os.getenv("BRUTEFORCE_ENABLED", "true").lower() == "true"
+
+# Feature flags exposed to the Settings UI. Names map to the module globals above
+# (and FULL_AUTO_MODE). Toggling updates the live global immediately AND is
+# persisted to .env by the API so it survives a restart.
+_FEATURE_FLAGS = {
+    "coverage_engine": "COVERAGE_ENGINE",
+    "bruteforce_enabled": "BRUTEFORCE_ENABLED",
+    "full_auto_mode": "FULL_AUTO_MODE",
+}
+
+
+def get_feature_flags() -> Dict[str, bool]:
+    """Current values of the user-toggleable feature flags."""
+    return {ui: bool(globals().get(gname, False)) for ui, gname in _FEATURE_FLAGS.items()}
+
+
+def set_feature_flag(ui_name: str, enabled: bool) -> Optional[str]:
+    """Update a feature flag's live value. Returns the .env key name on success,
+    or None if the flag is unknown. Persistence to .env is the caller's job."""
+    gname = _FEATURE_FLAGS.get(ui_name)
+    if not gname:
+        return None
+    globals()[gname] = bool(enabled)
+    logger.info(f"Feature flag {gname} set to {bool(enabled)} (runtime)")
+    return gname
 
 # Canonical stage progression order. The AI reports attack_phase in its JSON
 # responses; this list is the source of truth for valid transitions.

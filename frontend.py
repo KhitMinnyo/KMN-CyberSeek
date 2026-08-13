@@ -442,6 +442,28 @@ def get_shell_history(session_id: str, handler_id: str, msf_id: int) -> list:
     return []
 
 
+def get_feature_flags_api() -> dict:
+    """Current engine feature-flag values from the backend."""
+    try:
+        r = api_session.get(f"{API_BASE}/settings/features", timeout=6)
+        if r.status_code == 200:
+            return r.json().get("flags", {})
+    except Exception:
+        pass
+    return {}
+
+
+def set_feature_flags_api(**flags) -> dict:
+    """Toggle engine feature flags (persisted to .env by the backend)."""
+    try:
+        r = api_session.post(f"{API_BASE}/settings/features", json=flags, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        return {"status": "error", "message": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 def get_bruteforce_status(session_id: str) -> list:
     """Decoupled brute-force worker job status for a session."""
     try:
@@ -3134,10 +3156,32 @@ def show_settings():
     tab1, tab2, tab3, tab4 = st.tabs(["General", "AI Configuration", "Security", "Advanced"])
     
     with tab1:
+        # ── Engine features — toggle live, persisted to .env (no manual editing) ──
+        st.markdown("### 🚀 Engine Features")
+        _flags = get_feature_flags_api()
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            _cov = st.toggle("🧭 Coverage Engine", value=_flags.get("coverage_engine", True),
+                             help="Methodology-driven per-service playbooks + coverage progress")
+        with fc2:
+            _bf = st.toggle("🔓 Brute-force worker", value=_flags.get("bruteforce_enabled", True),
+                            help="Background credential brute-force on auth services")
+        with fc3:
+            _fa = st.toggle("⚡ Full-Auto mode", value=_flags.get("full_auto_mode", False),
+                            help="Execute all commands without approval — isolated labs only")
+        if st.button("💾 Save Engine Features", type="primary", key="save_features"):
+            res = set_feature_flags_api(coverage_engine=_cov, bruteforce_enabled=_bf, full_auto_mode=_fa)
+            if res.get("status") == "success":
+                st.success("Saved — applies immediately and persists across restarts.")
+            else:
+                st.error(res.get("message", "Failed to save features."))
+        st.caption("Changes take effect immediately for new decisions; no restart needed.")
+        st.markdown("---")
+
         st.markdown("### 🌐 General Settings")
-        
+
         col1, col2 = st.columns(2)
-        
+
         with col1:
             auto_refresh = st.checkbox("Enable auto-refresh", value=True)
             refresh_interval = st.slider("Refresh interval (seconds)", 1, 60, 5, disabled=not auto_refresh)

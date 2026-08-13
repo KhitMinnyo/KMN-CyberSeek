@@ -191,6 +191,12 @@ class AskRequest(BaseModel):
     """Operator question about the current session (read-only status chat)."""
     question: str = Field(..., description="Natural-language question about the engagement")
 
+class FeatureFlagsRequest(BaseModel):
+    """Toggle user-facing feature flags from the Settings UI (no .env editing)."""
+    coverage_engine: Optional[bool] = None
+    bruteforce_enabled: Optional[bool] = None
+    full_auto_mode: Optional[bool] = None
+
 # Known context windows for common Ollama models — used as fallback when
 # /api/show doesn't expose the model_info.context_length field.
 _KNOWN_CTX: dict = {
@@ -469,6 +475,36 @@ async def download_session_report_pdf(session_id: str):
         filename=filename,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
+
+
+@app.get("/api/settings/features")
+async def get_feature_flags():
+    """Current feature-flag values for the Settings UI."""
+    import core.orchestrator as _orch
+    return {"flags": _orch.get_feature_flags()}
+
+
+@app.post("/api/settings/features")
+async def set_feature_flags(req: FeatureFlagsRequest):
+    """Toggle feature flags live AND persist to .env so they survive a restart."""
+    import core.orchestrator as _orch
+    env_path = os.path.join(os.getcwd(), ".env")
+    if not os.path.exists(env_path):
+        open(env_path, "w").close()
+    changed = {}
+    for ui_name in ("coverage_engine", "bruteforce_enabled", "full_auto_mode"):
+        val = getattr(req, ui_name)
+        if val is None:
+            continue
+        gname = _orch.set_feature_flag(ui_name, val)
+        if gname:
+            try:
+                set_key(env_path, gname, "true" if val else "false")
+            except Exception as e:
+                logger.warning(f"Failed to persist {gname} to .env: {e}")
+            changed[ui_name] = bool(val)
+    logger.info(f"Feature flags updated: {changed}")
+    return {"status": "success", "changed": changed, "flags": _orch.get_feature_flags()}
 
 
 @app.get("/api/sessions/{session_id}/bruteforce")
