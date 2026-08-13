@@ -356,6 +356,12 @@ class Session:
         # the persisted ai_decisions (context="operator_instruction").
         self.operator_instructions: List[str] = []
 
+        # Status-chat transcript for this session (messenger-style). Each entry:
+        #   {"role": "user"|"ai", "text": str, "timestamp": iso}
+        # Persisted to the chat_messages table so it survives backend restarts and
+        # can be reviewed later.
+        self.chat_history: List[Dict] = []
+
     def to_dict(self) -> Dict:
         """Convert session to dictionary."""
         return {
@@ -388,6 +394,7 @@ class Session:
             "exhausted_services": self.exhausted_services,
             "compromise_evidence": self.compromise_evidence,
             "operator_instructions": self.operator_instructions,
+            "chat_history": self.chat_history[-100:],
         }
 
 
@@ -648,6 +655,18 @@ class Orchestrator:
                     payload     TEXT NOT NULL,
                     status      TEXT DEFAULT 'stopped',
                     started_at  TIMESTAMP,
+                    FOREIGN KEY (session_id) REFERENCES sessions (session_id)
+                )
+            ''')
+
+            # Status-chat transcript per session (messenger-style, persisted).
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role       TEXT NOT NULL,
+                    text       TEXT NOT NULL,
+                    timestamp  TIMESTAMP NOT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions (session_id)
                 )
             ''')
@@ -3821,6 +3840,19 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 if len(session.operator_instructions) > 12:
                     session.operator_instructions = session.operator_instructions[-12:]
 
+                # Load chat transcript (best-effort; table may not exist on old DBs)
+                try:
+                    cursor.execute(
+                        "SELECT role, text, timestamp FROM chat_messages "
+                        "WHERE session_id = ? ORDER BY id", (session_id,)
+                    )
+                    for _role, _text, _ts in cursor.fetchall():
+                        session.chat_history.append(
+                            {"role": _role, "text": _text, "timestamp": _ts}
+                        )
+                except sqlite3.OperationalError:
+                    pass
+
                 # Load pending commands into orchestrator's pending_commands dict
                 cursor.execute('''
                     SELECT command_id, command_text, status, risk_level, timestamp
@@ -3847,8 +3879,11 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 # Queue for auto-resume if the session was mid-flight.
                 # scanning + nmap results exist → skip re-scan, go straight to AI.
                 # analyzing / executing → restart the AI analysis loop.
+                # ready → the loop had paused (auto-approve idle, or a recovery
+                #   pause); after a restart no task is running, so "ready" would
+                #   otherwise look active but do nothing — resume it too.
                 # initialized → nothing to resume (never got started).
-                if status in ("scanning", "analyzing", "executing"):
+                if status in ("scanning", "analyzing", "executing", "ready"):
                     has_scan_data = bool(session.scan_results or session.discovered_hosts)
                     self._sessions_to_auto_resume.append({
                         "session_id": session_id,
@@ -4590,6 +4625,9 @@ Web apps: {webapps}
             f"OPERATOR QUESTION: {question}\n\n"
             "Return ONLY JSON: {\"answer\": \"...\"}"
         )
+        # Record the operator's question in the transcript first so it shows even
+        # if the AI call then fails.
+        self._append_chat(session_id, "user", question)
         try:
             data = await self.ai_connector.ask_raw_async(system_prompt, user_prompt)
             answer = ""
@@ -4597,10 +4635,35 @@ Web apps: {webapps}
                 answer = str(data.get("answer") or "").strip()
             if not answer:
                 answer = "The AI did not return a usable answer. Try rephrasing the question."
+            self._append_chat(session_id, "ai", answer)
             return {"status": "success", "answer": answer}
         except Exception as e:
             logger.warning(f"answer_operator_question failed for {session_id}: {e}")
+            self._append_chat(session_id, "ai", f"[error] {e}")
             return {"status": "error", "message": f"AI query failed: {e}"}
+
+    def _append_chat(self, session_id: str, role: str, text: str) -> None:
+        """Add one chat message to the session transcript and persist it."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+        entry = {"role": role, "text": text, "timestamp": datetime.now().isoformat()}
+        session.chat_history.append(entry)
+        if len(session.chat_history) > 200:
+            session.chat_history = session.chat_history[-200:]
+        if not getattr(self, "db_path", None):
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "INSERT INTO chat_messages (session_id, role, text, timestamp) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, role, text, entry["timestamp"]),
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to persist chat message for {session_id}: {e}")
 
     def _operator_context_block(self, session: "Session") -> str:
         """Render active operator instructions for the AI prompt. Highest priority
@@ -5006,8 +5069,8 @@ Web apps: {webapps}
             cursor.execute('DELETE FROM vulnerabilities WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM credentials WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM ai_decisions WHERE session_id = ?', (session_id,))
-            # Shell tables (best-effort: older DBs may not have them yet).
-            for _tbl in ("shell_handlers", "shell_sessions_log"):
+            # Shell + chat tables (best-effort: older DBs may not have them yet).
+            for _tbl in ("shell_handlers", "shell_sessions_log", "chat_messages"):
                 try:
                     cursor.execute(f'DELETE FROM {_tbl} WHERE session_id = ?', (session_id,))
                 except sqlite3.OperationalError:
@@ -5065,7 +5128,7 @@ Web apps: {webapps}
             cursor.execute('DELETE FROM vulnerabilities')
             cursor.execute('DELETE FROM credentials')
             cursor.execute('DELETE FROM ai_decisions')
-            for _tbl in ("shell_handlers", "shell_sessions_log"):
+            for _tbl in ("shell_handlers", "shell_sessions_log", "chat_messages"):
                 try:
                     cursor.execute(f'DELETE FROM {_tbl}')
                 except sqlite3.OperationalError:
