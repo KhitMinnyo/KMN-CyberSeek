@@ -199,6 +199,30 @@ PLAYBOOKS: Dict[str, List[PlaybookStep]] = {
 }
 
 
+# Post-exploitation checklist — triggered once ANY foothold exists (not tied to a
+# single service). OS-aware intents; the AI adapts commands to the shell it has.
+POSTEX_STEPS: List[PlaybookStep] = [
+    PlaybookStep("postex.identity", "Confirm identity & privileges (whoami /all, id)",
+                 PHASE_POST, KIND_AI, produces=["priv"], signals=["whoami /all", "whoami /priv", "id;"]),
+    PlaybookStep("postex.system", "Host/OS details (systeminfo, uname -a)",
+                 PHASE_POST, KIND_AI, produces=["os"], signals=["systeminfo", "uname -a"]),
+    PlaybookStep("postex.users", "Local users & groups; admins",
+                 PHASE_POST, KIND_AI, produces=["users"], signals=["net user", "net localgroup", "/etc/passwd"]),
+    PlaybookStep("postex.defenses", "AV/firewall/UAC posture (Defender, firewall, EnableLUA)",
+                 PHASE_POST, KIND_AI, produces=["misconfig"],
+                 signals=["get-mppreference", "netsh advfirewall", "enablelua", "defender"]),
+    PlaybookStep("postex.network", "Network posture (LLMNR/NBT-NS, IPv6, ARP, routes)",
+                 PHASE_POST, KIND_AI, produces=["misconfig"], signals=["ipconfig", "arp -a", "llmnr", "netstat"]),
+    PlaybookStep("postex.creds", "Harvest credentials (SAM/LSASS, config files, history)",
+                 PHASE_POST, KIND_AI, produces=["creds"], signals=["secretsdump", "reg save", "sam", "mimikatz"]),
+    PlaybookStep("postex.privesc", "Local privilege-escalation scan (winPEAS/linPEAS)",
+                 PHASE_POST, KIND_AI, produces=["priv"], signals=["winpeas", "linpeas", "powerup"]),
+    PlaybookStep("postex.loot", "Loot sensitive files (configs, keys, docs)",
+                 PHASE_POST, KIND_AI, produces=["file_read"], signals=["type c:", "cat /", "findstr /si password"]),
+]
+
+
+
 # ---------------------------------------------------------------------------
 # Classification: discovered service -> playbook keys
 # ---------------------------------------------------------------------------

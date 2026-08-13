@@ -442,6 +442,17 @@ def get_shell_history(session_id: str, handler_id: str, msf_id: int) -> list:
     return []
 
 
+def get_bruteforce_status(session_id: str) -> list:
+    """Decoupled brute-force worker job status for a session."""
+    try:
+        r = api_session.get(f"{API_BASE}/sessions/{session_id}/bruteforce", timeout=6)
+        if r.status_code == 200:
+            return r.json().get("jobs", [])
+    except Exception:
+        pass
+    return []
+
+
 def steer_session(session_id: str, instruction: str) -> dict:
     """Send a live natural-language steering instruction to the running AI."""
     try:
@@ -1269,6 +1280,34 @@ def show_session_overview(session_details: Dict):
                 st.caption(f"Via: `{_c.get('command','')}`  ·  Signal: {_c.get('signal','')}")
                 if _c.get("proof"):
                     st.code(_c["proof"], language="text")
+
+    # ── Methodology coverage matrix (Coverage Engine) ─────────────────────────
+    _cov = session_details.get("service_coverage", {}) or {}
+    if _cov:
+        _svc_cov = {k: v for k, v in _cov.items() if k != "__postex__"}
+        if _svc_cov:
+            _avg = round(sum(v.get("pct", 0) for v in _svc_cov.values()) / len(_svc_cov))
+            with st.expander(f"🧭 Methodology Coverage — {_avg}% avg across {len(_svc_cov)} service(s)", expanded=False):
+                for key, v in sorted(_svc_cov.items()):
+                    pct = v.get("pct", 0)
+                    state = v.get("state", "untested")
+                    bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                    st.markdown(f"**`{key}`** `{bar}` {pct}% · _{state}_")
+                    if v.get("pending"):
+                        st.caption("pending: " + " · ".join(v["pending"][:5]))
+                _px = _cov.get("__postex__")
+                if _px:
+                    st.markdown(f"**post-exploitation** {_px.get('pct',0)}% · _{_px.get('state','')}_")
+
+    # ── Brute-force worker panel (decoupled) ──────────────────────────────────
+    _bf = get_bruteforce_status(session_id) if session_id else []
+    if _bf:
+        _found = sum(j.get("creds_found", 0) for j in _bf)
+        with st.expander(f"🔓 Brute-force — {len(_bf)} job(s), {_found} credential(s) found", expanded=False):
+            for j in _bf:
+                icon = {"queued": "⏳", "running": "🔄", "done": "✅", "error": "⚠️"}.get(j.get("status"), "•")
+                st.markdown(f"{icon} `{j.get('service')}` {j.get('host')}:{j.get('port')} — "
+                            f"{j.get('status')} · {j.get('creds_found', 0)} found")
 
     # Check if session is in analyzing state and show loading indicator
     if session_details.get("status") == "analyzing":

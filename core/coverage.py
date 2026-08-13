@@ -47,6 +47,18 @@ def build_service_coverage(svc: dict) -> dict:
     }
 
 
+def build_postex_coverage() -> dict:
+    """Coverage record for the (service-agnostic) post-exploitation checklist,
+    activated once a foothold exists."""
+    steps = pb.POSTEX_STEPS
+    return {
+        "keys": [],
+        "postex": True,
+        "steps": {st.id: PENDING for st in steps},
+        "phases": {st.id: st.phase for st in steps},
+    }
+
+
 def mark(cov: dict, step_id: str, status: str) -> None:
     """Set a step's status (best-effort; unknown ids are ignored)."""
     if step_id in cov.get("steps", {}):
@@ -54,6 +66,8 @@ def mark(cov: dict, step_id: str, status: str) -> None:
 
 
 def _steps_for(cov: dict) -> List:
+    if cov.get("postex"):
+        return list(pb.POSTEX_STEPS)
     return pb.get_steps(cov.get("keys", []))
 
 

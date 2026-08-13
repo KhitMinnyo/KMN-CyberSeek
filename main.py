@@ -471,6 +471,14 @@ async def download_session_report_pdf(session_id: str):
     )
 
 
+@app.get("/api/sessions/{session_id}/bruteforce")
+async def get_bruteforce_status(session_id: str):
+    """Decoupled brute-force worker status for a session (per-service jobs)."""
+    if not orchestrator.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"jobs": orchestrator.get_bruteforce_status(session_id)}
+
+
 @app.get("/api/sessions/{session_id}/report/md")
 async def download_session_report_md(session_id: str):
     """Generate and download a Markdown penetration-test report. Pure Python —
