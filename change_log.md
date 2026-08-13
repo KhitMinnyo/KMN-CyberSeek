@@ -4,6 +4,18 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.2.4] — 2026-08-12
+
+### Added
+- **Persistent chat transcript (messenger-style).** The AI chat now keeps a full per-session conversation instead of overwriting a single answer. Messages are stored in a new `chat_messages` table, reloaded on restart, and rendered as scrollable right/left bubbles so you can review the whole conversation. Exposed via `session.chat_history` in the session report.
+- **Enter-to-send.** Both the chat and steer inputs are now `st.form`s, so pressing **Enter** submits (no longer requires clicking the button).
+
+### Changed
+- **Steering is now limited to active sessions.** The 🎯 Steer input only appears while a session is actually running (scanning/analyzing/executing/ready); for inactive sessions the chat shows a note instead. Keeps the chat clean and instructions scoped to the live engagement.
+
+### Fixed
+- **After `./start.sh` restart, sessions showed `ready` but the AI wasn't actually running** (no Resume, no activity in the log). Restored sessions with status `ready` weren't queued for auto-resume (only scanning/analyzing/executing were), so `ready` looked active but nothing ran. `ready` is now included in auto-resume, so a restored session genuinely continues.
+
 ## [2.2.3] — 2026-08-12
 
 ### Fixed

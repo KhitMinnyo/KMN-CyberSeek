@@ -387,6 +387,31 @@ def test_answer_operator_question_uses_state():
     assert any("glassfish" in str(a).lower() for a in args)
 
 
+def test_chat_history_records_question_and_answer():
+    orch = _loop_orch()
+    s = make_session(services=[svc(80, "http")])
+    orch.sessions[s.session_id] = s
+    orch.ai_connector.ask_raw_async = AsyncMock(return_value={"answer": "42 findings"})
+    _run(orch.answer_operator_question(s.session_id, "how many findings?"))
+    roles = [m["role"] for m in s.chat_history]
+    texts = [m["text"] for m in s.chat_history]
+    assert roles == ["user", "ai"]
+    assert "how many findings?" in texts[0] and "42 findings" in texts[1]
+    # exposed to the frontend via to_dict
+    assert s.to_dict()["chat_history"] == s.chat_history
+
+
+def test_chat_history_records_error_answer_on_failure():
+    orch = _loop_orch()
+    s = make_session(); orch.sessions[s.session_id] = s
+    orch.ai_connector.ask_raw_async = AsyncMock(side_effect=RuntimeError("boom"))
+    res = _run(orch.answer_operator_question(s.session_id, "status?"))
+    assert res["status"] == "error"
+    # question still recorded, plus an error reply — transcript never half-drops
+    assert s.chat_history[0]["role"] == "user"
+    assert s.chat_history[-1]["role"] == "ai" and "boom" in s.chat_history[-1]["text"]
+
+
 def test_create_episode_summary_uses_session_episode_size():
     """Regression: _create_episode_summary referenced self._EPISODE_SIZE (an
     orchestrator attr that doesn't exist) → AttributeError crashed the whole
