@@ -15,6 +15,7 @@ import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
 from core.orchestrator import _detect_privilege_level, _detect_exhausted_target
+from ai.connector import AIResponse
 from tests._helpers import make_orch, make_session, svc
 
 
@@ -314,6 +315,39 @@ def test_persist_shell_session_logs_caught_shell_decision():
 
 
 # ── episode summary (regressions) ───────────────────────────────────────────
+
+def test_full_auto_critique_reject_no_unbound_error():
+    """Regression: in FULL_AUTO_MODE a critique-rejected high-risk command hit
+    `elif not _queued_already` while _queued_already was never assigned →
+    UnboundLocalError failed the whole loop turn ('Agentic loop error')."""
+    import core.orchestrator as orch_mod
+    orch = _loop_orch()
+    s = make_session(services=[svc(80, "http")])
+    orch.sessions[s.session_id] = s
+    s.status = "executing"
+
+    hi = AIResponse(reasoning="risky", suggested_command="msfvenom -p x LHOST=1",
+                    risk_level="high", confidence=0.9, attack_phase="exploitation")
+    orch.ai_connector.ask_ai_async = AsyncMock(return_value=hi)
+    orch._build_ai_memory = MagicMock(return_value="")
+    orch._plan_context_block = MagicMock(return_value="")
+    orch._get_relevant_threat_intel_context = MagicMock(return_value="")
+    orch._auto_parse_tool_output = MagicMock()
+    orch._vet_command = AsyncMock(return_value={"verdict": "reject", "reason": "bogus"})
+    queued = []
+    orch.queue_for_approval = lambda sid, cmd: queued.append(cmd)
+
+    _orig = orch_mod.FULL_AUTO_MODE
+    orch_mod.FULL_AUTO_MODE = True
+    try:
+        _run(orch._process_command_output(s.session_id, "prev cmd", "some output", None))
+    finally:
+        orch_mod.FULL_AUTO_MODE = _orig
+
+    # No exception, and the rejected command was routed to approval exactly once.
+    assert queued == ["msfvenom -p x LHOST=1"]
+    assert not any(d.get("context") == "loop_error" for d in s.ai_decisions)
+
 
 def test_operator_instruction_injected_into_context():
     orch = _loop_orch()

@@ -856,12 +856,26 @@ async def resume_session(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = orchestrator.sessions[session_id]
-    already_active = session.status in ("scanning", "analyzing", "executing", "ready")
+
+    # A recovery/pause context on the last decision means the loop halted and is
+    # waiting for the operator — even though status may still read "ready". In that
+    # case Resume must actually restart analysis (not no-op).
+    _PAUSED_CTX = {
+        "loop_error", "no_next_step", "watchdog_stalled",
+        "pivot_limit_reached", "loop_prevention",
+    }
+    _last_ctx = session.ai_decisions[-1].get("context") if session.ai_decisions else ""
+    _is_paused = _last_ctx in _PAUSED_CTX
+
+    already_active = (
+        session.status in ("scanning", "analyzing", "executing", "ready")
+        and not _is_paused
+    )
     if already_active:
         logger.info(f"Resume called on already-active session {session_id} (status={session.status}) — no-op")
         return {"status": "already_running", "message": f"Session is already active (status: {session.status})"}
 
-    logger.info(f"Manual resume triggered for {session_id}")
+    logger.info(f"Manual resume triggered for {session_id} (paused_ctx={_last_ctx or 'none'})")
     session.status = "analyzing"
     asyncio.create_task(orchestrator._analyze_with_ai(session_id))
     return {"status": "success", "message": "AI analysis resumed"}

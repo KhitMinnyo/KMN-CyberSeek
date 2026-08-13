@@ -1217,10 +1217,19 @@ def show_session_overview(session_details: Dict):
 
     status = session_details.get("status", "").lower()
 
-    # "ready" = AI autonomous loop is active (commands executing via auto-approve).
-    # Showing Resume while "ready" is misleading and dangerous — a second click
-    # spawns a duplicate _analyze_with_ai() task, doubling queued commands.
-    in_progress = status in ("scanning", "analyzing", "executing", "ready")
+    # A recovery/pause context on the LAST decision means the loop halted and is
+    # waiting for the operator — even though status is still "ready". In that case
+    # Resume MUST be enabled (the banner tells the user to click it).
+    _PAUSED_CTX = {
+        "loop_error", "no_next_step", "watchdog_stalled",
+        "pivot_limit_reached", "loop_prevention",
+    }
+    _is_paused = _last_ctx in _PAUSED_CTX
+
+    # "ready" normally means the AI autonomous loop is active (commands executing
+    # via auto-approve); Resume is disabled then to avoid spawning a duplicate
+    # analysis task. But when the session is paused (above), treat it as resumable.
+    in_progress = status in ("scanning", "analyzing", "executing", "ready") and not _is_paused
     has_data = (
         session_details.get("discovered_hosts_count", 0) > 0
         or session_details.get("commands_executed_count", 0) > 0

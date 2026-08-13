@@ -4,6 +4,13 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.2.3] — 2026-08-12
+
+### Fixed
+- **"Agentic loop error" on every turn — `UnboundLocalError: _queued_already`.** In `_process_command_output`, `_queued_already` was only assigned in the non-FULL_AUTO branch, but the trailing `elif not _queued_already` ran in all modes — so under `FULL_AUTO_MODE` (and on the critique-reject path) it raised `UnboundLocalError`, which the handler turned into a `loop_error` and paused the session. Now initialised before the branch and set on the FULL_AUTO critique-reject path. Regression-tested.
+- **Resume button did nothing when a session was paused.** A recovery/pause state (`loop_error`, `no_next_step`, `watchdog_stalled`, `pivot_limit_reached`, `loop_prevention`) leaves `status="ready"`, which both the frontend and the `/resume` endpoint treated as "already running" — so Resume was greyed out and the endpoint no-op'd. Both now detect the paused context from the last decision and make Resume clickable and functional.
+- **`name 'shlex' is not defined` during command execution.** `_inject_credentials` used `shlex.quote` but `shlex` was only imported locally in another method. Added the top-level import.
+
 ## [2.2.2] — 2026-08-12
 
 ### Added
