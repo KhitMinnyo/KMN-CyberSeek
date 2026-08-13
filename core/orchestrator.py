@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -2271,6 +2272,11 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 return  # _auto_pivot() re-schedules _analyze_with_ai internally
             
             # Check if we should auto-execute the suggested command (Agentic Loop).
+            # _queued_already must be initialised for BOTH branches — the
+            # FULL_AUTO_MODE path used to leave it unset, so the final
+            # `elif not _queued_already` raised UnboundLocalError and failed the
+            # whole loop turn (surfaced as the "Agentic loop error" banner).
+            _queued_already = False
             # FULL_AUTO_MODE: skip risk-level and confidence filters entirely.
             if FULL_AUTO_MODE:
                 should_auto_execute = bool(ai_response.suggested_command)
@@ -2290,6 +2296,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                             f"Routing to manual approval."
                         )
                         should_auto_execute = False
+                        _queued_already = True
                         self.queue_for_approval(session_id, ai_response.suggested_command)
                         _d = {
                             "timestamp": datetime.now().isoformat(),
