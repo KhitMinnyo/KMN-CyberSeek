@@ -48,6 +48,9 @@ from core import threat_intel
 from core.shell_manager import ShellManager, get_local_ip, COMMON_PAYLOADS
 from core import playbooks as _playbooks
 from core import coverage as _coverage
+from core import vuln_validate as _vuln_validate
+from core import exploit_map as _exploit_map
+from core.bruteforce_worker import BruteforceWorker
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,10 @@ FULL_AUTO_MODE: bool = os.getenv("FULL_AUTO_MODE", "false").lower() == "true"
 # (playbooks) and derives objective progress from measured coverage instead of the
 # strategist's estimate. Default OFF so behaviour is unchanged until opted in.
 COVERAGE_ENGINE: bool = os.getenv("COVERAGE_ENGINE", "false").lower() == "true"
+
+# BRUTEFORCE_ENABLED: run the decoupled brute-force worker against discovered auth
+# services (produces credentials the main loop reuses). Default OFF.
+BRUTEFORCE_ENABLED: bool = os.getenv("BRUTEFORCE_ENABLED", "false").lower() == "true"
 
 # Canonical stage progression order. The AI reports attack_phase in its JSON
 # responses; this list is the source of truth for valid transitions.
@@ -190,6 +197,35 @@ _EXPLOIT_SIGNALS = (
     "dumped",                   # credential dump tools (secretsdump, mimikatz)
     "flag{",                    # CTF-style flag capture
 )
+
+# Commands that merely ENUMERATE and routinely print "NT AUTHORITY\SYSTEM" (as a
+# well-known SID) — these must NOT be treated as a compromise on that string alone.
+_ENUM_ONLY_TOOLS = (
+    "enum4linux", "rpcclient", "smbmap", "ldapsearch", "nmap ",
+    "crackmapexec", "nxc ", "smbclient -l", "smbclient //", "getent",
+)
+
+
+def _is_windows_rce_proof(command: str, output: str) -> bool:
+    """True when a command's output proves Windows code execution (web-shell /
+    exec giving a SYSTEM/user identity), while excluding enumeration tools that
+    merely list the SYSTEM SID. This catches web-shell RCE (e.g. cmd.php?cmd=whoami
+    returning 'nt authority\\system') that the Unix/msf-centric signals miss.
+    """
+    o = (output or "").lower()
+    c = (command or "").lower()
+    win_identity = (
+        "nt authority\\system" in o
+        or "nt authority\\local service" in o
+        or "nt authority\\network service" in o
+        or (bool(re.search(r"\bwhoami\b", c)) and bool(re.search(r"^\w[\w.-]*\\[\w.$-]+", o, re.M)))
+    )
+    if not win_identity:
+        return False
+    # Exclude pure-enumeration commands (they print the SYSTEM SID during listing).
+    if any(t in c for t in _ENUM_ONLY_TOOLS):
+        return False
+    return True
 
 
 def _detect_privilege_level(output: str) -> Optional[str]:
@@ -443,6 +479,9 @@ class Orchestrator:
         # Each manager holds the persistent msfconsole multi/handler process(es)
         # and tracks active meterpreter/shell connections for that session.
         self._shell_managers: Dict[str, ShellManager] = {}
+
+        # Decoupled brute-force workers — one per pentest session (M5).
+        self._brute_workers: Dict[str, BruteforceWorker] = {}
 
         # ── Stuck-session watchdog ────────────────────────────────────────────
         # Detects sessions wedged in an active status (analyzing/executing) with
@@ -903,6 +942,9 @@ class Orchestrator:
             # Coverage engine: seed per-service playbooks from the scan (no-op off).
             self._ensure_coverage(session)
             self._recompute_coverage_progress(session)
+
+            # Kick off the decoupled brute-force worker on auth services (no-op off).
+            self._maybe_start_bruteforce(session_id)
 
             # Nmap done: move to enumeration (the next logical step after port scanning).
             # Vulnerability analysis runs as a background task and does not block
@@ -1454,6 +1496,7 @@ class Orchestrator:
             # Methodology coverage — guide the AI through the per-service playbook.
             self._ensure_coverage(session)
             _exhausted_ctx += self._coverage_context_block(session)
+            _exhausted_ctx += self._exploit_hints_block(session)
 
             # Exhausted attack vectors — injected so AI skips them automatically.
             _exhausted_ctx += self._exhausted_context_block(session)
@@ -2213,7 +2256,7 @@ Subdomains found: {len(session.discovered_subdomains)}{f' — [{", ".join(sessio
 Web apps found: {len(session.web_applications)}{f' — [{", ".join(a.get("url","") for a in session.web_applications[:5])}]' if session.web_applications else ''}
 API endpoints: {len(session.discovered_api_endpoints)}
 Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
-{self._operator_context_block(session)}{self._coverage_context_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}
+{self._operator_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}
 Domain rule: If Target Domain is provided ({session.target_domain}), use domain name for all web tools — never IP.
 
 {self._get_relevant_threat_intel_context(session_id)}
@@ -2839,6 +2882,21 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             "discovered_at": datetime.now().isoformat()
         }
 
+        # Version-aware validation: set confidence + potential/confirmed status and
+        # drop obvious false positives (TLS-only CVE on a plain service, version
+        # mismatch on a heuristic source). Best-effort — never blocks recording.
+        try:
+            validated = _vuln_validate.validate(record, record.get("service_version") or "")
+            if validated.get("suppressed"):
+                logger.info(
+                    f"Vulnerability suppressed (false positive) for {session_id}: "
+                    f"{name} — {validated.get('validation_note')}"
+                )
+                return None
+            record = validated
+        except Exception as e:
+            logger.warning(f"vuln validation failed for '{name}' (non-fatal): {e}")
+
         session.vulnerabilities.append(record)
         self._save_vulnerability_db(session_id, record)
 
@@ -3317,6 +3375,59 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         """Return in-memory credential list for a session (fast path)."""
         session = self.sessions.get(session_id)
         return list(session.credentials) if session else []
+
+    # ── Brute-force worker (M5, decoupled credential producer) ────────────────
+
+    def _ingest_credential(self, session_id: str, cred: Dict) -> None:
+        """Record a credential produced by the brute-force worker (deduped),
+        so the main loop's credential-reuse picks it up."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+        username = (cred.get("username") or "").strip()
+        secret = (cred.get("secret") or "")
+        if not username:
+            return
+        if any(c.get("username") == username and c.get("secret") == secret
+               for c in session.credentials):
+            return
+        record = {
+            "username": username, "secret": secret,
+            "secret_type": cred.get("secret_type", "password"),
+            "service": cred.get("service"), "host": cred.get("host"),
+            "port": cred.get("port"), "source_command": cred.get("source_command", "bruteforce"),
+            "discovered_at": datetime.now().isoformat(), "reused": False,
+        }
+        session.credentials.append(record)
+        self._save_credential_db(session_id, record)
+        logger.warning(
+            f"BRUTEFORCE credential for {session_id}: {username}:{'*' * len(secret)} "
+            f"on {record.get('service')} {record.get('host')}"
+        )
+
+    def _maybe_start_bruteforce(self, session_id: str) -> None:
+        """Submit discovered auth services to the decoupled brute-force worker.
+        No-op unless BRUTEFORCE_ENABLED. Idempotent per service."""
+        if not BRUTEFORCE_ENABLED:
+            return
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+        worker = self._brute_workers.get(session_id)
+        if worker is None:
+            worker = BruteforceWorker(
+                on_credential=lambda c, sid=session_id: self._ingest_credential(sid, c),
+                in_scope=lambda host: is_target_in_scope(host, os.getenv("SCOPE_ALLOWLIST", "")),
+            )
+            self._brute_workers[session_id] = worker
+        for svc in session.discovered_services:
+            if worker.supported(svc.get("service", "")):
+                worker.submit(svc.get("service"), svc.get("host") or session.target_ip,
+                              svc.get("port"))
+
+    def get_bruteforce_status(self, session_id: str) -> List[Dict]:
+        worker = self._brute_workers.get(session_id)
+        return worker.status() if worker else []
 
     def get_live_output(self, session_id: str) -> str:
         """Return the current rolling live-output buffer for a session.
@@ -4524,6 +4635,9 @@ Web apps: {webapps}
             return
         out_l = (output or "").lower()
         _matched = [sig for sig in _EXPLOIT_SIGNALS if sig in out_l]
+        # Windows web-shell / exec RCE proof (guarded against enumeration output).
+        if _is_windows_rce_proof(command, output):
+            _matched.append("windows-rce")
         exploited = bool(_matched)
         settle_state = "exploited" if exploited else "tested"
         referenced = self._services_referenced(session, command)
@@ -4748,6 +4862,9 @@ Web apps: {webapps}
                     session.service_coverage[key] = _coverage.build_service_coverage(svc)
                 except Exception as e:
                     logger.warning(f"coverage build failed for {key}: {e}")
+        # Activate the post-exploitation checklist once a foothold exists.
+        if session.compromise_evidence and "__postex__" not in session.service_coverage:
+            session.service_coverage["__postex__"] = _coverage.build_postex_coverage()
 
     def _update_coverage_from_command(self, session: "Session", command: str) -> None:
         """After a command runs, mark any playbook steps it attempted as done."""
@@ -4763,27 +4880,52 @@ Web apps: {webapps}
         """Derive objective progress + completion from measured coverage."""
         if not COVERAGE_ENGINE or not session.service_coverage:
             return
-        covs = list(session.service_coverage.values())
-        enum_cov = [_coverage.enumeration_coverage(c) for c in covs]
+        # Separate the post-exploitation record from per-service coverage.
+        svc_covs = [v for k, v in session.service_coverage.items() if k != "__postex__"]
+        postex_cov = session.service_coverage.get("__postex__")
+        enum_cov = [_coverage.enumeration_coverage(c) for c in svc_covs]
         covered_ratio = (
-            sum(1 for c in covs if _coverage.is_service_covered(c)) / len(covs)
-            if covs else 0.0
+            sum(1 for c in svc_covs if _coverage.is_service_covered(c)) / len(svc_covs)
+            if svc_covs else 0.0
         )
         vulns = session.vulnerabilities or []
         validated = sum(1 for v in vulns if (v.get("status") or "") == "confirmed")
         vuln_ratio = (validated / len(vulns)) if vulns else 0.0
         footholds = len(session.compromise_evidence or [])
+        postex_ratio = _coverage.coverage_ratio(postex_cov) if postex_cov else 0.0
         progress = _coverage.compute_progress(
             recon_done=bool(session.discovered_services),
             enum_coverages=enum_cov,
             validated_vuln_ratio=vuln_ratio,
             footholds=footholds,
-            post_ex_coverage=0.0,
+            post_ex_coverage=postex_ratio,
         )
         session.objective_progress = progress
         session.objective_complete = _coverage.is_objective_complete(
             progress, covered_ratio, footholds
         )
+
+    def _exploit_hints_block(self, session: "Session") -> str:
+        """Surface curated, high-signal exploit candidates for the discovered
+        services so the AI attempts known paths (Ghostcat, WAR deploy, INTO
+        OUTFILE, EternalBlue, etc.) instead of improvising."""
+        if not COVERAGE_ENGINE or not session.discovered_services:
+            return ""
+        keys: List[str] = []
+        for svc in session.discovered_services:
+            for k in _playbooks.classify_service(svc):
+                if k not in keys:
+                    keys.append(k)
+        cands = _exploit_map.candidates_for(keys)
+        if not cands:
+            return ""
+        lines = ["\n=== KNOWN EXPLOIT CANDIDATES (attempt the relevant ones) ==="]
+        for c in cands[:14]:
+            cve = f" [{c['cve']}]" if c.get("cve") else ""
+            tool = f"  →  {c['tool']}" if c.get("tool") else ""
+            lines.append(f"- {c['name']}{cve}: {c['technique']}{tool}")
+        lines.append("")
+        return "\n".join(lines)
 
     def _coverage_context_block(self, session: "Session") -> str:
         """Render the per-service methodology checklist (pending steps) for the AI
@@ -4808,8 +4950,19 @@ Web apps: {webapps}
             shown += 1
             if shown >= 8:
                 break
-        if shown == 0:
+        # Post-exploitation checklist (once a foothold exists).
+        postex = session.service_coverage.get("__postex__")
+        postex_lines: List[str] = []
+        if postex:
+            pend = _coverage.pending_steps(postex)
+            if pend:
+                postex_lines.append("- POST-EXPLOITATION (a foothold exists — enumerate the host):")
+                for st in pend[:8]:
+                    postex_lines.append(f"    · {st.intent}")
+
+        if shown == 0 and not postex_lines:
             return ""
+        lines.extend(postex_lines)
         lines.append(
             "Choose your next command to complete a pending step above. A service is "
             "only done when its whole checklist is attempted.\n"

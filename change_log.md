@@ -4,10 +4,13 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
-## [Unreleased] — Coverage Engine (v2.3.0, in progress)
+## [2.3.0] — 2026-08-13 — Coverage Engine
 
-Building the shift from opportunistic LLM-guessing to methodology-driven coverage
+The shift from opportunistic LLM-guessing to **methodology-driven coverage**
 (design: `docs/coverage-engine-design.md`, plan: `docs/coverage-engine-buildplan.md`).
+Target-agnostic — everything keys on service type, not a specific lab. All new
+capability is additive and, where it changes loop behaviour, gated behind flags
+(`COVERAGE_ENGINE`, `BRUTEFORCE_ENABLED`), both default OFF.
 
 ### Added
 - **M0 — Benchmark harness.** `benchmarks/score.py` scores an engagement report
@@ -33,6 +36,38 @@ Building the shift from opportunistic LLM-guessing to methodology-driven coverag
   **Benchmark check (2026-08-13 completed run, pre-engine):** touched 17/35
   (48.6%), confirmed 1/35 (2.9%) — barely above baseline; the number the engine
   must beat.
+- **M2 — Vulnerability validation** (`core/vuln_validate.py`, always on). Version-aware
+  filtering + `confidence` + `potential`/`confirmed` status. Suppresses TLS-only CVEs
+  on plain services (Heartbleed-on-FileZilla) and downgrades version-major-mismatch
+  keyword hits (Tomcat 3.x CVE on a 8.5 target). NSE/exploit sources = confirmed;
+  NVD/searchsploit = potential until validated. Unit-tested.
+- **M3 — Exploit mapping** (`core/exploit_map.py`). Curated, target-agnostic
+  knowledge base mapping service/tech → concrete exploit candidates (Ghostcat,
+  WAR deploy, INTO OUTFILE/UDF, EternalBlue, BlueKeep, vsftpd backdoor, WP plugin
+  RCE, WebDAV…). Surfaced to the AI as a "KNOWN EXPLOIT CANDIDATES" prompt block
+  so it attempts known paths (COVERAGE_ENGINE-gated).
+- **M4 — Post-exploitation + Windows RCE capture.** `_is_windows_rce_proof()` +
+  `windows-rce` signal capture a web-shell/exec SYSTEM foothold that the
+  Unix/msf-centric signals missed (guarded against enumeration output that merely
+  lists the SYSTEM SID). New `POSTEX_STEPS` checklist (identity, host, users,
+  AV/firewall/UAC, network/LLMNR/IPv6, cred harvest, privesc, loot) activates on a
+  foothold and is injected as a POST-EXPLOITATION block — this is what surfaces the
+  host/system-level findings. Post-ex coverage feeds the progress formula.
+- **M5 — Brute-force worker** (`core/bruteforce_worker.py`, `BRUTEFORCE_ENABLED`).
+  Decoupled credential **producer**: submits discovered auth services (ssh/ftp/
+  rdp/mysql/smb/winrm), brute-forces in the background with tiered wordlists
+  (built-in defaults → rockyou top-N → full), and pushes hits to the credential
+  store (`_ingest_credential`) which the main loop reuses — never blocking the
+  tactical loop. Bounded (per-service timeout, concurrency), scope-gated, safe when
+  tools are missing. Injectable runner → unit-tested without hydra.
+  API: `GET /api/sessions/{id}/bruteforce`.
+- **M6 — Coverage & brute-force UI.** Overview shows a **methodology coverage
+  matrix** (per-service % + state + pending steps, plus post-ex) and a
+  **brute-force panel** (per-service job status + creds found). Objective progress
+  is now coverage-derived.
+
+New env: `COVERAGE_ENGINE`, `BRUTEFORCE_ENABLED`, `BRUTEFORCE_TIER`,
+`BRUTEFORCE_MAX_SECONDS_PER_SERVICE`, `BRUTEFORCE_CONCURRENCY`. Suite: 125 passed.
 - **M1 (part 3) — Live wiring behind `COVERAGE_ENGINE` flag** (default OFF, so
   existing behaviour is unchanged). When enabled, the orchestrator: seeds
   per-service playbook coverage after the scan (`_ensure_coverage`); injects a
