@@ -4,7 +4,7 @@ KMN-CyberSeek Streamlit Frontend
 Web dashboard for AI-driven autonomous red team operations.
 """
 
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.4"
 
 import html
 import json

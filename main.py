@@ -57,7 +57,7 @@ app = FastAPI(
     title="KMN-CyberSeek API",
     on_startup=[],   # populated below after orchestrator is built
     description="AI-Driven Autonomous Red Team Operator Backend",
-    version="2.0.0",
+    version="2.2.4",
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
@@ -277,7 +277,7 @@ async def root():
     """Root endpoint with API information."""
     return {
         "name": "KMN-CyberSeek",
-        "version": "2.0.0",
+        "version": "2.2.4",
         "status": "operational",
         "endpoints": ["/api/docs", "/api/start", "/api/sessions", "/api/ws"],
         "description": "AI-Driven Autonomous Red Team Operator"
