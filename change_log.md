@@ -16,6 +16,12 @@ Building the shift from opportunistic LLM-guessing to methodology-driven coverag
   per-category, missed list). Dependency-free; unit-tested (`tests/test_benchmark.py`).
   **Baseline (v2.2.7 run):** touched 16/35 (45.7%), confirmed 1/35 (2.9%); web_cms
   and windows_system at 0 — recorded in `benchmarks/README.md`.
+- **M1 (part 1) — Playbook registry** (`core/playbooks.py`). Declarative per-service
+  methodology: `PlaybookStep` schema (deterministic vs AI steps), playbooks for
+  http/tomcat/glassfish/jenkins/smb/ftp/ssh/mysql/winrm/rdp/generic, service→playbook
+  classification, and command rendering. Pure data (no orchestrator coupling yet) —
+  unit-tested (`tests/test_playbooks.py`). Not yet wired into the live loop; that
+  integration lands behind a `COVERAGE_ENGINE` flag next.
 
 ---
 
