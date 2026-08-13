@@ -4,7 +4,12 @@ KMN-CyberSeek Streamlit Frontend
 Web dashboard for AI-driven autonomous red team operations.
 """
 
-APP_VERSION = "2.2.4"
+# Version comes from the single source of truth (_version.py) so the sidebar,
+# the API, and the README badge can never drift apart.
+try:
+    from _version import __version__ as APP_VERSION
+except Exception:  # pragma: no cover - fallback if run from an odd cwd
+    APP_VERSION = "0.0.0"
 
 import html
 import json

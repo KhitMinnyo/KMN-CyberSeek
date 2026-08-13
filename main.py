@@ -26,6 +26,12 @@ from core.orchestrator import Orchestrator
 from core.scanner import Scanner
 from core.validators import is_valid_target, is_cidr
 
+# Single source of truth for the version (see _version.py / bump_version.py).
+try:
+    from _version import __version__ as APP_VERSION
+except Exception:  # pragma: no cover
+    APP_VERSION = "0.0.0"
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -57,7 +63,7 @@ app = FastAPI(
     title="KMN-CyberSeek API",
     on_startup=[],   # populated below after orchestrator is built
     description="AI-Driven Autonomous Red Team Operator Backend",
-    version="2.2.4",
+    version=APP_VERSION,
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
@@ -277,7 +283,7 @@ async def root():
     """Root endpoint with API information."""
     return {
         "name": "KMN-CyberSeek",
-        "version": "2.2.4",
+        "version": APP_VERSION,
         "status": "operational",
         "endpoints": ["/api/docs", "/api/start", "/api/sessions", "/api/ws"],
         "description": "AI-Driven Autonomous Red Team Operator"
