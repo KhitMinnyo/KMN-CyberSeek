@@ -417,6 +417,49 @@ def test_answer_operator_question_uses_state():
     assert any("glassfish" in str(a).lower() for a in args)
 
 
+def test_coverage_engine_wiring_when_enabled():
+    """With COVERAGE_ENGINE on, the orchestrator seeds per-service coverage,
+    marks steps from executed commands, renders the methodology block, and
+    derives progress from coverage."""
+    import core.orchestrator as orch_mod
+    orch = _loop_orch()
+    s = make_session(services=[svc(445, "smb", host="10.0.0.5")])
+    s.discovered_services = [{"service": "smb", "port": 445, "host": "10.0.0.5"}]
+    orch.sessions[s.session_id] = s
+
+    _orig = orch_mod.COVERAGE_ENGINE
+    orch_mod.COVERAGE_ENGINE = True
+    try:
+        orch._ensure_coverage(s)
+        assert "10.0.0.5:445" in s.service_coverage
+        block = orch._coverage_context_block(s)
+        assert "METHODOLOGY COVERAGE" in block and "pending" in block
+
+        orch._update_coverage_from_command(s, "enum4linux-ng -A 10.0.0.5")
+        cov = s.service_coverage["10.0.0.5:445"]
+        assert cov["steps"]["smb.enum4linux"] == "done"
+
+        orch._recompute_coverage_progress(s)
+        assert 0.0 <= s.objective_progress <= 1.0
+        # one service, not fully covered, no foothold -> not complete
+        assert s.objective_complete is False
+    finally:
+        orch_mod.COVERAGE_ENGINE = _orig
+
+
+def test_coverage_engine_off_is_noop():
+    import core.orchestrator as orch_mod
+    orch = _loop_orch()
+    s = make_session(services=[svc(445, "smb", host="10.0.0.5")])
+    s.discovered_services = [{"service": "smb", "port": 445, "host": "10.0.0.5"}]
+    orch.sessions[s.session_id] = s
+    # default OFF
+    assert orch_mod.COVERAGE_ENGINE is False
+    orch._ensure_coverage(s)
+    assert s.service_coverage == {}
+    assert orch._coverage_context_block(s) == ""
+
+
 def test_chat_history_records_question_and_answer():
     orch = _loop_orch()
     s = make_session(services=[svc(80, "http")])

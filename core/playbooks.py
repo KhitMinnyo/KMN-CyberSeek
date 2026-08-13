@@ -42,6 +42,16 @@ class PlaybookStep:
     tool: Optional[str] = None                 # required binary (checked via shutil.which)
     produces: List[str] = field(default_factory=list)  # tags: creds, shares, cve, rce, file_read...
     applies_if: Optional[Callable[[dict], bool]] = None  # extra gate on a context dict
+    signals: List[str] = field(default_factory=list)   # substrings in an executed command that
+                                                        # mark this step attempted (for AI steps)
+
+    def matches_command(self, command: str) -> bool:
+        """Best-effort: did this executed command attempt this step? Deterministic
+        steps match on their tool name; any step matches on its explicit signals."""
+        c = (command or "").lower()
+        if self.tool and self.tool.lower() in c:
+            return True
+        return any(sig.lower() in c for sig in self.signals)
 
     def render(self, ctx: dict) -> Optional[str]:
         """Render a deterministic command template with {host}/{port}/{url}/{domain}.
@@ -112,7 +122,7 @@ PLAYBOOKS: Dict[str, List[PlaybookStep]] = {
                      KIND_DET, "nxc smb {host} -u '' -p '' --shares", tool="nxc",
                      produces=["shares", "creds"]),
         PlaybookStep("smb.loot", "Read/loot accessible shares", PHASE_EXPLOIT,
-                     KIND_AI, produces=["file_read", "creds"]),
+                     KIND_AI, produces=["file_read", "creds"], signals=["smbclient", "smbget", "//"]),
     ],
     "ftp": [
         PlaybookStep("ftp.anon", "Test anonymous login and list root", PHASE_VULN,
@@ -122,7 +132,7 @@ PLAYBOOKS: Dict[str, List[PlaybookStep]] = {
                      KIND_DET, "nmap -p{port} --script ftp-anon,ftp-bounce,ftp-vuln* {host}",
                      tool="nmap", produces=["misconfig"]),
         PlaybookStep("ftp.upload", "Test write/upload permission", PHASE_EXPLOIT,
-                     KIND_AI, produces=["upload", "rce"]),
+                     KIND_AI, produces=["upload", "rce"], signals=["stor ", "ftp-put", "curl -T"]),
     ],
     "ssh": [
         PlaybookStep("ssh.banner", "Grab banner and supported auth/algos", PHASE_ENUM,
@@ -130,48 +140,49 @@ PLAYBOOKS: Dict[str, List[PlaybookStep]] = {
                      tool="nmap", produces=["tech"]),
         # Brute-force is handled by the decoupled worker (M5), not inline here.
         PlaybookStep("ssh.creds_reuse", "Try any discovered credentials over SSH", PHASE_EXPLOIT,
-                     KIND_AI, produces=["shell"]),
+                     KIND_AI, produces=["shell"], signals=["sshpass", "ssh -o", "ssh -i"]),
     ],
     "mysql": [
         PlaybookStep("mysql.auth", "Test root and common accounts (no/weak pw)", PHASE_VULN,
                      KIND_DET, "nmap -p{port} --script mysql-empty-password,mysql-info {host}",
                      tool="nmap", produces=["creds"]),
         PlaybookStep("mysql.enum", "Enumerate databases/users/grants with access", PHASE_ENUM,
-                     KIND_AI, produces=["creds", "db"]),
+                     KIND_AI, produces=["creds", "db"],
+                     signals=["show databases", "show grants", "information_schema", "select user"]),
         PlaybookStep("mysql.file_read", "Read sensitive files via LOAD_FILE", PHASE_EXPLOIT,
-                     KIND_AI, produces=["file_read", "creds"]),
+                     KIND_AI, produces=["file_read", "creds"], signals=["load_file"]),
         PlaybookStep("mysql.file_write", "Write a webshell via INTO OUTFILE / UDF", PHASE_EXPLOIT,
-                     KIND_AI, produces=["rce"]),
+                     KIND_AI, produces=["rce"], signals=["into outfile", "into dumpfile", "lib_mysqludf", "udf"]),
     ],
     "tomcat": [
         PlaybookStep("tomcat.manager", "Test manager/host-manager default creds", PHASE_VULN,
-                     KIND_AI, produces=["creds"]),
+                     KIND_AI, produces=["creds"], signals=["manager/html", "manager/text", "host-manager"]),
         PlaybookStep("tomcat.ghostcat", "AJP Ghostcat file read (CVE-2020-1938)", PHASE_VULN,
                      KIND_DET, "nmap -p8009 --script ajp-headers,ajp-methods {host}",
                      tool="nmap", produces=["file_read", "cve"]),
         PlaybookStep("tomcat.war", "Deploy a WAR webshell via manager", PHASE_EXPLOIT,
-                     KIND_AI, produces=["rce"]),
+                     KIND_AI, produces=["rce"], signals=[".war", "deploy?path", "manager/text/deploy"]),
     ],
     "glassfish": [
         PlaybookStep("glassfish.creds", "Test admin console default creds (4848)", PHASE_VULN,
-                     KIND_AI, produces=["creds"]),
+                     KIND_AI, produces=["creds"], signals=["4848", "j_security_check", "common/index.jsf"]),
         PlaybookStep("glassfish.lfi", "Path traversal / LFI (CVE-2017-1000028)", PHASE_VULN,
-                     KIND_AI, produces=["file_read", "cve"]),
+                     KIND_AI, produces=["file_read", "cve"], signals=["%c0%af", "war/", "cve-2017-1000028"]),
         PlaybookStep("glassfish.war", "Deploy a WAR webshell for RCE", PHASE_EXPLOIT,
-                     KIND_AI, produces=["rce"]),
+                     KIND_AI, produces=["rce"], signals=["asadmin", "management/domain/applications", "deploy"]),
     ],
     "jenkins": [
         PlaybookStep("jenkins.detect", "Confirm Jenkins and auth state", PHASE_ENUM,
                      KIND_DET, "curl -sk {url}/api/json", tool="curl", produces=["tech"]),
         PlaybookStep("jenkins.script_console", "Groovy script console RCE (if unauth)", PHASE_EXPLOIT,
-                     KIND_AI, produces=["rce"]),
+                     KIND_AI, produces=["rce"], signals=["/script", "scripttext", "groovy"]),
     ],
     "winrm": [
         PlaybookStep("winrm.detect", "Confirm WinRM and transport", PHASE_ENUM,
                      KIND_DET, "nmap -p{port} --script http-title {host}", tool="nmap",
                      produces=["tech"]),
         PlaybookStep("winrm.exec", "evil-winrm with discovered creds", PHASE_EXPLOIT,
-                     KIND_AI, produces=["shell"]),
+                     KIND_AI, produces=["shell"], signals=["evil-winrm"]),
     ],
     "rdp": [
         PlaybookStep("rdp.nla", "Check NLA / NTLM info", PHASE_VULN,

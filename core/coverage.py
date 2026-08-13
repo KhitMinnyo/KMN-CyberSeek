@@ -53,6 +53,27 @@ def mark(cov: dict, step_id: str, status: str) -> None:
         cov["steps"][step_id] = status
 
 
+def _steps_for(cov: dict) -> List:
+    return pb.get_steps(cov.get("keys", []))
+
+
+def match_and_mark(cov: dict, command: str) -> List[str]:
+    """Mark any PENDING step this executed command attempts (tool name or signal
+    match) as DONE. Returns the list of newly-completed step ids. Best-effort —
+    coverage tracking is a guide, not an oracle."""
+    done_now: List[str] = []
+    for st in _steps_for(cov):
+        if cov["steps"].get(st.id) == PENDING and st.matches_command(command):
+            cov["steps"][st.id] = DONE
+            done_now.append(st.id)
+    return done_now
+
+
+def pending_steps(cov: dict) -> List:
+    """PlaybookStep objects for this service's still-pending steps, in order."""
+    return [st for st in _steps_for(cov) if cov["steps"].get(st.id) == PENDING]
+
+
 def _phases_with_done(cov: dict) -> set:
     return {
         cov["phases"].get(sid)

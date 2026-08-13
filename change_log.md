@@ -33,6 +33,17 @@ Building the shift from opportunistic LLM-guessing to methodology-driven coverag
   **Benchmark check (2026-08-13 completed run, pre-engine):** touched 17/35
   (48.6%), confirmed 1/35 (2.9%) — barely above baseline; the number the engine
   must beat.
+- **M1 (part 3) — Live wiring behind `COVERAGE_ENGINE` flag** (default OFF, so
+  existing behaviour is unchanged). When enabled, the orchestrator: seeds
+  per-service playbook coverage after the scan (`_ensure_coverage`); injects a
+  **METHODOLOGY COVERAGE** block into the AI prompt listing each service's pending
+  steps ("work every step; do not skip a service"); marks steps done from executed
+  commands (`match_and_mark`, tool/signal based); and **derives objective progress
+  + completion from coverage** (`_recompute_coverage_progress`), overriding the
+  strategist's estimate so a run can't hit 100% while services are untouched.
+  Target-agnostic — playbooks key on service type, not a specific lab.
+  `service_coverage` (per-service % + state + pending intents) exposed in the
+  session report. New env: `COVERAGE_ENGINE`. Suite: 113 passed.
 
 ---
 
