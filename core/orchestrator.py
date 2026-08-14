@@ -290,6 +290,18 @@ def _is_local_target(target: str) -> bool:
         return False  # it's a hostname — treat as public
 
 
+def _is_hostname(target: str) -> bool:
+    """True if the target is a hostname/domain (not a bare IP or CIDR)."""
+    t = (target or "").strip()
+    if not t or "/" in t:
+        return False
+    try:
+        ipaddress.ip_address(t)
+        return False  # it's an IP
+    except ValueError:
+        return True   # it's a hostname
+
+
 def _cvss_to_risk(score: Optional[float]) -> str:
     """Map a CVSS score to the low/medium/high vocabulary used everywhere else
     in this codebase (there's no 'critical' tier in the UI/prompt, so 9-10 folds
@@ -899,7 +911,10 @@ class Orchestrator:
             raise ValueError(f"Session {session_id} not found")
         
         session.status = "scanning"
-        session.current_stage = "reconnaissance"
+        # For a real domain/host target, begin in the OSINT stage so subdomain
+        # enumeration / dorking / crt.sh run first; a bare private IP skips OSINT.
+        _do_osint = self._should_run_osint(session)
+        session.current_stage = "osint" if _do_osint else "reconnaissance"
 
         try:
             logger.info(f"Starting reconnaissance for session {session_id}")
@@ -975,12 +990,12 @@ class Orchestrator:
             # Kick off the decoupled brute-force worker on auth services (no-op off).
             self._maybe_start_bruteforce(session_id)
 
-            # Nmap done: move to enumeration (the next logical step after port scanning).
-            # Vulnerability analysis runs as a background task and does not block
-            # enumeration commands — the AI will advance through vulnerability_analysis
-            # naturally as it proposes vuln-specific commands.
+            # Nmap done. For a domain/host target, hold in the OSINT stage so the AI
+            # does open-source recon first (the OSINT block guides it, then it
+            # advances osint→reconnaissance→enumeration). For a bare IP, jump
+            # straight to enumeration as before.
             session.status = "analyzing"
-            session.current_stage = "enumeration"
+            session.current_stage = "osint" if _do_osint else "enumeration"
             self._save_session_status(session_id, session)
 
             # Auto-trigger threat-intel background research for any service names
@@ -1521,6 +1536,9 @@ class Orchestrator:
 
             # Operator steering — highest priority, first in the block.
             _exhausted_ctx = self._operator_context_block(session)
+
+            # OSINT — for a real domain/host target, do OSINT before deeper scans.
+            _exhausted_ctx += self._osint_context_block(session)
 
             # Methodology coverage — guide the AI through the per-service playbook.
             self._ensure_coverage(session)
@@ -2285,7 +2303,7 @@ Subdomains found: {len(session.discovered_subdomains)}{f' — [{", ".join(sessio
 Web apps found: {len(session.web_applications)}{f' — [{", ".join(a.get("url","") for a in session.web_applications[:5])}]' if session.web_applications else ''}
 API endpoints: {len(session.discovered_api_endpoints)}
 Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
-{self._operator_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}
+{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}
 Domain rule: If Target Domain is provided ({session.target_domain}), use domain name for all web tools — never IP.
 
 {self._get_relevant_threat_intel_context(session_id)}
@@ -4932,6 +4950,38 @@ Web apps: {webapps}
         session.objective_progress = progress
         session.objective_complete = _coverage.is_objective_complete(
             progress, covered_ratio, footholds
+        )
+
+    def _should_run_osint(self, session: "Session") -> bool:
+        """OSINT applies to a real public domain/host, not a bare private IP.
+        A domain target (drhmonegyi.cc) should get subdomain enum, crt.sh, dorks,
+        etc.; a lab IP (192.168.x) correctly skips internet OSINT."""
+        if _is_local_target(session.target_ip):
+            return False
+        if (session.target_domain or "").strip():
+            return True
+        return _is_hostname(session.target_ip)
+
+    def _osint_context_block(self, session: "Session") -> str:
+        """Inject the OSINT checklist while the engagement is in the OSINT stage
+        against a real domain/host. Always-on (not coverage-gated) — a domain
+        target must never silently skip OSINT. Fades once the stage advances."""
+        if session.current_stage != "osint" or not self._should_run_osint(session):
+            return ""
+        dom = (session.target_domain or session.target_ip or "").strip()
+        return (
+            "\n=== OSINT (do this FIRST — real domain/host target) ===\n"
+            f"Target: {dom}\n"
+            "Gather open-source intelligence before deeper scanning:\n"
+            f"- Subdomain enumeration: subfinder -d {dom} / amass / assetfinder\n"
+            f"- Certificate transparency: curl -s 'https://crt.sh/?q=%25.{dom}&output=json'\n"
+            f"- DNS: dnsrecon -d {dom}; dig ANY {dom}; try zone transfer (dig AXFR @ns {dom})\n"
+            f"- Google dorking: site:{dom} (filetype:, inurl:admin/login, exposed panels)\n"
+            f"- theHarvester -d {dom} -b all  (emails, hosts, employees)\n"
+            f"- Web fingerprint + WAF: whatweb {dom}; wafw00f {dom}\n"
+            f"- Archived URLs: gau {dom} / waybackurls {dom}\n"
+            "Advance past OSINT only after collecting subdomains, DNS, and a web "
+            "fingerprint of the main site.\n"
         )
 
     def _exploit_hints_block(self, session: "Session") -> str:

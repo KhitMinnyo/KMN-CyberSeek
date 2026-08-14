@@ -4,6 +4,19 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.3.3] — 2026-08-14
+
+### Fixed
+- **OSINT stage skipped for domain targets.** A session always started at
+  `reconnaissance` and (with `_advance_stage` never regressing) could never enter
+  the `osint` stage — so a real domain target (e.g. `drhmonegyi.cc`) skipped
+  subdomain enumeration, crt.sh, Google dorking, theHarvester, etc. Now a public
+  domain/host target **starts in the OSINT stage** and is held there after the
+  initial scan, with an injected OSINT checklist (subfinder/amass, crt.sh, DNS +
+  zone transfer, dorks, theHarvester, whatweb/wafw00f, wayback) guiding the AI
+  before deeper scanning. A bare **private IP still skips OSINT** (correct — no
+  internet OSINT on a lab host). `_should_run_osint()` decides; unit-tested.
+
 ## [2.3.2] — 2026-08-14
 
 ### Fixed
