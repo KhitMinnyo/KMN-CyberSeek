@@ -40,6 +40,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+class _AccessLogNoiseFilter(logging.Filter):
+    """The Streamlit frontend polls a handful of read-only endpoints every few
+    seconds (auto-refresh), which floods the terminal with identical
+    'GET ... 200 OK' access lines and buries real events. Drop those successful
+    GET polls; keep POST/DELETE, errors, and everything else."""
+
+    _NOISY = (
+        "/health", "/api/sessions", "/api/shells/local-ip",
+        "/shells", "/pending_commands", "/credentials", "/bruteforce",
+        "/handlers", "/live_output", "/settings/features", "/api/stats",
+        "/api/schedules", "/api/threat-intel",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if '"GET ' not in msg:
+            return True  # keep POST/DELETE/etc.
+        # Only suppress successful (2xx/304) polls of the noisy read endpoints.
+        if not (' 200 ' in msg or ' 304 ' in msg):
+            return True
+        return not any(p in msg for p in self._NOISY)
+
+
+# Attach to uvicorn's access logger (created when the server runs).
+logging.getLogger("uvicorn.access").addFilter(_AccessLogNoiseFilter())
+
 # --- API authentication -----------------------------------------------------
 # This API can execute arbitrary shell commands on behalf of a session
 # (/api/execute, the AI auto-execute loop). It must never be reachable without
@@ -359,9 +389,6 @@ async def get_session(session_id: str):
     """Get details of a specific session."""
     try:
         session_report = orchestrator.get_session_report(session_id)
-        logger.info(f"get_session_report returned keys: {list(session_report.keys())}")
-        logger.info(f"Has 'session' key? {'session' in session_report}")
-        logger.info(f"Has 'discovered_hosts' key? {'discovered_hosts' in session_report}")
     except ValueError:
         raise HTTPException(status_code=404, detail="Session not found")
     return session_report
