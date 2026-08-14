@@ -1,6 +1,6 @@
 # KMN-CyberSeek
 
-![Version](https://img.shields.io/badge/Version-2.3.1-brightgreen)
+![Version](https://img.shields.io/badge/Version-2.3.2-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 

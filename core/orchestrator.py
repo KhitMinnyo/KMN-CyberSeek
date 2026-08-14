@@ -842,7 +842,11 @@ class Orchestrator:
 
         session_id = str(uuid.uuid4())
         if session_name:
-            session_id = f"{session_name}_{session_id[:8]}"
+            # Sanitise the name into a safe slug (no spaces/special chars) so the
+            # session_id is clean in URLs, file paths, and msf rc files.
+            _slug = re.sub(r"[^A-Za-z0-9._-]+", "-", session_name.strip()).strip("-")
+            _slug = _slug or "session"
+            session_id = f"{_slug}_{session_id[:8]}"
 
         session = Session(session_id, target_ip, target_domain, auto_approve, authorization_confirmed)
         session.max_auto_depth = max_auto_depth  # Allow customizing max auto depth

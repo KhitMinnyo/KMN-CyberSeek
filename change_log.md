@@ -4,6 +4,20 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.3.2] — 2026-08-14
+
+### Fixed
+- **Terminal flooded with polling logs** — the Streamlit auto-refresh polls a
+  handful of read-only endpoints every few seconds, and (a) `GET /api/sessions/{id}`
+  logged three debug INFO lines per poll, plus (b) uvicorn logged every
+  `GET ... 200 OK`. Together they buried real events. Removed the debug logs and
+  added a `uvicorn.access` filter that drops successful GET polls of the noisy
+  read endpoints (keeps POST/DELETE, non-2xx, and app logs). The terminal is now
+  quiet enough to see actual scan/AI/error events.
+- **Session names with spaces/special chars** (e.g. "Dr HG") produced a session_id
+  with a space (`Dr HG_...`), awkward in URLs/paths. Names are now slugified
+  (`Dr-HG_...`).
+
 ## [2.3.1] — 2026-08-13
 
 ### Changed
