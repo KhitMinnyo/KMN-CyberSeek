@@ -447,6 +447,35 @@ def test_coverage_engine_wiring_when_enabled():
         orch_mod.COVERAGE_ENGINE = _orig
 
 
+def test_osint_runs_for_domain_not_for_private_ip():
+    orch = _loop_orch()
+    # Private lab IP → skip OSINT
+    lab = make_session(ip="192.168.1.10")
+    assert orch._should_run_osint(lab) is False
+    # Public domain target → run OSINT
+    dom = make_session(ip="74.206.228.78")
+    dom.target_domain = "drhmonegyi.cc"
+    assert orch._should_run_osint(dom) is True
+    # Bare public hostname
+    host = make_session(ip="example.com")
+    assert orch._should_run_osint(host) is True
+
+
+def test_osint_block_shows_only_in_osint_stage_for_domain():
+    orch = _loop_orch()
+    s = make_session(ip="74.206.228.78")
+    s.target_domain = "drhmonegyi.cc"
+    s.current_stage = "osint"
+    block = orch._osint_context_block(s)
+    assert "OSINT" in block and "drhmonegyi.cc" in block and "crt.sh" in block
+    # Once past OSINT, the block disappears
+    s.current_stage = "enumeration"
+    assert orch._osint_context_block(s) == ""
+    # Private IP never shows it
+    lab = make_session(ip="192.168.1.10"); lab.current_stage = "osint"
+    assert orch._osint_context_block(lab) == ""
+
+
 def test_feature_flags_default_on_and_toggle():
     import core.orchestrator as orch_mod
     flags = orch_mod.get_feature_flags()
