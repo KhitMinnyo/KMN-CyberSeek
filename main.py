@@ -176,7 +176,7 @@ class TargetRequest(BaseModel):
     domain: Optional[str] = Field(None, description="Optional domain name")
     session_name: Optional[str] = Field(None, description="Custom session name")
     auto_approve: bool = Field(False, description="Auto-approve low/medium risk commands")
-    max_auto_depth: int = Field(5, description="Maximum consecutive auto-executed commands")
+    max_auto_depth: int = Field(25, description="Maximum consecutive auto-executed commands before a manual checkpoint (the counter resets on any critical finding)")
     objective: Optional[str] = Field(
         None,
         description="Engagement goal in plain language (e.g. 'get root', 'reach Domain Admin', "

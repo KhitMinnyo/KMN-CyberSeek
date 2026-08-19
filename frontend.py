@@ -180,7 +180,7 @@ def get_sessions():
 
 
 def start_session(target_ip: str, target_domain: str = "", session_name: str = "",
-                 auto_approve: bool = False, max_auto_depth: int = 5,
+                 auto_approve: bool = False, max_auto_depth: int = 25,
                  authorization_confirmed: bool = False):
     """Start a new session. Returns the parsed response on success, or a dict
     with an "error" key (never raises) so callers can surface the real reason

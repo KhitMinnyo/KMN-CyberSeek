@@ -71,13 +71,27 @@ def _steps_for(cov: dict) -> List:
     return pb.get_steps(cov.get("keys", []))
 
 
-def match_and_mark(cov: dict, command: str) -> List[str]:
+def match_and_mark(cov: dict, command: str, success: bool = True) -> List[str]:
     """Mark any PENDING step this executed command attempts (tool name or signal
     match) as DONE. Returns the list of newly-completed step ids. Best-effort —
-    coverage tracking is a guide, not an oracle."""
+    coverage tracking is a guide, not an oracle.
+
+    ``success`` distinguishes *attempting* a step from *achieving* it. Running a
+    tool is enough to complete an ENUMERATION or VULNERABILITY step (the recon
+    value is in the output either way), but an EXPLOITATION or POST-EXPLOITATION
+    step only counts as DONE when the command actually succeeded (a confirmed
+    exploit signal). Otherwise a failed exploit attempt would falsely mark the
+    service "covered" and the loop would abandon it before it is compromised —
+    the root cause of a high touched-rate but a near-zero confirmed-rate.
+    The default (True) preserves the recon/enumeration behaviour.
+    """
     done_now: List[str] = []
     for st in _steps_for(cov):
         if cov["steps"].get(st.id) == PENDING and st.matches_command(command):
+            if st.phase in (pb.PHASE_EXPLOIT, pb.PHASE_POST) and not success:
+                # Attempted but not confirmed — leave PENDING so the loop keeps
+                # working this vector instead of marking it complete.
+                continue
             cov["steps"][st.id] = DONE
             done_now.append(st.id)
     return done_now
@@ -143,10 +157,16 @@ def enumeration_coverage(cov: dict) -> float:
 # ---------------------------------------------------------------------------
 
 # Weights (must sum to 1.0). Configurable later via env if needed.
-_W_RECON = 0.10
-_W_ENUM = 0.35
+#
+# The engagement objective is a foothold / root / Domain Admin, so exploitation
+# and post-exploitation carry the most weight. Enumeration is necessary but is
+# not the goal: an earlier weighting (ENUM 0.35 > FOOTHOLD 0.25) let a run that
+# only enumerated reach ~45% progress without compromising anything, which
+# matched the observed "touches half, confirms almost nothing" behaviour.
+_W_RECON = 0.08
+_W_ENUM = 0.22
 _W_VULN = 0.15
-_W_FOOTHOLD = 0.25
+_W_FOOTHOLD = 0.40
 _W_POSTEX = 0.15
 
 

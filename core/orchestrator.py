@@ -403,7 +403,18 @@ class Session:
         # Safety cap: after this many consecutive auto-pivots without advancing
         # the stage, stop and wait for manual intervention.
         self._auto_pivot_count: int = 0
-        self._MAX_AUTO_PIVOTS: int = int(os.getenv("MAX_AUTO_PIVOTS", "6"))
+        self._MAX_AUTO_PIVOTS: int = int(os.getenv("MAX_AUTO_PIVOTS", "12"))
+
+        # Finding-aware stagnation tracker. The loop is only "stuck" when it keeps
+        # acting in the same stage WITHOUT producing new findings. Exploitation
+        # legitimately needs many turns on one service, so counting raw same-stage
+        # decisions (the old approach) abandoned a service mid-exploit. We instead
+        # count consecutive decisions since the last real progress and reset the
+        # counter whenever the attack surface grows (new cred/service/foothold/
+        # subdomain/coverage step). Exploitation-family stages also get a higher
+        # threshold before a pivot is forced.
+        self._stagnation_counter: int = 0
+        self._last_progress_marker: tuple = ()
 
         # Empty-response recovery: the LLM (esp. local Ollama / DeepSeek) sometimes
         # returns valid JSON with an EMPTY suggested_command. Without handling, the
@@ -825,7 +836,7 @@ class Orchestrator:
 
     def create_session(self, target_ip: str, target_domain: Optional[str] = None,
                       session_name: Optional[str] = None, auto_approve: bool = False,
-                      max_auto_depth: int = 5, authorization_confirmed: bool = False,
+                      max_auto_depth: int = 25, authorization_confirmed: bool = False,
                       objective: Optional[str] = None) -> str:
         """Create a new penetration testing session.
 
@@ -2106,8 +2117,16 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
             # Coverage engine: mark playbook steps this command attempted, and
             # recompute coverage-derived progress. No-op unless COVERAGE_ENGINE on.
+            # Exploitation/post-ex steps only count as done when the command
+            # actually landed a confirmed exploit signal (a shell, dump, root, or
+            # crackmapexec Pwn3d) — not merely on exit code 0, which most exploit
+            # tools return even when they fail to compromise the target.
+            _combined_out = (sanitized_output + "\n" + sanitized_error).lower()
+            _exploit_success = any(sig in _combined_out for sig in _EXPLOIT_SIGNALS)
             self._ensure_coverage(session)
-            self._update_coverage_from_command(session, command)
+            self._update_coverage_from_command(
+                session, command, success=_exploit_success
+            )
             self._recompute_coverage_progress(session)
 
             # Feed this command's result into the hybrid retrieval index so it can
@@ -2383,20 +2402,46 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     "Auto-execution halted to prevent infinite loop."
                 )
 
-            # Check 2: stage stagnation — same stage for 8+ consecutive decisions
-            # without the stage advancing means the AI is spinning in place.
+            # Check 2: finding-aware stagnation — count consecutive decisions since
+            # the last real progress (a new credential, service, foothold, subdomain,
+            # or completed coverage step). Reset the counter whenever the attack
+            # surface grows, so a service being actively worked toward exploitation
+            # is never abandoned just for taking several turns. Only a genuinely
+            # unproductive streak trips the guard, and exploitation-family stages get
+            # a higher threshold because they legitimately need more turns per target.
             if not _loop_reason:
-                _stage_decisions = [
-                    d for d in session.ai_decisions[-8:]
-                    if d.get("attack_phase") == session.current_stage
-                ]
-                if len(_stage_decisions) >= 8:
+                _coverage_done = sum(
+                    1
+                    for cov in session.service_coverage.values()
+                    for st in cov.get("steps", {}).values()
+                    if st == "done"
+                )
+                _progress_marker = (
+                    len(session.credentials),
+                    len(session.discovered_services),
+                    len(session.compromise_evidence or []),
+                    len(session.discovered_subdomains),
+                    _coverage_done,
+                )
+                if _progress_marker != session._last_progress_marker:
+                    session._stagnation_counter = 0
+                    session._last_progress_marker = _progress_marker
+                else:
+                    session._stagnation_counter += 1
+
+                _exploit_stages = {
+                    "exploitation", "post_exploitation", "privilege_escalation",
+                    "lateral_movement", "credential_reuse",
+                }
+                _stag_threshold = 18 if session.current_stage in _exploit_stages else 8
+                if session._stagnation_counter >= _stag_threshold:
                     _loop_reason = (
-                        f"SYSTEM OVERRIDE: Session has made 8+ consecutive AI decisions "
-                        f"at stage '{session.current_stage}' without advancing. "
-                        "Likely stuck — halting auto-execution. "
-                        "Try a different approach or advance to the next stage manually."
+                        f"SYSTEM OVERRIDE: {session._stagnation_counter} consecutive AI "
+                        f"decisions at stage '{session.current_stage}' produced no new "
+                        "findings (no new credential, service, foothold, subdomain, or "
+                        "coverage progress). Likely stuck — pivoting to a different vector."
                     )
+                    session._stagnation_counter = 0
 
             if _loop_reason:
                 logger.warning(
@@ -4913,13 +4958,21 @@ Web apps: {webapps}
         if session.compromise_evidence and "__postex__" not in session.service_coverage:
             session.service_coverage["__postex__"] = _coverage.build_postex_coverage()
 
-    def _update_coverage_from_command(self, session: "Session", command: str) -> None:
-        """After a command runs, mark any playbook steps it attempted as done."""
+    def _update_coverage_from_command(
+        self, session: "Session", command: str, success: bool = True
+    ) -> None:
+        """After a command runs, mark any playbook steps it attempted as done.
+
+        ``success`` gates exploitation/post-exploitation steps: those only count
+        as done when the command actually landed a confirmed result, so a failed
+        exploit attempt does not falsely mark a service "covered" and get it
+        abandoned before it is compromised. Enumeration/vuln steps ignore it.
+        """
         if not COVERAGE_ENGINE or not command:
             return
         for cov in session.service_coverage.values():
             try:
-                _coverage.match_and_mark(cov, command)
+                _coverage.match_and_mark(cov, command, success=success)
             except Exception:
                 pass
 
