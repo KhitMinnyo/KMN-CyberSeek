@@ -18,3 +18,10 @@ env/
 
 # OS
 .DS_Store
+
+# Internal review notes / private scratch docs (may contain non-English text) —
+# never publish to the public repository.
+KMN-CyberSeek-review.md
+*.review.md
+/notes/
+/private/

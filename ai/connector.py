@@ -159,9 +159,32 @@ class KMN_AI_Connector:
         except ValueError:
             self.context_window = 8192
 
+        # ── Response budget ───────────────────────────────────────────────────
+        # The full red-team system prompt asks for a reasoned analysis plus the
+        # command, so the JSON reply can be long. A tight cap (the old hard-coded
+        # 2000) truncates the reply mid-JSON; the parser then returns None and
+        # the loop mistakes it for an "empty command" and stalls. Default higher
+        # and make it configurable.
+        try:
+            self.max_tokens: int = int(os.getenv("AI_MAX_TOKENS", "4096").strip())
+        except ValueError:
+            self.max_tokens = 4096
+
+        # ── Sampling temperature ──────────────────────────────────────────────
+        # Tactical command selection wants determinism (fewer hallucinated flags
+        # / CVEs / hostnames), so it defaults low. The strategist/critique passes
+        # use their own lower temperature already.
+        try:
+            self.tactical_temperature: float = float(
+                os.getenv("TACTICAL_TEMPERATURE", "0.2").strip()
+            )
+        except ValueError:
+            self.tactical_temperature = 0.2
+
         logger.info(
             f"Initialized AI connector — provider={self.provider}, "
-            f"context_window={self.context_window} tokens"
+            f"context_window={self.context_window} tokens, "
+            f"max_tokens={self.max_tokens}, tactical_temp={self.tactical_temperature}"
         )
 
     # ── Token budget helpers ──────────────────────────────────────────────────
@@ -271,17 +294,20 @@ class KMN_AI_Connector:
                 "prompt": full_prompt,
                 "stream": False,
                 "options": {
-                    "temperature": 0.7,
+                    "temperature": self.tactical_temperature,
                     "top_p": 0.9,
                     "top_k": 40,
                     # Tell Ollama to load the model with our configured context size.
                     # Without this, Ollama uses the model's baked-in default (often
                     # 2048 or 4096) even if the model supports more.
                     "num_ctx": self.context_window,
+                    # Cap the reply length so a small model cannot ramble past the
+                    # context budget, while still leaving room for a full JSON reply.
+                    "num_predict": self.max_tokens,
                 }
             }
 
-            response = requests.post(self.ollama_url, json=payload, timeout=120)
+            response = requests.post(self.ollama_url, json=payload, timeout=180)
             response.raise_for_status()
             
             result = response.json()
@@ -338,42 +364,75 @@ class KMN_AI_Connector:
                 "Content-Type": "application/json"
             }
 
-            messages = [
+            base_messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content}
             ]
 
-            payload = {
-                "model": self.api_model,
-                "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 2000,
-                "response_format": {"type": "json_object"}
-            }
-            
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(self.deepseek_api_url, json=payload, headers=headers)
-                response.raise_for_status()
-                
-                result = response.json()
-                response_text = result['choices'][0]['message']['content']
+            # Up to two attempts: the first at the configured tactical temperature,
+            # and — if the reply is truncated or unparseable — a deterministic
+            # repair pass at temperature 0 with a stricter, more compact-JSON
+            # instruction. This turns a transient bad reply (the #1 cause of the
+            # loop stalling on a phantom "empty command") into a self-heal.
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                for attempt in range(2):
+                    messages = list(base_messages)
+                    temperature = self.tactical_temperature
+                    if attempt == 1:
+                        temperature = 0.0
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "Your previous reply was truncated or was not valid JSON. "
+                                "Reply again with ONLY a single compact JSON object matching "
+                                "the required schema (reasoning, suggested_command, risk_level, "
+                                "confidence, attack_phase, target_info). Keep the reasoning "
+                                "under 400 characters. No markdown, no text outside the JSON."
+                            ),
+                        })
 
-                # Parse JSON response — use robust extractor that handles any
-                # extra text or fences the API model might emit despite the
-                # json_object response_format hint.
-                ai_data = _extract_json(response_text)
-                if ai_data is None:
-                    logger.error(
-                        f"Could not extract valid JSON from API response "
-                        f"(model={self.api_model}): {response_text[:500]}"
-                    )
-                    return None  # Caller handles None: logs + stops cleanly
-                try:
-                    return AIResponse(**ai_data)
-                except Exception as e:
-                    logger.error(f"AIResponse validation failed: {e} | data={ai_data}")
-                    return None
-                    
+                    payload = {
+                        "model": self.api_model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": self.max_tokens,
+                        "response_format": {"type": "json_object"}
+                    }
+
+                    response = await client.post(self.deepseek_api_url, json=payload, headers=headers)
+                    response.raise_for_status()
+
+                    result = response.json()
+                    choice = result['choices'][0]
+                    response_text = choice['message']['content']
+                    finish_reason = choice.get('finish_reason')
+
+                    # Parse JSON response — robust extractor handles fences/preamble.
+                    ai_data = _extract_json(response_text)
+                    truncated = finish_reason == "length"
+
+                    if ai_data is not None and not truncated:
+                        try:
+                            return AIResponse(**ai_data)
+                        except Exception as e:
+                            logger.warning(
+                                f"AIResponse validation failed (attempt {attempt + 1}): "
+                                f"{e} | data={ai_data}"
+                            )
+                    else:
+                        logger.warning(
+                            f"API reply unusable (attempt {attempt + 1}, "
+                            f"finish_reason={finish_reason}, model={self.api_model}): "
+                            f"{response_text[:300]}"
+                        )
+                    # Fall through to the repair attempt.
+
+                logger.error(
+                    f"Could not obtain valid JSON from API after 2 attempts "
+                    f"(model={self.api_model})."
+                )
+                return None  # Caller handles None: retry+visible-halt recovery
+
         except httpx.RequestError as e:
             logger.error(f"API request failed: {e}")
             raise ConnectionError(f"Failed to connect to DeepSeek API: {e}")
@@ -462,10 +521,10 @@ class KMN_AI_Connector:
             "model": self.api_model,
             "messages": messages,
             "temperature": 0.3,
-            "max_tokens": 2000,
+            "max_tokens": self.max_tokens,
         }
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=90.0) as client:
             response = await client.post(self.deepseek_api_url, json=payload, headers=headers)
             response.raise_for_status()
             result = response.json()

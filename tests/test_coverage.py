@@ -56,14 +56,14 @@ def test_skipped_steps_excluded_from_ratio():
 def test_progress_formula_bounds_and_weights():
     # Nothing done → 0
     assert cov.compute_progress(False, [], 0.0, 0, 0.0) == 0.0
-    # Recon only → 0.10
-    assert cov.compute_progress(True, [], 0.0, 0, 0.0) == 0.10
+    # Recon only → _W_RECON (0.08)
+    assert cov.compute_progress(True, [], 0.0, 0, 0.0) == 0.08
     # Full everything → 1.0
     full = cov.compute_progress(True, [1.0, 1.0], 1.0, 2, 1.0)
     assert full == 1.0
-    # A single foothold gives half the foothold weight (0.25 * 0.5 = 0.125)
+    # A single foothold gives half the foothold weight (0.40 * 0.5 = 0.20)
     p = cov.compute_progress(False, [], 0.0, 1, 0.0)
-    assert abs(p - 0.125) < 1e-6
+    assert abs(p - 0.20) < 1e-6
 
 
 def test_match_and_mark_by_tool():
