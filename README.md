@@ -1,6 +1,6 @@
 # KMN-CyberSeek
 
-![Version](https://img.shields.io/badge/Version-2.3.3-brightgreen)
+![Version](https://img.shields.io/badge/Version-2.4.0-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
@@ -104,15 +104,24 @@ FULL_AUTO_MODE=false   # true = no approval prompts — isolated labs only
 
 All have sensible defaults; set only if needed.
 
-```env
-# Autonomous shell capture — the managed multi/handler the AI delivers shells to
-EXPLOIT_LHOST=            # default: auto-detected local IP (set if it guesses wrong)
-EXPLOIT_LPORT=4444
-EXPLOIT_PAYLOAD=          # default: guessed from target OS
+# AI reply budget + determinism (DeepSeek API / Ollama)
+AI_MAX_TOKENS=4096        # cap on a single AI reply; too small truncates the JSON
+TACTICAL_TEMPERATURE=0.2  # low = fewer hallucinated flags/CVEs for command choice
 
-# CVE enrichment (NVD). Free key raises the rate limit and avoids HTTP 429.
+# Reverse-shell callback routing — a shell only works if the TARGET can reach your
+# listener. On a LAN lab the local IP works; a real internet target behind NAT needs
+# a reachable callback (public IP, ngrok tunnel, or a reverse-SSH endpoint).
+CALLBACK_MODE=auto        # auto | local | public | ngrok | manual
+EXPLOIT_LHOST=            # explicit callback host (VPS public IP / tunnel endpoint)
+EXPLOIT_LPORT=4444        # callback + local listener port
+EXPLOIT_PAYLOAD=          # default: guessed from target OS
+NGROK_AUTHTOKEN=          # required for CALLBACK_MODE=ngrok
+
+# CVE enrichment + exploitability ranking.
 NVD_API_KEY=             # https://nvd.nist.gov/developers/request-an-api-key
 NVD_MIN_INTERVAL=6.5     # seconds between NVD calls when no key is set
+MSF_CVE_RESOLVE=true     # resolve CVE -> Metasploit module via local msfconsole
+MSF_CVE_RESOLVE_LIMIT=3  # how many top-priority CVEs to resolve per pass
 
 # Scan / command timeouts (seconds)
 SCAN_TIMEOUT=300
@@ -120,9 +129,14 @@ VULN_SCAN_TIMEOUT=120
 COMMAND_TIMEOUT=600
 
 # Agentic-loop safety
-MAX_AUTO_PIVOTS=6        # auto-pivots before pausing for manual review
+MAX_AUTO_PIVOTS=12       # auto-pivots before pausing for manual review
 MAX_EMPTY_RETRIES=3      # retries when the model returns no command
 WATCHDOG_STALL_SECONDS=  # default: COMMAND_TIMEOUT + 180 (stuck-session revival)
+
+# OSINT stage hold (public domain/host targets) — stops OSINT being skipped after
+# one turn. Advances once enough OSINT tools have run, or the turn cap is hit.
+OSINT_MIN_ACTIONS=3      # distinct OSINT tools before leaving the OSINT stage
+OSINT_MAX_TURNS=6        # hard cap so a low-OSINT target still advances
 
 # Coverage engine — methodology-driven per-service playbooks, known-exploit hints,
 # coverage-derived progress. ON by default; toggle live in Settings → Engine Features

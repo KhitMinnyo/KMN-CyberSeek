@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 
 VULNERS_API_URL = "https://vulners.com/api/v3/search/lucene/"
 NVD_API_URL     = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+# CISA Known Exploited Vulnerabilities catalog — CVEs confirmed exploited in the
+# wild. The single best real-world prioritisation signal (better than CVSS alone).
+KEV_FEED_URL    = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+# FIRST EPSS — probability (0..1) a CVE will be exploited in the next 30 days.
+EPSS_API_URL    = "https://api.first.org/data/v1/epss"
 _CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 
 # Keep this conservative: enrichment runs once per discovered service on every
@@ -310,3 +315,123 @@ async def lookup_cves_nvd(
         return []
 
     return results
+
+
+# ── Exploitability prioritisation: CISA KEV + FIRST EPSS ──────────────────────
+# These turn a flat list of CVEs into a *ranked* one so the AI weaponises the
+# CVEs that are actually exploited in the wild first, instead of chasing a high
+# CVSS score that has no public exploit. Both are best-effort and never raise.
+
+_KEV_CACHE_PATH = os.path.join(
+    os.getenv("KMN_CACHE_DIR", "/tmp"), "kmn_kev_catalog.json"
+)
+_KEV_TTL_SECONDS = 24 * 3600
+_kev_set: Optional[set] = None
+_kev_loaded_ts: float = 0.0
+_kev_lock = asyncio.Lock()
+
+
+async def load_kev(force: bool = False) -> set:
+    """Return the set of CVE IDs in the CISA KEV catalog (uppercased).
+
+    Cached in memory for the process and on disk (KMN_CACHE_DIR, default /tmp)
+    so it survives restarts and works offline after the first successful fetch.
+    Refreshes at most once per day. Returns an empty set if it has never been
+    fetched and cannot be reached — callers treat "not in set" as "not KEV".
+    """
+    global _kev_set, _kev_loaded_ts
+    async with _kev_lock:
+        fresh = _kev_set is not None and (time.time() - _kev_loaded_ts) < _KEV_TTL_SECONDS
+        if fresh and not force:
+            return _kev_set
+
+        # Try a cached file first (offline-friendly).
+        if _kev_set is None and not force:
+            try:
+                import json
+                with open(_KEV_CACHE_PATH, "r") as fh:
+                    cached = json.load(fh)
+                age = time.time() - os.path.getmtime(_KEV_CACHE_PATH)
+                _kev_set = {c.upper() for c in cached}
+                _kev_loaded_ts = time.time()
+                if age < _KEV_TTL_SECONDS:
+                    return _kev_set
+            except Exception:
+                pass
+
+        try:
+            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+                r = await client.get(KEV_FEED_URL)
+                r.raise_for_status()
+                data = r.json()
+            cve_ids = [
+                v.get("cveID", "").upper()
+                for v in data.get("vulnerabilities", [])
+                if v.get("cveID")
+            ]
+            _kev_set = set(cve_ids)
+            _kev_loaded_ts = time.time()
+            try:
+                import json
+                with open(_KEV_CACHE_PATH, "w") as fh:
+                    json.dump(sorted(_kev_set), fh)
+            except Exception:
+                pass
+            logger.info(f"Loaded CISA KEV catalog: {len(_kev_set)} CVEs")
+        except Exception as e:
+            logger.warning(f"KEV catalog fetch failed (non-fatal): {e}")
+            if _kev_set is None:
+                _kev_set = set()
+        return _kev_set
+
+
+async def lookup_epss(cve_ids: List[str]) -> Dict[str, float]:
+    """Return {CVE_ID: epss_probability} for the given CVEs via the FIRST EPSS
+    API (batched in one request). Missing/failed CVEs are simply absent from the
+    returned dict. Never raises."""
+    ids = sorted({c.upper() for c in (cve_ids or []) if c})
+    if not ids:
+        return {}
+    out: Dict[str, float] = {}
+    try:
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+            # The API accepts a comma-separated cve list; cap to a sane batch size.
+            r = await client.get(EPSS_API_URL, params={"cve": ",".join(ids[:100])})
+            r.raise_for_status()
+            data = r.json()
+        for row in data.get("data", []):
+            cve = (row.get("cve") or "").upper()
+            try:
+                out[cve] = float(row.get("epss", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+    except Exception as e:
+        logger.warning(f"EPSS lookup failed (non-fatal): {e}")
+    return out
+
+
+async def enrich_findings(findings: List[Dict]) -> None:
+    """Annotate vulnerability findings in place with exploitability signals:
+      - finding['kev']  = True if any of its CVEs is in the CISA KEV catalog
+      - finding['epss'] = the max EPSS probability across its CVEs (0..1)
+    Findings with no CVE IDs are left untouched. Best-effort; never raises."""
+    if not findings:
+        return
+    all_cves: set = set()
+    for f in findings:
+        for c in (f.get("cve_ids") or []):
+            if c:
+                all_cves.add(c.upper())
+    if not all_cves:
+        return
+
+    kev_set = await load_kev()
+    epss_map = await lookup_epss(list(all_cves))
+
+    for f in findings:
+        cves = [c.upper() for c in (f.get("cve_ids") or []) if c]
+        if not cves:
+            continue
+        f["kev"] = any(c in kev_set for c in cves)
+        epss_vals = [epss_map[c] for c in cves if c in epss_map]
+        f["epss"] = round(max(epss_vals), 4) if epss_vals else f.get("epss", 0.0)
