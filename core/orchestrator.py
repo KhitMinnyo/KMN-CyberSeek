@@ -51,6 +51,7 @@ from core import coverage as _coverage
 from core import vuln_validate as _vuln_validate
 from core import exploit_map as _exploit_map
 from core import callback as _callback
+from core import msf_resolver as _msf_resolver
 from core.bruteforce_worker import BruteforceWorker
 
 logger = logging.getLogger(__name__)
@@ -339,6 +340,12 @@ class Session:
         self.evidence: List[Dict] = []
         self.vulnerabilities: List[Dict] = []
         self.current_stage = "reconnaissance"
+        # OSINT hold: how many loop turns have been spent in the OSINT stage. Used
+        # to keep a public domain/host target in OSINT long enough to actually do
+        # open-source recon (it was being skipped after a single turn because the
+        # AI jumps to scanning once it sees the initial nmap data), with a hard cap
+        # so a target with little OSINT surface still advances.
+        self._osint_turns: int = 0
         # Agentic loop settings
         self.auto_approve = auto_approve
         self.max_auto_depth = 15  # Maximum consecutive auto-executed commands before requiring human review
@@ -1526,9 +1533,63 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"[{session_id}] Threat-intel cross-reference failed (non-fatal): {e}")
 
+        # ── 6. Exploitability enrichment + CVE->Metasploit resolution ─────────
+        # Annotate findings with CISA KEV (exploited-in-the-wild) and EPSS
+        # (exploit-probability), then resolve ready Metasploit modules for the
+        # top-priority CVEs. This is what lets the AI weaponise the CVEs that
+        # matter first instead of chasing a high CVSS with no public exploit.
+        try:
+            await self._enrich_and_prioritize_cves(session_id)
+        except Exception as e:
+            logger.warning(f"[{session_id}] CVE prioritisation failed (non-fatal): {e}")
+
         logger.info(
             f"[{session_id}] Vulnerability analysis complete — "
             f"{len(session.vulnerabilities)} total finding(s) recorded"
+        )
+
+    async def _enrich_and_prioritize_cves(self, session_id: str) -> None:
+        """Add KEV/EPSS signals to findings and resolve Metasploit modules for the
+        highest-priority CVEs. Populates finding['kev'|'epss'|'msf_modules'] and
+        stores a ranked view on the session for the AI prompt. Best-effort."""
+        session = self.sessions.get(session_id)
+        if not session or not session.vulnerabilities:
+            return
+
+        # 1) KEV + EPSS enrichment (in place, network best-effort).
+        await cve_lookup.enrich_findings(session.vulnerabilities)
+
+        # 2) Rank findings that carry a CVE: KEV first, then EPSS, then CVSS.
+        def _rank_key(f: Dict):
+            return (
+                1 if f.get("kev") else 0,
+                float(f.get("epss") or 0.0),
+                float(f.get("cvss_score") or 0.0),
+            )
+
+        cve_findings = [f for f in session.vulnerabilities if (f.get("cve_ids") or [])]
+        cve_findings.sort(key=_rank_key, reverse=True)
+
+        # 3) Resolve Metasploit modules for the top few CVEs only (msf is heavy).
+        top_cves: List[str] = []
+        for f in cve_findings:
+            for c in (f.get("cve_ids") or []):
+                if c and c.upper() not in top_cves:
+                    top_cves.append(c.upper())
+        limit = int(os.getenv("MSF_CVE_RESOLVE_LIMIT", "3"))
+        module_map = await _msf_resolver.resolve_many(top_cves, limit=limit)
+        if module_map:
+            for f in session.vulnerabilities:
+                mods: List[str] = []
+                for c in (f.get("cve_ids") or []):
+                    mods.extend(module_map.get((c or "").upper(), []))
+                if mods:
+                    f["msf_modules"] = sorted(set(mods))
+
+        logger.info(
+            f"[{session_id}] CVE prioritisation: "
+            f"{sum(1 for f in session.vulnerabilities if f.get('kev'))} KEV, "
+            f"{len(module_map)} CVE(s) with a Metasploit module"
         )
 
     async def _analyze_with_ai(self, session_id: str, force_command: bool = False):
@@ -1568,6 +1629,8 @@ class Orchestrator:
             self._ensure_coverage(session)
             _exhausted_ctx += self._coverage_context_block(session)
             _exhausted_ctx += self._exploit_hints_block(session)
+            # Exploitability-ranked CVEs (KEV/EPSS/CVSS) with any ready msf module.
+            _exhausted_ctx += self._prioritized_cve_block(session)
 
             # Exhausted attack vectors — injected so AI skips them automatically.
             _exhausted_ctx += self._exhausted_context_block(session)
@@ -1689,6 +1752,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
             # Advance stage: gate prevents regression and limits skipping to 1 step.
             new_stage = _advance_stage(session.current_stage, ai_response.attack_phase)
+            new_stage = self._hold_osint(session, new_stage)
             if new_stage != session.current_stage:
                 logger.info(f"Session {session_id}: stage {session.current_stage} → {new_stage} (AI proposed: {ai_response.attack_phase})")
             session.current_stage = new_stage
@@ -2339,7 +2403,7 @@ Subdomains found: {len(session.discovered_subdomains)}{f' — [{", ".join(sessio
 Web apps found: {len(session.web_applications)}{f' — [{", ".join(a.get("url","") for a in session.web_applications[:5])}]' if session.web_applications else ''}
 API endpoints: {len(session.discovered_api_endpoints)}
 Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
-{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}{self._reachability_context_block(session)}
+{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._prioritized_cve_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}{self._reachability_context_block(session)}
 Domain rule: If Target Domain is provided ({session.target_domain}), use domain name for all web tools — never IP.
 
 {self._get_relevant_threat_intel_context(session_id)}
@@ -2373,6 +2437,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 
             # Advance stage: gate prevents regression and limits skip to 1 step.
             new_stage = _advance_stage(session.current_stage, ai_response.attack_phase)
+            new_stage = self._hold_osint(session, new_stage)
             if new_stage != session.current_stage:
                 logger.info(f"Session {session_id}: stage {session.current_stage} → {new_stage} (AI proposed: {ai_response.attack_phase})")
             else:
@@ -5073,6 +5138,51 @@ Web apps: {webapps}
             return True
         return _is_hostname(session.target_ip)
 
+    # OSINT tool signatures — used to measure whether real open-source recon has
+    # actually happened before the session is allowed to leave the OSINT stage.
+    _OSINT_MARKERS = (
+        "subfinder", "amass", "assetfinder", "sublist3r", "findomain",
+        "crt.sh", "theharvester", "dnsrecon", "dnsenum", "dnsx", "fierce",
+        "gobuster dns", "waybackurls", "gau ", "whatweb", "wafw00f",
+        "shodan", "censys", "wappalyzer", "httpx",
+    )
+
+    def _osint_satisfied(self, session: "Session") -> bool:
+        """True when the session may leave the OSINT stage: enough distinct OSINT
+        tools have run, OR a hard turn cap is hit (so a target with little OSINT
+        surface still advances). Non-OSINT targets are always 'satisfied'."""
+        if not self._should_run_osint(session):
+            return True
+        try:
+            cap = int(os.getenv("OSINT_MAX_TURNS", "6"))
+            min_actions = int(os.getenv("OSINT_MIN_ACTIONS", "3"))
+        except ValueError:
+            cap, min_actions = 6, 3
+        if session._osint_turns >= cap:
+            return True
+        blob = " ".join(
+            (c.get("command") or "").lower() for c in session.commands_executed
+        )
+        distinct = sum(1 for m in self._OSINT_MARKERS if m in blob)
+        return distinct >= min_actions
+
+    def _hold_osint(self, session: "Session", proposed_stage: str) -> str:
+        """Keep the session in the OSINT stage until open-source recon is actually
+        done. Without this, the AI leaves OSINT after a single turn (it proposes
+        'reconnaissance' the moment it sees the initial nmap data) and OSINT is
+        effectively skipped. Counts a turn each time we are in OSINT and only lets
+        the stage advance once _osint_satisfied()."""
+        if session.current_stage != "osint":
+            return proposed_stage
+        session._osint_turns += 1
+        if proposed_stage != "osint" and not self._osint_satisfied(session):
+            logger.info(
+                f"Session {session.session_id}: holding in OSINT "
+                f"(turn {session._osint_turns}) — proposed '{proposed_stage}' deferred"
+            )
+            return "osint"
+        return proposed_stage
+
     def _osint_context_block(self, session: "Session") -> str:
         """Inject the OSINT checklist while the engagement is in the OSINT stage
         against a real domain/host. Always-on (not coverage-gated) — a domain
@@ -5091,8 +5201,10 @@ Web apps: {webapps}
             f"- theHarvester -d {dom} -b all  (emails, hosts, employees)\n"
             f"- Web fingerprint + WAF: whatweb {dom}; wafw00f {dom}\n"
             f"- Archived URLs: gau {dom} / waybackurls {dom}\n"
-            "Advance past OSINT only after collecting subdomains, DNS, and a web "
-            "fingerprint of the main site.\n"
+            "You are HELD in the OSINT stage until this passive recon is done — do "
+            "NOT jump to port scanning / nmap yet. Set attack_phase='osint' and run "
+            "the passive OSINT tools above first. The stage advances automatically "
+            "once enough OSINT has run (subdomains, DNS, and a web fingerprint).\n"
         )
 
     def _exploit_hints_block(self, session: "Session") -> str:
@@ -5114,6 +5226,48 @@ Web apps: {webapps}
             cve = f" [{c['cve']}]" if c.get("cve") else ""
             tool = f"  →  {c['tool']}" if c.get("tool") else ""
             lines.append(f"- {c['name']}{cve}: {c['technique']}{tool}")
+        lines.append("")
+        return "\n".join(lines)
+
+    def _prioritized_cve_block(self, session: "Session") -> str:
+        """Rank CVE findings by real-world exploitability (CISA KEV first, then
+        EPSS, then CVSS) and surface a short 'weaponise these first' list with any
+        ready Metasploit module. Empty until CVE findings exist. This steers the AI
+        to the CVEs that are actually exploitable instead of the highest CVSS."""
+        vulns = [f for f in (session.vulnerabilities or []) if (f.get("cve_ids") or [])]
+        if not vulns:
+            return ""
+
+        def _rank_key(f: Dict):
+            return (
+                1 if f.get("kev") else 0,
+                float(f.get("epss") or 0.0),
+                float(f.get("cvss_score") or 0.0),
+            )
+
+        ranked = sorted(vulns, key=_rank_key, reverse=True)[:8]
+        lines = [
+            "\n=== PRIORITISED CVEs (weaponise these first — ranked by real-world "
+            "exploitability) ===",
+            "Order = CISA KEV (exploited in the wild) > EPSS (exploit probability) "
+            "> CVSS. Attempt KEV / high-EPSS CVEs before high-CVSS-only ones; a "
+            "high CVSS with near-zero EPSS and no module is usually not worth "
+            "chasing. When a Metasploit module is listed, use it directly.",
+        ]
+        for f in ranked:
+            cve = (f.get("cve_ids") or ["?"])[0]
+            tags = []
+            if f.get("kev"):
+                tags.append("KEV:exploited-in-wild")
+            if f.get("epss") is not None:
+                tags.append(f"EPSS={float(f.get('epss') or 0.0) * 100:.0f}%")
+            if f.get("cvss_score") is not None:
+                tags.append(f"CVSS={f.get('cvss_score')}")
+            tags.append(f"status={f.get('status', '?')}")
+            svc = f"{f.get('service', '?')}:{f.get('port', '?')}"
+            mods = f.get("msf_modules") or []
+            mod_str = f"  msf: {mods[0]}" if mods else ""
+            lines.append(f"- {cve} [{svc}] {' '.join(tags)}{mod_str}")
         lines.append("")
         return "\n".join(lines)
 
@@ -5531,6 +5685,9 @@ Web apps: {webapps}
                 "risk": v.get("risk_level"),
                 "cve_ids": v.get("cve_ids") or [],
                 "cvss": v.get("cvss_score"),
+                "kev": v.get("kev", False),
+                "epss": v.get("epss"),
+                "msf_modules": v.get("msf_modules") or [],
                 "source": v.get("source_tool"),
                 "status": v.get("status")
             })

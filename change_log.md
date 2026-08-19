@@ -4,6 +4,64 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.4.0] — 2026-08-19 — Effectiveness, callback routing & CVE weaponisation
+
+Focus of this release: raise the **confirmed** rate (the engine used to touch ~48%
+of a lab's vulns but confirm only ~3%), make reverse shells work against real
+internet targets, and rank CVEs by real-world exploitability.
+
+### Added
+- **CVE exploitability ranking (KEV + EPSS).** Findings are now enriched with
+  **CISA KEV** (exploited-in-the-wild) and **FIRST EPSS** (exploit probability),
+  cached and best-effort (`core/cve_lookup.py`: `load_kev`, `lookup_epss`,
+  `enrich_findings`). A new **PRIORITISED CVEs** prompt block ranks findings
+  KEV → EPSS → CVSS so the AI weaponises what is actually exploitable instead of
+  chasing a high CVSS with no public exploit.
+- **CVE → Metasploit module resolver** (`core/msf_resolver.py`). For the top
+  prioritised CVEs, the local `msfconsole` is queried (`search cve:<id>`) and any
+  ready module path is surfaced to the AI (and in the findings summary), so it
+  jumps to a known exploit instead of improvising. Cached, bounded, and a no-op
+  when Metasploit is absent. New env: `MSF_CVE_RESOLVE`, `MSF_CVE_RESOLVE_LIMIT`,
+  `MSF_SEARCH_TIMEOUT`.
+- **Reachable reverse-shell callbacks for real-world / VPS targets**
+  (`core/callback.py`). Separates the *advertised* payload LHOST (what the target
+  dials) from the local *bind* address, so a listener behind NAT still catches a
+  shell. Modes via `CALLBACK_MODE`: `auto | local | public | ngrok | manual` —
+  supporting an ngrok TCP tunnel (`NGROK_AUTHTOKEN`), the host's public egress IP,
+  or a manual reverse-SSH endpoint (`EXPLOIT_LHOST`). The msf handler emits
+  `ReverseListenerBindAddress/Port` when advertised ≠ bind; tunnels are torn down
+  on session end. The AI prompt now reasons about reachability and falls back to
+  bind shells / web shells when no callback is reachable. Unit-tested
+  (`tests/test_callback.py`).
+
+### Changed
+- **AI reply reliability (DeepSeek API).** `max_tokens` 2000 → `AI_MAX_TOKENS`
+  (default 4096) with a truncation/JSON-repair retry — fixes the frequent
+  phantom "empty command" stalls caused by a JSON reply truncated mid-object.
+  Tactical sampling temperature 0.7 → `TACTICAL_TEMPERATURE` (default 0.2) for
+  fewer hallucinated flags/CVEs.
+- **Coverage now measures success, not attempts** (`core/coverage.py`).
+  `match_and_mark(..., success=)` — exploitation/post-ex steps only count as done
+  on a confirmed exploit signal, so a failed attempt no longer marks a service
+  "covered" and gets it abandoned. Progress reweighted toward footholds
+  (FOOTHOLD 0.25 → 0.40, ENUM 0.35 → 0.22).
+- **Finding-aware anti-loop.** The stagnation guard resets on any new finding
+  (credential, service, foothold, subdomain, coverage step) and uses a higher
+  threshold (18 vs 8) for exploitation-family stages, so a service being actively
+  worked toward a shell is not abandoned mid-exploit. `MAX_AUTO_PIVOTS` 6 → 12.
+- **OSINT stage is no longer skipped.** A public domain/host target is now *held*
+  in the OSINT stage until real open-source recon has run (or a turn cap), instead
+  of leaving after a single turn the moment the AI sees the initial nmap data.
+  New env: `OSINT_MIN_ACTIONS` (default 3), `OSINT_MAX_TURNS` (default 6).
+- **Autonomy defaults for unattended runs.** `max_auto_depth` default 5 → 25
+  (the counter still resets on any critical finding), so an auto-approved session
+  doesn't stall for a manual checkpoint every 5 commands.
+
+### Notes
+- `AI_PROVIDER` example default is now `api` (DeepSeek). Local Ollama still works.
+- Re-run `python benchmarks/score.py <report>.md` against the lab ground truth to
+  measure the **confirmed %** delta from this release.
+
 ## [2.3.3] — 2026-08-14
 
 ### Fixed

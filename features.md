@@ -221,7 +221,9 @@ KMN-CyberSeek/
 │   ├── validators.py        # Target validation, scope allowlist, command allowlist
 │   ├── report_generator.py  # DOCX / PDF report generation
 │   ├── threat_intel.py      # Open-web threat intelligence research
-│   └── cve_lookup.py        # NVD API v2 + Vulners CVE enrichment
+│   ├── cve_lookup.py        # NVD API v2 + Vulners CVE enrichment + CISA KEV/EPSS ranking
+│   ├── msf_resolver.py      # CVE → Metasploit module resolution (msfconsole search)
+│   └── callback.py          # Reverse-shell callback routing (local/public/ngrok/reverse-SSH)
 ├── tests/
 │   ├── run_tests.py
 │   ├── _helpers.py
