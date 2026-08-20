@@ -1315,6 +1315,30 @@ class Orchestrator:
         if binary in _API_TOOLS:
             self._parse_and_store_api_endpoints(session, command, output)
 
+        # nmap run by the AI ITSELF (not the scanner pipeline). Without this the
+        # ports the AI finds — e.g. after resolving a parked domain to its real
+        # server IP — never enter discovered_services, so the coverage/stage
+        # machine stays empty and the engagement can't progress on the real host.
+        if binary == "nmap" and ("Nmap scan report" in output or re.search(r"\d+/tcp\s+open", output)):
+            try:
+                parsed = self.scanner._parse_nmap_output(output)
+                new_hosts = parsed.get("hosts", []) if isinstance(parsed, dict) else []
+                if new_hosts:
+                    before = len(session.discovered_services)
+                    self._merge_hosts(session, new_hosts)
+                    self._merge_services(session, new_hosts)
+                    self._ensure_coverage(session)          # seed playbooks for new svcs
+                    self._recompute_coverage_progress(session)
+                    added = len(session.discovered_services) - before
+                    if added:
+                        logger.info(
+                            f"Session {session.session_id}: registered {added} service(s) "
+                            f"from an AI-run nmap (host(s): "
+                            f"{', '.join(h.get('ip','?') for h in new_hosts)})"
+                        )
+            except Exception as e:
+                logger.warning(f"AI-run nmap auto-parse failed (non-fatal): {e}")
+
     async def _run_vulnerability_analysis(self, session_id: str):
         """Vulnerability analysis pipeline — per-port NSE + searchsploit + NVD + Vulners + threat-intel.
 

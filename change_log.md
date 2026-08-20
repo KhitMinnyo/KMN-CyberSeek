@@ -4,6 +4,20 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.4.2] — 2026-08-20 — Register AI-run nmap results
+
+### Fixed
+- **Services the AI discovered itself were invisible to the state machine.** Only
+  the initial scanner-pipeline nmap populated `discovered_services`; when the AI
+  ran its own `nmap` (e.g. after resolving a parked domain — `drhmonegyi.cc`, on
+  `dns-parking.com` nameservers — to its real server IP `207.90.192.124` running
+  HestiaCP on 8083), those open ports never entered the session, so coverage/stage
+  stayed empty and the engagement was correctly-but-permanently gated at
+  `vulnerability_analysis`. `_auto_parse_tool_output` now parses AI-run nmap output
+  and merges the hosts/services (and seeds coverage), so the loop can progress on a
+  host the AI found on its own. Tip: for a parked domain, point the session at the
+  real server IP directly for the cleanest run.
+
 ## [2.4.1] — 2026-08-20 — Scan reachability, stage gating & credential sanity
 
 Fixes a field run where a public domain scan returned **0 open ports** and the
