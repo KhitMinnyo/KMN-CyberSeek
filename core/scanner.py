@@ -127,13 +127,18 @@ class Scanner:
         # scripts). On hosts with many/slow services (RMI, JMX, GIOP, GlassFish)
         # -sC version+script probing can take 10+ minutes; the AI queues targeted
         # script/vuln scans later, and the background vuln pass runs NSE per port.
+        # -Pn (skip host discovery) on every profile: most internet hosts block
+        # ICMP/ping, so without it nmap declares them "down" and returns 0 ports —
+        # the engagement then has no attack surface and the loop fast-forwards
+        # through every stage with nothing to do. -Pn makes nmap scan the ports
+        # regardless. (Subnet ping-sweep uses -sn separately and is unaffected.)
         scan_profiles = {
-            "quick":    f"-T4 -F --open {_bound}",                          # top 100, fast
-            "default":  f"-T4 -sV --top-ports 1000 --open {_bound}",        # top 1000, no scripts
-            "full":     f"-T4 -sV -sC --top-ports 5000 --open {_bound}",    # top 5000 + scripts
-            "stealth":  f"-sS -T2 -sV --top-ports 1000 --open {_bound}",    # stealth SYN
-            "vuln":     f"-T4 -sV --script vuln --top-ports 1000 {_bound}", # vuln NSE
-            "allports": f"-T4 -sV -sC -p- --open {_bound}",                 # all 65535 (slow!)
+            "quick":    f"-Pn -T4 -F --open {_bound}",                          # top 100, fast
+            "default":  f"-Pn -T4 -sV --top-ports 1000 --open {_bound}",        # top 1000, no scripts
+            "full":     f"-Pn -T4 -sV -sC --top-ports 5000 --open {_bound}",    # top 5000 + scripts
+            "stealth":  f"-Pn -sS -T2 -sV --top-ports 1000 --open {_bound}",    # stealth SYN
+            "vuln":     f"-Pn -T4 -sV --script vuln --top-ports 1000 {_bound}", # vuln NSE
+            "allports": f"-Pn -T4 -sV -sC -p- --open {_bound}",                 # all 65535 (slow!)
         }
 
         scan_options = scan_profiles.get(scan_type, scan_profiles["default"])
@@ -448,7 +453,7 @@ class Scanner:
             # block the whole scan. -T4 aggressive timing keeps service probing fast.
             port_flag = f"-p {','.join(str(int(p)) for p in ports)} " if ports else ""
             cmd = (
-                f"nmap -sV -T4 {port_flag}"
+                f"nmap -Pn -sV -T4 {port_flag}"
                 f'--script "vuln and not intrusive" --script-timeout 30 '
                 f"{shlex.quote(target)}"
             )
@@ -525,7 +530,7 @@ class Scanner:
         logger.info(f"Starting per-port vuln scan: {target}:{port}")
         try:
             cmd = (
-                f"nmap -sV -T4 -p {int(port)} "
+                f"nmap -Pn -sV -T4 -p {int(port)} "
                 f'--script "vuln and not intrusive" --script-timeout 20 '
                 f"{shlex.quote(target)}"
             )
@@ -733,7 +738,7 @@ class Scanner:
             }
 
         try:
-            cmd = f"nmap -p {port} {shlex.quote(target)}"
+            cmd = f"nmap -Pn -p {port} {shlex.quote(target)}"
 
             process = await asyncio.create_subprocess_shell(
                 cmd,

@@ -4,6 +4,30 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.4.1] — 2026-08-20 — Scan reachability, stage gating & credential sanity
+
+Fixes a field run where a public domain scan returned **0 open ports** and the
+engagement then fast-forwarded through every stage with nothing to do.
+
+### Fixed
+- **Nmap returned 0 ports on ping-blocking hosts.** Every scan profile (and the
+  per-port NSE scans) now uses **`-Pn`** (skip host discovery). Most internet
+  hosts block ICMP, so without it nmap declared them "down" and found no ports,
+  leaving the engagement with no attack surface (`core/scanner.py`).
+- **Stages fast-forwarded on a mislabeled phase.** Stage progression was driven
+  purely by the AI's self-reported `attack_phase`; when the model kept reporting
+  `credential_reuse`, the loop marched through recon→…→credential_reuse one step
+  per decision without doing any stage's work. Added `_gate_stage` /
+  `_stage_prereqs_met`: a stage is entered only when its prerequisites exist
+  (services/vulns for exploitation; a foothold for post-ex/privesc; a foothold or
+  real credential + a service for lateral movement / credential reuse). A
+  mislabeled phase can no longer skip ahead of the real attack surface.
+- **Guessed credentials no longer ingested.** A "credential" whose secret is
+  derived from the target/domain name (e.g. password `DrHmoneGyi` for
+  `drhmonegyi.cc`, echoed by a python/echo command) is now rejected
+  (`_looks_guessed_credential`), so the loop no longer fixates on
+  credential-reuse against a login that never existed.
+
 ## [2.4.0] — 2026-08-19 — Effectiveness, callback routing & CVE weaponisation
 
 Focus of this release: raise the **confirmed** rate (the engine used to touch ~48%
