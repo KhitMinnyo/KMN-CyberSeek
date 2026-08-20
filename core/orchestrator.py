@@ -1753,6 +1753,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # Advance stage: gate prevents regression and limits skipping to 1 step.
             new_stage = _advance_stage(session.current_stage, ai_response.attack_phase)
             new_stage = self._hold_osint(session, new_stage)
+            new_stage = self._gate_stage(session, new_stage)
             if new_stage != session.current_stage:
                 logger.info(f"Session {session_id}: stage {session.current_stage} → {new_stage} (AI proposed: {ai_response.attack_phase})")
             session.current_stage = new_stage
@@ -2438,6 +2439,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             # Advance stage: gate prevents regression and limits skip to 1 step.
             new_stage = _advance_stage(session.current_stage, ai_response.attack_phase)
             new_stage = self._hold_osint(session, new_stage)
+            new_stage = self._gate_stage(session, new_stage)
             if new_stage != session.current_stage:
                 logger.info(f"Session {session_id}: stage {session.current_stage} → {new_stage} (AI proposed: {ai_response.attack_phase})")
             else:
@@ -3350,6 +3352,54 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         except sqlite3.Error:
             return []
 
+    @staticmethod
+    def _looks_guessed_credential(session: "Session", username: str, secret: str,
+                                  command: str) -> bool:
+        """Heuristic: does this 'credential' look like the AI guessed it from the
+        target/domain name rather than obtaining it from a tool? Catches the
+        observed failure where a python/echo command printed
+        `user='DrHmoneGyi' pass='DrHmoneGyi'` (from target drhmonegyi.cc) and it
+        was ingested as a real credential, sending the loop into endless
+        credential-reuse against a login that never existed.
+
+        Fires when the secret equals a target-derived token (domain label / IP
+        octet-word), optionally with a trivial suffix, or when username == secret
+        and both derive from the target. Conservative to avoid dropping real creds."""
+        import re as _re
+
+        def _tokens(text: str):
+            return [t for t in _re.split(r"[^a-z0-9]+", (text or "").lower()) if t]
+
+        target_tokens = set()
+        for src in (session.target_domain or "", session.target_ip or ""):
+            for p in _tokens(src):
+                if len(p) >= 4 and not p.isdigit():   # skip TLDs handled below + pure numbers
+                    target_tokens.add(p)
+            # domain label without its TLD, e.g. drhmonegyi.cc -> drhmonegyi
+            parts = _tokens(src)
+            if len(parts) >= 2 and len(parts[-2]) >= 4:
+                target_tokens.add(parts[-2])
+        if not target_tokens:
+            return False
+
+        norm = lambda s: _re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+        sec = norm(secret)
+        usr = norm(username)
+        if not sec:
+            return False
+
+        # secret is exactly a target token (password == domain label)
+        if sec in target_tokens:
+            return True
+        # username == secret and both look target-derived (DrHmoneGyi:DrHmoneGyi)
+        if usr and usr == sec and any(usr in t or t in usr for t in target_tokens):
+            return True
+        # secret is a target token plus a trivial suffix (drhmonegyi123, drhmonegyi!)
+        for t in target_tokens:
+            if sec.startswith(t) and 0 <= len(sec) - len(t) <= 4:
+                return True
+        return False
+
     def _extract_and_store_credentials(self, session_id: str, command: str, output: str):
         """Scan command output for credential finds and persist new ones.
         Deduplicates on (username, secret). Never raises - failures are logged."""
@@ -3374,6 +3424,19 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     secret = (match.group(2) or "").strip()
                     if not username or not secret or len(username) > 256 or len(secret) > 512:
                         continue
+                    # Reject credentials the AI merely GUESSED from the target name
+                    # (e.g. password "DrHmoneGyi" for target drhmonegyi.cc, echoed
+                    # by a python/echo command rather than returned by an auth tool).
+                    # Ingesting these makes the loop fixate on credential-reuse
+                    # against a phantom login. See _looks_guessed_credential().
+                    if self._looks_guessed_credential(session, username, secret, command):
+                        logger.info(
+                            f"Skipping likely-guessed credential for session {session_id}: "
+                            f"user={username!r} — secret derived from the target name, "
+                            f"not from real tool output."
+                        )
+                        continue
+
                     # Rough heuristic: long hex/dollar strings are hashes, not passwords
                     is_hash = secret.startswith("$") or (len(secret) >= 32 and all(c in "0123456789abcdefABCDEF" for c in secret))
                     secret_type = "hash" if is_hash else "password"
@@ -5182,6 +5245,49 @@ Web apps: {webapps}
             )
             return "osint"
         return proposed_stage
+
+    def _stage_prereqs_met(self, session: "Session", stage: str) -> bool:
+        """Whether the engagement has the real findings a stage needs to be
+        meaningful. Used to stop the loop fast-forwarding into late stages purely
+        because the model keeps reporting attack_phase='credential_reuse' when
+        there is nothing to act on (e.g. a scan that found 0 open ports)."""
+        has_services = len(session.discovered_services) > 0
+        has_creds = len(session.credentials) > 0
+        has_vulns = len(session.vulnerabilities) > 0
+        has_foothold = len(session.compromise_evidence or []) > 0
+
+        if stage == "exploitation":
+            # Nothing to exploit without a service or a concrete vulnerability.
+            return has_services or has_vulns
+        if stage in ("post_exploitation", "privilege_escalation"):
+            # These only make sense once we actually have access.
+            return has_foothold
+        if stage in ("lateral_movement", "credential_reuse"):
+            # Reuse/pivot needs a foothold, or at least a real credential AND a
+            # service to try it against. A guessed credential with no services is
+            # not a reason to declare the engagement is in credential_reuse.
+            return has_foothold or (has_creds and has_services)
+        # osint / reconnaissance / enumeration / vulnerability_analysis are always
+        # allowed — they are how the attack surface gets discovered in the first place.
+        return True
+
+    def _gate_stage(self, session: "Session", proposed_stage: str) -> str:
+        """Clamp the proposed stage to the furthest stage whose prerequisites are
+        actually met (never regressing below the current stage). This makes stage
+        progression follow real findings, not just the AI's self-reported phase —
+        so a mislabeled 'credential_reuse' cannot march the whole chain to the end
+        when the scan found nothing to work on."""
+        idx = _STAGE_INDEX.get(proposed_stage, _STAGE_INDEX.get(session.current_stage, 0))
+        cur = _STAGE_INDEX.get(session.current_stage, 0)
+        while idx > cur and not self._stage_prereqs_met(session, _STAGE_ORDER[idx]):
+            idx -= 1
+        gated = _STAGE_ORDER[idx]
+        if gated != proposed_stage:
+            logger.info(
+                f"Session {session.session_id}: gating stage '{proposed_stage}' → "
+                f"'{gated}' (prerequisites not met — no attack surface for the later stage)"
+            )
+        return gated
 
     def _osint_context_block(self, session: "Session") -> str:
         """Inject the OSINT checklist while the engagement is in the OSINT stage
