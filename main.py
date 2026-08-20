@@ -32,11 +32,22 @@ try:
 except Exception:  # pragma: no cover
     APP_VERSION = "0.0.0"
 
-# Configure logging
+# Configure logging.
+# In addition to the terminal (stdout), mirror everything to ONE terminal-log
+# file. It is opened in 'w' mode so each backend start TRUNCATES and replaces it —
+# a single rolling log of the current run, never a growing pile of per-run files.
+# Path is configurable via TERMINAL_LOG_FILE; default terminal_output.txt.
+_TERMINAL_LOG_FILE = (os.getenv("TERMINAL_LOG_FILE", "").strip() or "terminal_output.txt")
+_log_handlers = [logging.StreamHandler(sys.stdout)]
+try:
+    _log_handlers.append(logging.FileHandler(_TERMINAL_LOG_FILE, mode="w", encoding="utf-8"))
+except OSError as _e:  # pragma: no cover - disk/permission issue must not break startup
+    print(f"[warn] could not open terminal log file {_TERMINAL_LOG_FILE}: {_e}", file=sys.stderr)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=_log_handlers,
 )
 logger = logging.getLogger(__name__)
 
@@ -1436,7 +1447,12 @@ def start_operation():
         app,
         host=host,
         port=port,
-        log_level="info"
+        log_level="info",
+        # log_config=None → don't let uvicorn install its own logging handlers.
+        # Its loggers then propagate to the root logger we configured above, so
+        # uvicorn's output (startup, errors, non-noise access) is mirrored into the
+        # single terminal-log file alongside the app logs.
+        log_config=None,
     )
 
 if __name__ == "__main__":

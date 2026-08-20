@@ -1452,41 +1452,58 @@ def show_session_overview(session_details: Dict):
             st.rerun()
 
     # Report download — Markdown (no deps, always works) + DOCX.
+    # NOTE: a download must survive the rerun a click triggers. The old code put
+    # st.download_button INSIDE `if st.button(...)`, so the save button vanished on
+    # the next rerun and the download never fired ("can't export"). Fix: fetch on
+    # click, stash the bytes in session_state, and render a persistent download
+    # button from that state so it stays available across reruns.
     rep_col1, rep_col2 = st.columns(2)
+    _md_key = f"_report_md_{session_id}"
+    _docx_key = f"_report_docx_{session_id}"
     with rep_col1:
-        if st.button("📝 Download Markdown Report", use_container_width=True):
+        if st.button("📝 Generate Markdown Report", use_container_width=True):
             with st.spinner("Generating report…"):
                 try:
-                    resp = api_session.get(f"{API_BASE}/sessions/{session_id}/report/md", timeout=60)
+                    resp = api_session.get(f"{API_BASE}/sessions/{session_id}/report/md", timeout=120)
                     if resp.status_code == 200:
-                        st.download_button(
-                            label="💾 Save Markdown (.md)",
-                            data=resp.content,
-                            file_name=f"kmn_report_{session_id[:12]}.md",
-                            mime="text/markdown",
-                            use_container_width=True,
-                        )
+                        st.session_state[_md_key] = resp.content
                     else:
-                        st.error(f"Report failed ({resp.status_code}): {resp.text[:200]}")
+                        st.session_state.pop(_md_key, None)
+                        st.error(f"Report failed ({resp.status_code}): {resp.text[:300]}")
                 except Exception as e:
+                    st.session_state.pop(_md_key, None)
                     st.error(f"Could not reach backend: {e}")
+        if st.session_state.get(_md_key):
+            st.download_button(
+                label="💾 Save Markdown (.md)",
+                data=st.session_state[_md_key],
+                file_name=f"kmn_report_{session_id[:12]}.md",
+                mime="text/markdown",
+                use_container_width=True,
+                key=f"dl_md_{session_id}",
+            )
     with rep_col2:
-        if st.button("📄 Download DOCX Report", use_container_width=True):
+        if st.button("📄 Generate DOCX Report", use_container_width=True):
             with st.spinner("Generating report…"):
                 try:
-                    resp = api_session.get(f"{API_BASE}/sessions/{session_id}/report", timeout=60)
+                    resp = api_session.get(f"{API_BASE}/sessions/{session_id}/report", timeout=120)
                     if resp.status_code == 200:
-                        st.download_button(
-                            label="💾 Save DOCX",
-                            data=resp.content,
-                            file_name=f"kmn_report_{session_id[:12]}.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            use_container_width=True,
-                        )
+                        st.session_state[_docx_key] = resp.content
                     else:
+                        st.session_state.pop(_docx_key, None)
                         st.error(f"DOCX needs python-docx ({resp.status_code}). Use Markdown instead.")
                 except Exception as e:
+                    st.session_state.pop(_docx_key, None)
                     st.error(f"Could not reach backend: {e}")
+        if st.session_state.get(_docx_key):
+            st.download_button(
+                label="💾 Save DOCX",
+                data=st.session_state[_docx_key],
+                file_name=f"kmn_report_{session_id[:12]}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key=f"dl_docx_{session_id}",
+            )
 
     # ── Steer / Ask the AI ────────────────────────────────────────────────────
     # Modern Streamlit shows the floating 💬 chat bubble (bottom-right, rendered in
@@ -2051,6 +2068,13 @@ def show_evidence(session_details: Dict):
     sid = session_details.get("session_id", "")
     col1, col2, col3 = st.columns(3)
 
+    # Export state keys — bytes/str stashed here on click so the download button
+    # persists across the rerun a download click triggers (see the report-download
+    # note in display_session_details).
+    _json_key = f"_export_json_{sid}"
+    _pdf_key = f"_export_pdf_{sid}"
+    _html_key = f"_export_html_{sid}"
+
     # ── JSON export ────────────────────────────────────────────────────────
     with col1:
         if st.button("📄 Export as JSON", use_container_width=True):
@@ -2066,12 +2090,15 @@ def show_evidence(session_details: Dict):
                 "discovered_services": session_details.get("discovered_services", []),
                 "credentials": session_details.get("credentials", []),
             }
+            st.session_state[_json_key] = _json.dumps(payload, indent=2, default=str)
+        if st.session_state.get(_json_key):
             st.download_button(
                 label="💾 Save JSON",
-                data=_json.dumps(payload, indent=2, default=str),
+                data=st.session_state[_json_key],
                 file_name=f"kmn_report_{sid[:12]}.json",
                 mime="application/json",
                 use_container_width=True,
+                key=f"dl_json_{sid}",
             )
 
     # ── PDF export ─────────────────────────────────────────────────────────
@@ -2079,21 +2106,27 @@ def show_evidence(session_details: Dict):
         if st.button("📊 Export as PDF", use_container_width=True):
             with st.spinner("Generating PDF…"):
                 try:
-                    resp = api_session.get(f"{API_BASE}/sessions/{sid}/report/pdf", timeout=60)
+                    resp = api_session.get(f"{API_BASE}/sessions/{sid}/report/pdf", timeout=120)
                     if resp.status_code == 200:
-                        st.download_button(
-                            label="💾 Save PDF",
-                            data=resp.content,
-                            file_name=f"kmn_report_{sid[:12]}.pdf",
-                            mime="application/pdf",
-                            use_container_width=True,
-                        )
+                        st.session_state[_pdf_key] = resp.content
                     elif resp.status_code == 501:
+                        st.session_state.pop(_pdf_key, None)
                         st.warning("fpdf2 not installed on backend. Run: pip install fpdf2")
                     else:
+                        st.session_state.pop(_pdf_key, None)
                         st.error(f"PDF generation failed ({resp.status_code}): {resp.text[:200]}")
                 except Exception as e:
+                    st.session_state.pop(_pdf_key, None)
                     st.error(f"Could not reach backend: {e}")
+        if st.session_state.get(_pdf_key):
+            st.download_button(
+                label="💾 Save PDF",
+                data=st.session_state[_pdf_key],
+                file_name=f"kmn_report_{sid[:12]}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key=f"dl_pdf_{sid}",
+            )
 
     # ── HTML report export ─────────────────────────────────────────────────
     with col3:
@@ -2174,12 +2207,15 @@ def show_evidence(session_details: Dict):
 <table><tr><th>OK</th><th>Command</th><th>Timestamp</th></tr>{cmd_rows or "<tr><td colspan='3'>None</td></tr>"}</table>
 <footer>Generated by KMN-CyberSeek &mdash; FOR AUTHORISED USE ONLY</footer>
 </body></html>"""
+            st.session_state[_html_key] = html
+        if st.session_state.get(_html_key):
             st.download_button(
                 label="💾 Save HTML",
-                data=html,
+                data=st.session_state[_html_key],
                 file_name=f"kmn_report_{sid[:12]}.html",
                 mime="text/html",
                 use_container_width=True,
+                key=f"dl_html_{sid}",
             )
 
 
