@@ -424,6 +424,15 @@ class Session:
         self._stagnation_counter: int = 0
         self._last_progress_marker: tuple = ()
 
+        # Hard effort ceiling: total executed commands since the last real
+        # progress (foothold / new credential). If this passes the cap without a
+        # foothold, the engagement halts for operator input instead of grinding
+        # for hours. Reset whenever a compromise or credential appears.
+        self._commands_since_progress: int = 0
+        self._MAX_COMMANDS_NO_PROGRESS: int = int(
+            os.getenv("MAX_COMMANDS_NO_PROGRESS", "60")
+        )
+
         # Empty-response recovery: the LLM (esp. local Ollama / DeepSeek) sometimes
         # returns valid JSON with an EMPTY suggested_command. Without handling, the
         # agentic loop silently halts at status=ready. We retry with an explicit
@@ -547,6 +556,16 @@ class Orchestrator:
         # Reverse-shell callback tunnels (e.g. an ngrok process) keyed by
         # session_id, so they can be torn down when the session ends.
         self._callback_tunnels: Dict[str, Any] = {}
+
+        # Tool availability preflight — computed once. The AI repeatedly tried
+        # `sshpass` on a host without it, wasting many turns; telling it up front
+        # which tools are missing lets it pick working alternatives immediately.
+        self._missing_tools: List[str] = self._detect_missing_tools()
+        if self._missing_tools:
+            logger.warning(
+                f"Missing pentest tools (AI will be told to avoid them): "
+                f"{', '.join(self._missing_tools)}"
+            )
 
         # Decoupled brute-force workers — one per pentest session (M5).
         self._brute_workers: Dict[str, BruteforceWorker] = {}
@@ -1336,6 +1355,16 @@ class Orchestrator:
                             f"from an AI-run nmap (host(s): "
                             f"{', '.join(h.get('ip','?') for h in new_hosts)})"
                         )
+                        # Kick a background vuln-analysis pass so the new services
+                        # get searchsploit/NVD/KEV/EPSS enrichment. It is marker-
+                        # deduplicated, so already-scanned services are skipped.
+                        self._maybe_start_bruteforce(session.session_id)
+                        try:
+                            asyncio.create_task(
+                                self._run_vulnerability_analysis(session.session_id)
+                            )
+                        except RuntimeError:
+                            pass  # no running loop (sync/test context)
             except Exception as e:
                 logger.warning(f"AI-run nmap auto-parse failed (non-fatal): {e}")
 
@@ -1672,6 +1701,9 @@ class Orchestrator:
             # toward tunnels or non-callback techniques before exploitation.
             _exhausted_ctx += self._reachability_context_block(session)
 
+            # Missing-tool advisory so the AI doesn't retry uninstalled tools.
+            _exhausted_ctx += self._tools_context_block(session)
+
             # Force-command directive — appended when recovering from an empty
             # response so the model is compelled to emit a concrete next command.
             if force_command:
@@ -1932,18 +1964,41 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         # Always truncate large outputs to manage token limits
         # For outputs > 4000 characters, keep first 2000 and last 2000 as specified
         if len(output) > 4000:
+            # Special case: nmap service/version output. Naive first/last-2000
+            # truncation cuts the PORT/SERVICE/VERSION table in half, so services
+            # register with EMPTY versions and CVE enrichment finds nothing. When
+            # the output looks like an nmap scan, preserve the port table lines
+            # (PORT ... / "N/tcp open ..." / NSE "| script" lines) in full.
+            if ("Nmap scan report" in output or re.search(r"^\s*PORT\s+STATE", output, re.M)):
+                keep = []
+                for line in output.split("\n"):
+                    if (re.search(r"^\s*\d+/(tcp|udp)\s", line)          # port rows
+                            or re.match(r"^\s*PORT\s+STATE", line)         # table header
+                            or line.startswith("Nmap scan report")        # host header
+                            or line.startswith("|")                        # NSE script output
+                            or re.match(r"^\s*\d+/(tcp|udp)", line)):
+                        keep.append(line)
+                table = "\n".join(keep)
+                if len(table) > 6000:
+                    table = table[:6000] + "\n...[port table truncated]..."
+                sanitized = (
+                    f"[NOTE: nmap output {len(output)} chars — showing the parsed "
+                    f"PORT/SERVICE/VERSION table]\n{table}"
+                )
+                return sanitized.strip()
+
             # Keep first 2000 and last 2000 characters with separator
             first_part = output[:2000]
             last_part = output[-2000:]
-            
+
             # Simple truncation without complex key section extraction
             sanitized = f"{first_part}\n\n...[Output truncated - {len(output)} characters total, showing first/last 2000 chars]...\n\n{last_part}"
-            
+
             # Add truncation notice
             sanitized = f"[NOTE: Original output {len(output)} chars, truncated to ~{len(sanitized)} chars for AI token limits]\n{sanitized}"
         else:
             sanitized = output
-        
+
         return sanitized.strip()
     
     def queue_for_approval(self, session_id: str, command: str) -> str:
@@ -2055,6 +2110,45 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
         return command
 
+    # Long directory / DNS / web brute-forcers: capped tighter than the global
+    # COMMAND_TIMEOUT so a single huge-wordlist run can't burn the full budget.
+    _ENUM_TOOLS = (
+        "gobuster", "ffuf", "dirb", "dirbuster", "feroxbuster", "wfuzz",
+        "dnsrecon", "dnsenum", "nikto", "wpscan", "nuclei", "dirsearch",
+    )
+    # Oversized wordlists → smaller equivalents in the same seclists tree, so a
+    # scan finds the common paths fast instead of grinding a 220k-line list.
+    _WORDLIST_SWAPS = {
+        "directory-list-2.3-medium.txt": "directory-list-2.3-small.txt",
+        "directory-list-2.3-big.txt": "directory-list-2.3-small.txt",
+        "directory-list-lowercase-2.3-medium.txt": "directory-list-2.3-small.txt",
+        "directory-list-lowercase-2.3-big.txt": "directory-list-2.3-small.txt",
+        "subdomains-top1million-110000.txt": "subdomains-top1million-20000.txt",
+        "/dirb/big.txt": "/dirb/common.txt",
+    }
+
+    def _command_timeout(self, command: str) -> int:
+        """Timeout (s) for a command. Enumeration brute-forcers get a shorter cap
+        (ENUM_COMMAND_TIMEOUT, default 180) since they yield useful partial output
+        early; everything else gets the full COMMAND_TIMEOUT."""
+        c = (command or "").lower()
+        if any(t in c for t in self._ENUM_TOOLS):
+            try:
+                return int(os.getenv("ENUM_COMMAND_TIMEOUT", "180"))
+            except ValueError:
+                return 180
+        return COMMAND_TIMEOUT
+
+    def _downsize_wordlists(self, command: str) -> str:
+        """Rewrite oversized brute-force wordlist paths to smaller ones so a single
+        scan cannot run for the whole timeout. No-op if none are present."""
+        if not command:
+            return command
+        for big, small in self._WORDLIST_SWAPS.items():
+            if big in command:
+                command = command.replace(big, small)
+        return command
+
     async def execute_command(self, session_id: str, command: str) -> Dict:
         """Execute a command and capture output."""
         session = self.sessions.get(session_id)
@@ -2064,7 +2158,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         # Do not execute commands when the session has already failed/completed.
         # Asyncio tasks queued before the failure would otherwise run after the
         # session is dead, producing confusing "terminal active / UI failed" state.
-        if session.status in ("failed", "completed", "error"):
+        if session.status in ("failed", "completed", "error", "needs_operator"):
             logger.warning(
                 f"execute_command called on {session_id} with status={session.status} — skipping: {command[:80]}"
             )
@@ -2104,6 +2198,14 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
             # Inject known credentials before execution so tools run non-interactively
             command = self._inject_credentials(command, session)
+            # Swap oversized brute-force wordlists for smaller ones so a single
+            # gobuster/ffuf can't run for the full timeout on a 220k-line list.
+            command = self._downsize_wordlists(command)
+
+            # Per-command timeout: long directory/DNS brute-forcers are capped much
+            # tighter than the global timeout (they return useful partial output
+            # early), so one big scan can't burn 10 minutes.
+            _cmd_timeout = self._command_timeout(command)
 
             # stdin=DEVNULL: close stdin so tools that prompt for a password
             # (smbclient, mysql, ftp, etc.) receive EOF instead of blocking on
@@ -2112,6 +2214,10 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # timeout can kill the WHOLE tree. Without it, process.kill() would
             # only kill the /bin/sh wrapper and leave the real tool (nmap, hydra,
             # smbclient…) orphaned and running.
+            # limit=: raise the StreamReader line-buffer well above the 64 KB
+            # default so a single very long output line (ffuf/gobuster progress,
+            # minified JS) does not crash the reader with "Separator is not found,
+            # and chunk exceed the limit" — which silently failed whole commands.
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -2119,6 +2225,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 stderr=asyncio.subprocess.PIPE,
                 cwd="/tmp",  # Safe directory
                 start_new_session=True,
+                limit=10 * 1024 * 1024,  # 10 MB per line
             )
 
             # Stream stdout + stderr line-by-line, broadcasting each chunk to
@@ -2129,29 +2236,24 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
             _LIVE_MAX = 8000  # rolling cap so buffer never grows unbounded
 
-            async def _stream_stdout():
-                async for line in process.stdout:
-                    text = line.decode(errors="replace")
-                    stdout_chunks.append(text)
-                    # Update per-session live-output buffer (Streamlit polling)
-                    self._live_output[session_id] = (
-                        self._live_output.get(session_id, "") + text
-                    )[-_LIVE_MAX:]
-                    if self.broadcast_callback:
+            async def _read_stream(stream, chunks, stream_name):
+                """Read a subprocess stream line-by-line, but survive lines that
+                exceed the buffer limit (LimitOverrunError / ValueError) by draining
+                a raw chunk instead of letting the whole command fail."""
+                while True:
+                    try:
+                        line = await stream.readline()
+                    except (asyncio.LimitOverrunError, ValueError):
                         try:
-                            await self.broadcast_callback("command_output_chunk", {
-                                "session_id": session_id,
-                                "command_id": command_id,
-                                "stream": "stdout",
-                                "chunk": text
-                            })
+                            line = await stream.read(65536)
                         except Exception:
-                            pass
-
-            async def _stream_stderr():
-                async for line in process.stderr:
-                    text = line.decode(errors="replace")
-                    stderr_chunks.append(text)
+                            break
+                    except Exception:
+                        break
+                    if not line:
+                        break
+                    text = line.decode(errors="replace") if isinstance(line, (bytes, bytearray)) else line
+                    chunks.append(text)
                     self._live_output[session_id] = (
                         self._live_output.get(session_id, "") + text
                     )[-_LIVE_MAX:]
@@ -2160,16 +2262,19 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                             await self.broadcast_callback("command_output_chunk", {
                                 "session_id": session_id,
                                 "command_id": command_id,
-                                "stream": "stderr",
-                                "chunk": text
+                                "stream": stream_name,
+                                "chunk": text,
                             })
                         except Exception:
                             pass
 
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(_stream_stdout(), _stream_stderr()),
-                    timeout=COMMAND_TIMEOUT
+                    asyncio.gather(
+                        _read_stream(process.stdout, stdout_chunks, "stdout"),
+                        _read_stream(process.stderr, stderr_chunks, "stderr"),
+                    ),
+                    timeout=_cmd_timeout
                 )
             except asyncio.TimeoutError:
                 # Kill the whole process group so the real tool dies, not just
@@ -2185,7 +2290,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                     await asyncio.wait_for(process.wait(), timeout=5)
                 except asyncio.TimeoutError:
                     pass
-                logger.warning(f"Command timed out after {COMMAND_TIMEOUT}s for session {session_id}: {command[:80]}")
+                logger.warning(f"Command timed out after {_cmd_timeout}s for session {session_id}: {command[:80]}")
 
             await process.wait()
             return_code = process.returncode
@@ -2318,7 +2423,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         # externally (e.g. a parse error in a parallel task set status before this
         # callback fired). Without this guard the loop keeps spawning new commands
         # on a dead session, making the terminal appear active while UI shows failed.
-        if session.status in ("failed", "completed", "error"):
+        if session.status in ("failed", "completed", "error", "needs_operator"):
             logger.warning(
                 f"_process_command_output: session {session_id} is {session.status} — halting loop."
             )
@@ -2329,6 +2434,42 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # newly discovered subdomains / web apps feed into the AI's next turn.
             if not error:
                 self._auto_parse_tool_output(session, command, output)
+
+            # ── Hard effort ceiling ───────────────────────────────────────────
+            # Count commands since the last real progress (a foothold or a new
+            # credential). Past the cap with no foothold, stop grinding and ask
+            # the operator — this is what prevents 6-hour runs that go nowhere.
+            _footholds = len(session.compromise_evidence or [])
+            _progress = (_footholds, len(session.credentials))
+            if _progress != getattr(session, "_last_effort_marker", None):
+                session._commands_since_progress = 0
+                session._last_effort_marker = _progress
+            else:
+                session._commands_since_progress += 1
+            if (_footholds == 0
+                    and session._commands_since_progress >= session._MAX_COMMANDS_NO_PROGRESS):
+                logger.warning(
+                    f"Session {session_id}: {session._commands_since_progress} commands "
+                    "with no foothold — halting for operator input."
+                )
+                session.status = "needs_operator"
+                _d = {
+                    "timestamp": datetime.now().isoformat(),
+                    "reasoning": (
+                        f"⛔ HALTED — NEEDS OPERATOR. {session._commands_since_progress} "
+                        "commands executed with no foothold or new credential. The "
+                        "autonomous loop is not making progress. Provide a credential, a "
+                        "specific vector, or approve a manual command to resume."
+                    ),
+                    "suggested_command": "",
+                    "risk_level": "high",
+                    "confidence": 1.0,
+                    "context": "needs_operator",
+                }
+                session.ai_decisions.append(_d)
+                self._save_ai_decision(session_id, _d)
+                self._save_session_status(session_id, session)
+                return
 
             # Get last 3 executed commands for context (excluding current one)
             last_commands = session.commands_executed[-3:] if len(session.commands_executed) > 0 else []
@@ -2428,7 +2569,7 @@ Subdomains found: {len(session.discovered_subdomains)}{f' — [{", ".join(sessio
 Web apps found: {len(session.web_applications)}{f' — [{", ".join(a.get("url","") for a in session.web_applications[:5])}]' if session.web_applications else ''}
 API endpoints: {len(session.discovered_api_endpoints)}
 Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
-{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._prioritized_cve_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}{self._reachability_context_block(session)}
+{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._prioritized_cve_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}{self._reachability_context_block(session)}{self._tools_context_block(session)}
 Domain rule: If Target Domain is provided ({session.target_domain}), use domain name for all web tools — never IP.
 
 {self._get_relevant_threat_intel_context(session_id)}
@@ -2727,9 +2868,16 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 
         # Manual approval is a human override — reset the depth counter so the AI
         # loop can continue auto-executing from this point instead of stalling.
+        # Also clears a needs_operator halt and its stuck-counters so the loop
+        # can resume from here.
         session = self.sessions.get(session_id)
         if session:
             session.auto_depth_counter = 0
+            if session.status == "needs_operator":
+                session.status = "executing"
+                session._auto_pivot_count = 0
+                session._stagnation_counter = 0
+                self._save_session_status(session_id, session)
 
         # Execute the command asynchronously
         asyncio.create_task(self.execute_command(session_id, command_data["command"]))
@@ -2791,21 +2939,34 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
     @staticmethod
     def _merge_services(session: "Session", new_hosts: List[Dict]) -> None:
         """Add services to session.discovered_services, skipping (host,port) pairs
-        already present.  Sets test_state='untested' for brand-new entries."""
-        existing = {(s["host"], s["port"]) for s in session.discovered_services}
+        already present.  Sets test_state='untested' for brand-new entries. For an
+        EXISTING (host,port), fills in a missing service name / version when the new
+        data has one — so a later `-sV` scan enriches a service first seen by a
+        version-less `-sS` scan (needed for CVE lookup to work)."""
+        by_key = {(s["host"], s["port"]): s for s in session.discovered_services}
         for host in new_hosts:
             for port in host.get("ports", []):
                 key = (host["ip"], port["port"])
-                if key not in existing:
-                    session.discovered_services.append({
+                existing = by_key.get(key)
+                if existing is None:
+                    rec = {
                         "host": host["ip"],
                         "port": port["port"],
                         "service": port.get("service", "unknown"),
                         "version": port.get("version", ""),
                         "state": port.get("state", "open"),
                         "test_state": "untested",
-                    })
-                    existing.add(key)
+                    }
+                    session.discovered_services.append(rec)
+                    by_key[key] = rec
+                else:
+                    # Enrich: fill an empty/unknown service or version if we now have it.
+                    new_svc = port.get("service", "")
+                    new_ver = port.get("version", "")
+                    if new_svc and existing.get("service") in ("", "unknown", None):
+                        existing["service"] = new_svc
+                    if new_ver and not (existing.get("version") or "").strip():
+                        existing["version"] = new_ver
 
     def _save_scan_results(self, session_id: str, scan_type: str, scan_data: Dict):
         """Save scan results to database."""
@@ -2927,23 +3088,32 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             return
 
         if session._auto_pivot_count >= session._MAX_AUTO_PIVOTS:
+            # FIRM HALT. Previously this set status='ready', but in FULL_AUTO the
+            # watchdog kept reviving the session and it spun for hours with no
+            # progress. needs_operator is a real stop: the loop guards refuse to
+            # run, and the watchdog skips it. A human clears it by sending an
+            # operator instruction or approving a command.
             logger.warning(
                 f"Session {session_id}: max auto-pivots ({session._MAX_AUTO_PIVOTS}) "
-                "reached — halting and waiting for manual intervention."
+                "reached with no foothold — halting for operator input."
             )
-            session.status = "ready"
+            session.status = "needs_operator"
             session.auto_depth_counter = session.max_auto_depth
             _d = {
                 "timestamp": datetime.now().isoformat(),
                 "reasoning": (
-                    f"AUTO-PIVOT LIMIT REACHED ({session._MAX_AUTO_PIVOTS} pivots). "
-                    f"Exhausted vectors: {', '.join(session.exhausted_services)}. "
-                    "All known attack paths have been attempted. Manual review required."
+                    f"⛔ HALTED — NEEDS OPERATOR. {session._MAX_AUTO_PIVOTS} auto-pivots "
+                    f"reached with no foothold. Exhausted vectors: "
+                    f"{', '.join(session.exhausted_services) or 'various'}. "
+                    "The autonomous loop is out of viable moves. Provide guidance "
+                    "(a credential, a specific vector, or an in-scope note) or approve "
+                    "a manual command to resume — the loop will not keep spinning on "
+                    "its own."
                 ),
                 "suggested_command": "",
                 "risk_level": "high",
                 "confidence": 1.0,
-                "context": "pivot_limit_reached",
+                "context": "needs_operator",
             }
             session.ai_decisions.append(_d)
             self._save_ai_decision(session_id, _d)
@@ -3388,8 +3558,29 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 
         Fires when the secret equals a target-derived token (domain label / IP
         octet-word), optionally with a trivial suffix, or when username == secret
-        and both derive from the target. Conservative to avoid dropping real creds."""
+        and both derive from the target. Conservative to avoid dropping real creds.
+
+        Also rejects structural junk the credential regex scrapes from ordinary
+        output — version numbers and dates — which is how `5.2.3 : 2025-10-07`
+        (a software version + a date) got captured as a login and sent the loop
+        into hours of dead credential-reuse."""
         import re as _re
+
+        # ── Structural junk: version numbers, dates, timestamps, bare numbers ──
+        _JUNK_RE = (
+            _re.compile(r"^\d+\.\d+(\.\d+)*[a-z0-9._-]*$", _re.I),  # 5.2.3, 1.0.0-rc
+            _re.compile(r"^\d{4}-\d{2}-\d{2}"),                      # 2025-10-07 (date)
+            _re.compile(r"^\d{1,2}:\d{2}"),                          # 09:04 (time)
+            _re.compile(r"^\d+$"),                                   # pure number
+            _re.compile(r"^v\d+\.\d+", _re.I),                       # v5.2, version-ish
+        )
+        def _is_junk(tok: str) -> bool:
+            t = (tok or "").strip()
+            return any(rx.match(t) for rx in _JUNK_RE)
+
+        # If EITHER field is structural junk, this is not a real credential.
+        if _is_junk(username) or _is_junk(secret):
+            return True
 
         def _tokens(text: str):
             return [t for t in _re.split(r"[^a-z0-9]+", (text or "").lower()) if t]
@@ -3455,9 +3646,9 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     # against a phantom login. See _looks_guessed_credential().
                     if self._looks_guessed_credential(session, username, secret, command):
                         logger.info(
-                            f"Skipping likely-guessed credential for session {session_id}: "
-                            f"user={username!r} — secret derived from the target name, "
-                            f"not from real tool output."
+                            f"Skipping junk/guessed credential for session {session_id}: "
+                            f"user={username!r} secret={secret[:12]!r} — looks like a "
+                            f"version/date/target-derived string, not a real credential."
                         )
                         continue
 
@@ -4852,20 +5043,36 @@ Web apps: {webapps}
         if not session:
             return ""
         plan_lines = ""
+        next_step = ""
         if session.strategic_plan:
             plan_lines = "\n".join(
                 f"  {i+1}. [{p.get('status','pending')}] {p.get('step','')}"
                 for i, p in enumerate(session.strategic_plan[:6])
             )
+            # Surface the first PENDING step as an explicit directive. The
+            # strategist was planning concrete steps (e.g. "run SELECT ... INTO
+            # OUTFILE") that the tactical loop never actually executed — pulling
+            # the top pending step up as "DO THIS NEXT" closes that gap.
+            for p in session.strategic_plan:
+                if (p.get("status") or "pending") == "pending" and p.get("step"):
+                    next_step = p["step"]
+                    break
         else:
             plan_lines = "  (no strategic plan yet — proceed with standard methodology)"
+        directive = (
+            f"\n=== DO THIS NEXT (top pending plan step — execute it unless a new "
+            f"finding makes it obsolete) ===\n  → {next_step}\n"
+            if next_step else ""
+        )
         return (
             f"=== ENGAGEMENT OBJECTIVE ===\n{session.objective}\n"
             f"Objective progress: {session.objective_progress:.2f} "
             f"({session.objective_progress_note or 'n/a'})\n"
             f"=== CURRENT STRATEGIC PLAN (from strategist) ===\n{plan_lines}\n"
+            f"{directive}"
             f"Choose the next command to advance the highest-priority pending plan step "
-            f"that current findings support.\n"
+            f"that current findings support. Prefer turning a plan step into a concrete "
+            f"command over re-running enumeration you have already done.\n"
         )
 
     # ── Service test-state machine ────────────────────────────────────────────
@@ -5042,6 +5249,22 @@ Web apps: {webapps}
         session.ai_decisions.append(_d)
         self._save_ai_decision(session_id, _d)
         logger.info(f"Session {session_id}: operator instruction added: {instruction[:120]}")
+
+        # If the session had halted for operator input, this instruction is the
+        # signal to resume: reset the stuck-counters and kick the loop back off.
+        if session.status == "needs_operator":
+            session.status = "analyzing"
+            session._auto_pivot_count = 0
+            session.auto_depth_counter = 0
+            session._stagnation_counter = 0
+            self._save_session_status(session_id, session)
+            self._touch_activity(session_id)
+            try:
+                asyncio.create_task(self._analyze_with_ai(session_id))
+            except RuntimeError:
+                pass  # no running loop (e.g. called from a sync context/test)
+            logger.info(f"Session {session_id}: operator input received — resuming from needs_operator")
+
         return {"status": "success", "instruction": instruction,
                 "active_count": len(session.operator_instructions)}
 
@@ -5348,6 +5571,19 @@ Web apps: {webapps}
             for k in _playbooks.classify_service(svc):
                 if k not in keys:
                     keys.append(k)
+            # Mail services aren't playbook-classified, but the exploit map has
+            # useful smtp/imap candidates — add those keys directly by port/name.
+            _n = str(svc.get("service") or "").lower()
+            try:
+                _p = int(svc.get("port") or 0)
+            except (TypeError, ValueError):
+                _p = 0
+            if "smtp" in _n or _p in (25, 465, 587):
+                if "smtp" not in keys:
+                    keys.append("smtp")
+            if "imap" in _n or "pop3" in _n or "dovecot" in _n or _p in (110, 143, 993, 995):
+                if "imap" not in keys:
+                    keys.append("imap")
         cands = _exploit_map.candidates_for(keys)
         if not cands:
             return ""
@@ -5495,6 +5731,47 @@ Web apps: {webapps}
             "  - Non-msf reverse shells (nc, bash -i, powershell): point them at "
             f"{session.exploit_lhost}:{session.exploit_lport}.\n"
             f"{_reach_line}"
+        )
+
+    @staticmethod
+    def _detect_missing_tools() -> List[str]:
+        """Return the subset of key pentest tools that are NOT on PATH, plus a
+        pseudo-entry 'seclists' if the wordlist dir is absent. Best-effort."""
+        import shutil as _shutil
+        checked = [
+            "sshpass", "gobuster", "ffuf", "nmap", "nikto", "wpscan", "nuclei",
+            "hydra", "crackmapexec", "nxc", "smbclient", "enum4linux-ng",
+            "evil-winrm", "msfconsole", "searchsploit", "subfinder", "whatweb",
+            "wafw00f", "sqlmap", "dnsrecon", "curl", "dig",
+        ]
+        missing = [t for t in checked if not _shutil.which(t)]
+        if not any(os.path.isdir(p) for p in (
+            "/usr/share/seclists", "/usr/share/wordlists/seclists")):
+            missing.append("seclists")
+        return missing
+
+    def _tools_context_block(self, session: "Session") -> str:
+        """Tell the AI which tools are missing so it doesn't waste turns on them."""
+        if not self._missing_tools:
+            return ""
+        alts = {
+            "sshpass": "use `ssh -i key` or a python paramiko one-liner instead",
+            "crackmapexec": "use `nxc` or `impacket` scripts",
+            "nxc": "use `crackmapexec` or `impacket` scripts",
+            "gobuster": "use `ffuf` or `dirb`",
+            "ffuf": "use `gobuster` or `feroxbuster`",
+            "seclists": "use /usr/share/wordlists/dirb/common.txt",
+        }
+        hints = []
+        for t in self._missing_tools:
+            if t in alts:
+                hints.append(f"{t} ({alts[t]})")
+            else:
+                hints.append(t)
+        return (
+            "\n=== MISSING TOOLS (NOT installed — do NOT use these) ===\n"
+            + ", ".join(hints)
+            + "\nPick an installed alternative; do not retry a missing tool.\n"
         )
 
     def _reachability_context_block(self, session: "Session") -> str:

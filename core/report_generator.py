@@ -685,10 +685,19 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
     a("## 3. Vulnerability Findings")
     a("")
     if vulns:
-        ordered = sorted(vulns, key=lambda v: {"high": 0, "medium": 1, "low": 2}
-                         .get(v.get("risk_level", ""), 3))
-        a("| # | Risk | Name | Host:Port | CVE(s) | Source | Status |")
-        a("|---|------|------|-----------|--------|--------|--------|")
+        # Rank by real-world exploitability first: KEV (exploited in the wild),
+        # then EPSS, then CVSS, then risk level — so the most actionable findings
+        # are at the top of the report, matching what the engine prioritised.
+        def _vrank(v):
+            return (
+                0 if v.get("kev") else 1,
+                -float(v.get("epss") or 0.0),
+                -float(v.get("cvss_score") or 0.0),
+                {"high": 0, "medium": 1, "low": 2}.get(v.get("risk_level", ""), 3),
+            )
+        ordered = sorted(vulns, key=_vrank)
+        a("| # | Risk | KEV | EPSS | CVSS | Name | Host:Port | CVE(s) | msf module | Source | Status |")
+        a("|---|------|-----|------|------|------|-----------|--------|------------|--------|--------|")
         for i, v in enumerate(ordered, 1):
             cids = v.get("cve_ids") or []
             if isinstance(cids, str):
@@ -696,9 +705,15 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
             hp = esc(v.get("host") or "")
             if v.get("port"):
                 hp += f":{v.get('port')}"
-            a(f"| {i} | {esc((v.get('risk_level') or 'unknown').upper())} | "
-              f"{esc(v.get('name'))} | {hp} | {esc(', '.join(cids) or '—')} | "
-              f"{esc(v.get('source_tool'))} | {esc(v.get('status') or 'confirmed')} |")
+            kev = "✅" if v.get("kev") else ""
+            epss = f"{float(v.get('epss') or 0.0) * 100:.0f}%" if v.get("epss") is not None else "—"
+            cvss = v.get("cvss_score")
+            cvss_s = f"{cvss}" if cvss is not None else "—"
+            mods = v.get("msf_modules") or []
+            mod_s = esc(mods[0]) if mods else "—"
+            a(f"| {i} | {esc((v.get('risk_level') or 'unknown').upper())} | {kev} | {epss} | "
+              f"{cvss_s} | {esc(v.get('name'))} | {hp} | {esc(', '.join(cids) or '—')} | "
+              f"{mod_s} | {esc(v.get('source_tool'))} | {esc(v.get('status') or 'confirmed')} |")
         a("")
         # Details for high/medium
         detail = [v for v in ordered if v.get("risk_level") in ("high", "medium")]
