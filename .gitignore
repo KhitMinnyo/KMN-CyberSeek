@@ -11,6 +11,7 @@ env/
 
 # Logs & runtime data (may contain scan output / session data from real engagements)
 *.log
+terminal_output.txt
 *.db
 *.db-journal
 *.db-wal
