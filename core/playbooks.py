@@ -248,7 +248,11 @@ def classify_service(svc: dict) -> List[str]:
             keys.append(k)
 
     is_http = any(h in name for h in _HTTP_SERVICES) or name == "http" or "http" in name
-    if is_http or port in (80, 443, 8080, 8000, 8443, 8081, 8888, 4848, 8181, 9090):
+    # Include common web control-panel ports (HestiaCP/VestaCP 8083, cPanel 2082-2087,
+    # Webmin 10000, Plesk 8443) so a panel on a non-standard port is still treated as
+    # a web target and gets web enumeration + exploit hints.
+    if is_http or port in (80, 443, 8080, 8000, 8443, 8081, 8888, 4848, 8181, 9090,
+                            8083, 2082, 2083, 2086, 2087, 10000, 8443, 8834):
         add("http")
         if "tomcat" in blob or port in (8080, 8009, 9090):
             add("tomcat")

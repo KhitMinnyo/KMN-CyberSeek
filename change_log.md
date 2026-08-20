@@ -4,6 +4,52 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.5.0] — 2026-08-20 — Efficiency, stuck-detection & enrichment
+
+Grounded in a 6-hour field run (78 commands, no foothold): the engine reached a
+real target (HestiaCP + phpMyAdmin + mail stack) but wasted hours on junk creds,
+600 s tool timeouts, a silent stream crash, and endless spinning with no escape.
+
+### Fixed
+- **Command output crash.** A single output line over ~64 KB (ffuf/gobuster,
+  minified JS) raised "Separator is not found, and chunk exceed the limit" and
+  silently failed the whole command. The subprocess stream limit is raised to
+  10 MB and the reader now survives over-limit lines instead of crashing.
+- **Junk credentials.** The extractor captured `5.2.3 : 2025-10-07` (a version
+  number + a date) as a login and burned hours reusing it. Version-, date-,
+  time- and pure-number-shaped tokens are now rejected (real brute-forced creds,
+  which arrive via a different path, are unaffected).
+
+### Added
+- **Per-tool timeouts + wordlist discipline.** Directory/DNS brute-forcers
+  (gobuster/ffuf/dnsrecon/nikto/…) get a tighter `ENUM_COMMAND_TIMEOUT`
+  (default 180 s) instead of the full 600 s, and oversized wordlists
+  (`directory-list-2.3-medium/big`) are swapped for smaller ones — a single scan
+  can no longer burn 10 minutes.
+- **Escalate-when-stuck.** Hitting the auto-pivot limit, or `MAX_COMMANDS_NO_PROGRESS`
+  (default 60) commands with no foothold, now HALTS the session to a firm
+  `needs_operator` state (the watchdog no longer revives it) with a clear ask for
+  guidance. Sending an operator instruction or approving a command resumes it.
+- **Missing-tool preflight.** Key tools are checked once (sshpass, gobuster, ffuf,
+  seclists, …); missing ones are surfaced to the AI with alternatives so it stops
+  retrying uninstalled tools. `start.sh` also warns / offers to apt-install them.
+- **Plan→act coupling.** The strategist's top pending plan step is now injected as
+  an explicit "DO THIS NEXT" directive, so planned steps (e.g. SQL `INTO OUTFILE`)
+  actually get executed instead of being re-enumerated around.
+- **Version enrichment + CVE follow-through.** nmap output truncation now preserves
+  the full PORT/SERVICE/VERSION table (naive truncation was cutting it, leaving
+  services version-less and CVE lookup empty); a later `-sV` fills missing versions
+  on already-known ports; and newly discovered services trigger a background
+  vuln-analysis (searchsploit/NVD/KEV/EPSS) pass.
+- **Target playbooks.** Exploit-map entries for phpMyAdmin (SQL→RCE), HestiaCP/
+  VestaCP panels (8083, CVE-2022-31126), Exim (CVE-2019-10149) and Dovecot; panel
+  ports (8083, cPanel 2082-2087, Webmin 10000) now classify as web targets.
+- **Report exploitability columns.** The Markdown report's findings table adds
+  KEV / EPSS / CVSS / Metasploit-module columns and ranks by real-world
+  exploitability.
+
+New env: `ENUM_COMMAND_TIMEOUT`, `MAX_COMMANDS_NO_PROGRESS`, `TERMINAL_LOG_FILE`.
+
 ## [2.4.2] — 2026-08-20 — Register AI-run nmap results
 
 ### Fixed

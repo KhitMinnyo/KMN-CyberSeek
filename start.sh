@@ -47,6 +47,27 @@ if ! command -v nmap &> /dev/null; then
     echo "   Install with: brew install nmap (macOS) or apt install nmap (Ubuntu)"
 fi
 
+# Check key pentest tools — the AI wastes turns retrying tools that aren't present
+# (e.g. it kept trying sshpass on a host without it). Warn, and on Debian/Kali
+# offer to apt-install the missing ones.
+_MISSING_TOOLS=""
+for _t in sshpass gobuster ffuf nikto hydra whatweb wafw00f sqlmap dnsrecon; do
+    command -v "$_t" &> /dev/null || _MISSING_TOOLS="$_MISSING_TOOLS $_t"
+done
+if [ ! -d /usr/share/seclists ] && [ ! -d /usr/share/wordlists/seclists ]; then
+    _MISSING_TOOLS="$_MISSING_TOOLS seclists"
+fi
+if [ -n "$_MISSING_TOOLS" ]; then
+    echo "⚠️  Missing pentest tools:$_MISSING_TOOLS"
+    if command -v apt-get &> /dev/null; then
+        echo "   Attempting install (sudo apt-get install ...) — Ctrl+C to skip."
+        sudo apt-get install -y $_MISSING_TOOLS 2>/dev/null || \
+            echo "   Install skipped/failed — the AI will avoid these tools and use alternatives."
+    else
+        echo "   Install them for best results (Kali: sudo apt install$_MISSING_TOOLS)."
+    fi
+fi
+
 echo "ℹ️  AI is optional at startup — configure it from Settings in the web UI."
 
 # Create .env file if it doesn't exist
