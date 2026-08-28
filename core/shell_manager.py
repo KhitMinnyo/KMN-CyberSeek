@@ -30,6 +30,7 @@ Limitations
 """
 
 import asyncio
+import ipaddress
 import logging
 import os
 import re
@@ -64,6 +65,28 @@ COMMON_PAYLOADS = [
     "python/meterpreter/reverse_tcp",
     "java/meterpreter/reverse_tcp",
 ]
+
+
+def _valid_host(value: str) -> bool:
+    value = (value or "").strip()
+    if not value or len(value) > 253 or any(c in value for c in "\r\n;|&`$"):
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return bool(re.fullmatch(r"[A-Za-z0-9.-]+", value)) and not value.startswith(".")
+
+
+def validate_handler_config(lhost: str, lport: int, payload: str) -> Optional[str]:
+    """Validate values that are written into a Metasploit resource file."""
+    if not _valid_host(lhost):
+        return "Invalid callback host"
+    if not isinstance(lport, int) or not 1 <= lport <= 65535:
+        return "Callback port must be between 1 and 65535"
+    if payload not in COMMON_PAYLOADS:
+        return "Payload is not in the supported payload allowlist"
+    return None
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -138,6 +161,11 @@ class MsfHandlerProcess:
 
     async def start(self) -> bool:
         """Launch msfconsole with multi/handler. Returns True on success."""
+        validation_error = validate_handler_config(self.lhost, self.lport, self.payload)
+        if validation_error:
+            logger.error(f"[Handler {self.handler_id}] {validation_error}")
+            self.status = "error"
+            return False
         rc_path = f"/tmp/kmn_handler_{self.handler_id}.rc"
         # LHOST/LPORT are what the payload dials (the reachable, advertised
         # address). When the listener must bind elsewhere — behind a tunnel or a
@@ -168,8 +196,8 @@ class MsfHandlerProcess:
             return False
 
         try:
-            self._process = await asyncio.create_subprocess_shell(
-                f"msfconsole -q -r {rc_path}",
+            self._process = await asyncio.create_subprocess_exec(
+                "msfconsole", "-q", "-r", rc_path,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -415,6 +443,11 @@ class ShellManager:
         """
         b_host = bind_host or lhost
         b_port = bind_port or lport
+        validation_error = validate_handler_config(lhost, lport, payload)
+        if validation_error:
+            raise ValueError(validation_error)
+        if not _valid_host(b_host) or not isinstance(b_port, int) or not 1 <= b_port <= 65535:
+            raise ValueError("Invalid listener bind address or port")
         key = f"{lhost}:{lport} (bind {b_host}:{b_port})"
         # Reuse an existing live handler bound to the same local socket.
         for h in self._handlers.values():

@@ -61,3 +61,15 @@ def test_explicit_confirmed_status_preserved():
          "status": "confirmed", "description": "proven RCE"}
     out = vv.validate(f)
     assert out["status"] == "confirmed"
+
+
+def test_priority_prefers_confirmed_kev_finding():
+    confirmed = vv.priority_score({
+        "status": "confirmed", "confidence": 0.95, "kev": True,
+        "epss": 0.8, "cvss_score": 7.5,
+    })
+    theoretical = vv.priority_score({
+        "status": "potential", "confidence": 0.4, "kev": False,
+        "epss": 0.01, "cvss_score": 10.0,
+    })
+    assert confirmed > theoretical

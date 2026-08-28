@@ -122,7 +122,9 @@ def is_target_in_scope(target: Optional[str], allowlist_str: Optional[str]) -> b
 # Comprehensive Kali Linux toolset allowlist for the autonomous auto-execute path.
 # Covers recon, web-app, brute-force, exploitation, AD/SMB, post-exploitation,
 # wireless, forensics, scripting, and standard shell utilities.
-# When FULL_AUTO_MODE=true this list is bypassed entirely — see is_allowlisted_command().
+# The list is enforced for every automated execution path, including
+# FULL_AUTO_MODE. Explicit operator approval is the only path that may run a
+# command outside this list.
 ALLOWED_BINARIES = {
     # ── Reconnaissance & scanning ───────────────────────────────────────
     "nmap", "masscan", "rustscan", "unicornscan",
@@ -281,19 +283,13 @@ def is_allowlisted_command(command: Optional[str]) -> Optional[str]:
     Returns None if the command is allowed to run, or a short human-readable
     rejection reason if it should instead be routed to manual approval.
 
-    When FULL_AUTO_MODE=true in the environment this check is bypassed entirely —
-    the operator has explicitly opted into unrestricted AI-driven execution.
-
-    NOT applied to commands a human explicitly typed or clicked "approve" on —
-    that's a legitimate trust boundary and operators should retain full
-    flexibility to run any tool they choose to review themselves.
+    This check is intentionally independent of FULL_AUTO_MODE. Automated
+    execution must never turn an environment flag into an arbitrary shell
+    execution bypass. Commands explicitly approved by an operator are handled
+    by the execution gateway and may use the reviewed manual trust boundary.
     """
     if not command or not command.strip():
         return "Empty command"
-
-    # FULL_AUTO_MODE bypasses the allowlist entirely.
-    if os.getenv("FULL_AUTO_MODE", "false").lower() == "true":
-        return None
 
     if "`" in command or "$(" in command:
         return "Command substitution (backticks or $()) is not allowed in auto-executed commands"

@@ -125,9 +125,81 @@ def test_auto_pivot_limit_halts():
     orch._analyze_with_ai = AsyncMock()
     with _no_sleep():
         _run(orch._auto_pivot(s.session_id, "loop detected"))
-    assert s.status == "ready"
-    assert s.ai_decisions[-1]["context"] == "pivot_limit_reached"
+    assert s.status == "needs_operator"
+    assert s.ai_decisions[-1]["context"] == "needs_operator"
     orch._analyze_with_ai.assert_not_awaited()  # halted, did not continue
+
+
+def test_execution_gate_requires_authorization_and_allowlist():
+    orch = _loop_orch()
+    s = make_session(authorization_confirmed=True)
+    orch.sessions[s.session_id] = s
+
+    assert orch.validate_command(s.session_id, "nmap -sV 10.0.0.5") is None
+    assert orch.validate_command(
+        s.session_id, "definitely_not_a_tool --pwn"
+    ) is not None
+    # Only an explicitly approved command may use the manual escape hatch.
+    assert orch.validate_command(
+        s.session_id, "definitely_not_a_tool --pwn", "approved"
+    ) is None
+
+    s.authorization_confirmed = False
+    assert orch.validate_command(s.session_id, "nmap -sV 10.0.0.5") is not None
+
+
+def test_deterministic_playbook_step_is_rendered_and_dispatched():
+    orch = _loop_orch()
+    s = make_session(authorization_confirmed=True)
+    s.discovered_services = [svc(80, "http")]
+    s.current_stage = "enumeration"
+    s.auto_approve = True
+    orch.sessions[s.session_id] = s
+    orch._ensure_coverage(s)
+
+    step, command = orch._next_deterministic_step(s)
+    assert step.id == "http.whatweb"
+    assert command == "whatweb -a 3 http://10.0.0.5:80"
+
+    async def scenario():
+        orch.execute_command = AsyncMock()
+        assert orch._dispatch_deterministic_step(s) is True
+        await asyncio.sleep(0)
+        orch.execute_command.assert_awaited_once_with(
+            s.session_id, command, execution_mode="playbook"
+        )
+
+    _run(scenario())
+
+
+def test_vulnerability_port_scans_run_in_parallel():
+    orch = _loop_orch()
+    s = make_session(authorization_confirmed=True)
+    s.discovered_hosts = [{
+        "ip": "10.0.0.5",
+        "ports": [{"port": port, "state": "open"} for port in (22, 80, 443)],
+    }]
+    s.discovered_services = [svc(port, "unknown") for port in (22, 80, 443)]
+    orch.sessions[s.session_id] = s
+    orch._scan_already_done = lambda sid, marker: False
+    orch._save_scan_results = lambda *a, **k: None
+
+    class FakeScanner:
+        def __init__(self):
+            self.active = 0
+            self.maximum = 0
+
+        async def perform_vulnerability_scan_port(self, target, port):
+            self.active += 1
+            self.maximum = max(self.maximum, self.active)
+            await asyncio.sleep(0.01)
+            self.active -= 1
+            return {"success": True, "vulnerabilities": []}
+
+    fake = FakeScanner()
+    orch.scanner = fake
+    _run(orch._run_vulnerability_analysis(s.session_id))
+    assert fake.maximum > 1
 
 
 # ── watchdog ────────────────────────────────────────────────────────────────
@@ -476,10 +548,10 @@ def test_osint_block_shows_only_in_osint_stage_for_domain():
     assert orch._osint_context_block(lab) == ""
 
 
-def test_feature_flags_default_on_and_toggle():
+def test_feature_flags_default_coverage_on_and_bruteforce_opt_in():
     import core.orchestrator as orch_mod
     flags = orch_mod.get_feature_flags()
-    assert flags["coverage_engine"] is True and flags["bruteforce_enabled"] is True
+    assert flags["coverage_engine"] is True and flags["bruteforce_enabled"] is False
 
     _covled = orch_mod.COVERAGE_ENGINE
     try:

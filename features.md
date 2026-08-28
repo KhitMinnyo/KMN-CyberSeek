@@ -29,13 +29,15 @@ Every AI cycle runs two separate passes:
 
 ### Risk Classification
 
-Every AI-suggested command is classified before execution via deterministic keyword + regex rules — not LLM output — so it cannot be bypassed via prompt injection.
+Every AI-suggested command passes deterministic risk and execution-policy checks
+before execution. These checks are not LLM output and remain active in
+full-auto mode, so prompt injection cannot directly bypass the gateway.
 
 | Risk Level | Meaning | Auto-execute? |
 |-----------|---------|--------------|
 | **LOW** | Read-only / passive. Examples: `nmap`, `curl -I`, `whois` | ✅ Yes (if `auto_approve=True`) |
 | **MEDIUM** | Active interaction, leaves traces. Examples: `nikto`, `gobuster`, `sqlmap --dbs` | ✅ Yes (if `auto_approve=True`) |
-| **HIGH** | Destructive or irreversible. Examples: `hydra`, `msfconsole exploit`, `hashcat` | ❌ Always requires manual approval |
+| **HIGH** | Destructive or irreversible. Examples: `hydra`, `msfconsole exploit`, `hashcat` | ❌ Manual by default; full-auto still requires policy checks |
 
 ### True Resume (Scan Dedup)
 
@@ -104,7 +106,13 @@ Nmap scans are capped at `SCAN_TIMEOUT` seconds (default 300). NSE vuln scans us
 SCAN_TIMEOUT=300
 VULN_SCAN_TIMEOUT=120
 VULN_PORT_TIMEOUT=60
+VULN_SCAN_CONCURRENCY=4
 ```
+
+Independent per-port NSE vulnerability scans run concurrently up to
+`VULN_SCAN_CONCURRENCY`. Results are collected first and persisted in order so
+parallel subprocesses do not race on SQLite state. State-dependent exploitation
+and post-exploitation steps remain ordered.
 
 ### Anti-Loop Guardrail
 

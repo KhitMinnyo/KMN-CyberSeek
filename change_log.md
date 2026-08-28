@@ -4,6 +4,55 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.6.0] — 2026-08-28 — Durable sessions, safer execution, and parallel analysis
+
+### Added
+- **Unified execution gateway.** API, AI, playbook, and manual command paths now
+  share server-side authorization, non-interactive checks, and automated binary
+  policy. Explicit approval is the only manual escape hatch.
+- **Deterministic playbook dispatch.** Framework-owned playbook steps are rendered
+  and dispatched one at a time before the AI improvises, while respecting the
+  current stage, installed tools, approval state, and duplicate queue protection.
+- **Durable session timeline.** Added lifecycle events, background job records,
+  activity timestamps, immutable session scope snapshots, asset graph nodes and
+  relationships, and portable ZIP session archives.
+- **Session cancellation and archive APIs.** Operators can cancel active sessions,
+  inspect events/jobs, and export a replayable session bundle from the dashboard.
+- **Prioritised findings.** Findings now receive a practical priority score based
+  on confirmation, confidence, KEV, EPSS, and CVSS rather than CVSS alone.
+- **Bounded parallel vulnerability analysis.** Independent per-port NSE scans and
+  local ExploitDB lookups run concurrently while persistence and state-dependent
+  exploitation remain ordered.
+- **Reachable callback selection.** Local callback discovery now follows the
+  target route, and automatic public-target handlers are skipped when no reachable
+  callback endpoint is configured.
+
+### Changed
+- Full-auto mode no longer bypasses the automated binary allowlist.
+- Brute-force workers are opt-in by default because they can trigger account
+  lockouts; temporary credential wordlists are deleted after each job.
+- Explicit local Ollama selection is no longer overridden by a stale API key in
+  the environment.
+- Exported reports redact secrets by default. Set
+  `INCLUDE_SECRETS_IN_REPORT=true` only for an explicitly controlled report.
+- Shell handler inputs are validated and Metasploit is launched with argument
+  arrays instead of a shell command string.
+- Documentation is English-only and includes session retention, archive, and
+  concurrency guidance.
+
+### Fixed
+- Python 3.9 worker initialization failure caused by creating an asyncio
+  semaphore outside a running event loop.
+- Stale auto-pivot test expectations and incomplete test fixtures.
+- Credential injection quoting for SMB, RPC, and Impacket command forms.
+- Public-target callback flows that advertised a private workstation address.
+
+### Verification
+- `pytest -q`: 139 passed.
+- `python3 -m compileall -q core ai main.py frontend.py docs_server.py` passed.
+
+---
+
 ## [2.5.0] — 2026-08-20 — Efficiency, stuck-detection & enrichment
 
 Grounded in a 6-hour field run (78 commands, no foothold): the engine reached a

@@ -35,6 +35,13 @@ _HEADER_BG = (0x1A, 0x23, 0x7E)   # dark indigo — title bar
 _ACCENT_BG  = (0x37, 0x47, 0x4F)  # blue-grey — section headers
 
 
+def _display_secret(credential: Dict) -> str:
+    """Mask secrets in exported reports unless explicitly enabled."""
+    if os.getenv("INCLUDE_SECRETS_IN_REPORT", "false").lower() == "true":
+        return str(credential.get("secret") or "")[:64]
+    return "<redacted>"
+
+
 def _require_docx():
     try:
         from docx import Document                          # noqa: F401
@@ -400,7 +407,7 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
             row = ct.rows[i + 1]
             vals = [
                 cred.get("username") or "",
-                (cred.get("secret") or "")[:64],
+                _display_secret(cred),
                 cred.get("secret_type") or "password",
                 cred.get("service") or "",
                 (cred.get("discovered_at") or "")[:19],
@@ -745,7 +752,7 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
         a("| Username | Secret | Type | Service | Discovered |")
         a("|----------|--------|------|---------|------------|")
         for c in creds:
-            a(f"| {esc(c.get('username'))} | {esc((c.get('secret') or '')[:64])} | "
+            a(f"| {esc(c.get('username'))} | {esc(_display_secret(c))} | "
               f"{esc(c.get('secret_type') or 'password')} | {esc(c.get('service'))} | "
               f"{esc((c.get('discovered_at') or '')[:19])} |")
     else:
@@ -1053,9 +1060,7 @@ def generate_pdf_report(session_report: Dict, output_path: Optional[str] = None)
         pdf.ln()
         pdf.set_font("Helvetica", "", 8)
         for c in credentials:
-            secret = str(c.get("secret", ""))
-            if len(secret) > 28:
-                secret = secret[:25] + "…"
+            secret = _display_secret(c)
             for w, val in zip([40, 60, 25, 30, 25], [
                 str(c.get("username", ""))[:22],
                 secret,

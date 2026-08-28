@@ -58,11 +58,22 @@ logger = logging.getLogger(__name__)
 
 # ── Primitives ────────────────────────────────────────────────────────────────
 
-def get_local_ip() -> str:
-    """Best-effort: the primary non-loopback LAN IP of this machine."""
+def get_local_ip(target: Optional[str] = None) -> str:
+    """Return the local address used to reach ``target`` when possible.
+
+    The old 8.8.8.8 probe always selected the default interface, which can be
+    wrong for multi-homed labs (for example, a VPN/eth0 target reached through
+    a different interface). A UDP connect does not send traffic, but lets the
+    kernel choose the correct route and source address.
+    """
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
+        route_target = (target or "8.8.8.8").strip()
+        try:
+            route_target = socket.gethostbyname(route_target)
+        except (OSError, socket.gaierror):
+            route_target = "8.8.8.8"
+        s.connect((route_target, 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
@@ -215,7 +226,9 @@ def resolve_callback(target: str, default_lport: Optional[int] = None) -> Callba
         else:
             mode = "local"
 
-    lan_ip = get_local_ip()
+    # Select the source address for the target's route, not merely the default
+    # internet route. This matters on Kali hosts with eth0 + VPN/tunnel NICs.
+    lan_ip = get_local_ip(target)
 
     # ── manual (explicit LHOST — reverse-SSH tunnel or known public IP) ────────
     if mode == "manual" or (explicit_lhost and mode not in ("ngrok", "public", "local")):

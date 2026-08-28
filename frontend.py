@@ -1384,10 +1384,7 @@ def show_session_overview(session_details: Dict):
                     live_data = live_resp.json()
                     if live_data.get("is_live") and live_data.get("live_output"):
                         st.markdown("##### 📡 Live Output (streaming)")
-                        st.markdown(
-                            f"<div class='terminal-output'>{live_data['live_output']}</div>",
-                            unsafe_allow_html=True
-                        )
+                        st.code(live_data["live_output"], language="text")
             except Exception:
                 pass
 
@@ -1504,6 +1501,32 @@ def show_session_overview(session_details: Dict):
                 use_container_width=True,
                 key=f"dl_docx_{session_id}",
             )
+
+    # Portable retention bundle: session snapshot + durable event/job timeline.
+    _archive_key = f"_session_archive_{session_id}"
+    if st.button("📦 Generate Session Archive", use_container_width=True):
+        with st.spinner("Building session archive…"):
+            try:
+                resp = api_session.get(
+                    f"{API_BASE}/sessions/{session_id}/archive", timeout=120
+                )
+                if resp.status_code == 200:
+                    st.session_state[_archive_key] = resp.content
+                else:
+                    st.session_state.pop(_archive_key, None)
+                    st.error(f"Archive failed ({resp.status_code}): {resp.text[:300]}")
+            except Exception as e:
+                st.session_state.pop(_archive_key, None)
+                st.error(f"Could not reach backend: {e}")
+    if st.session_state.get(_archive_key):
+        st.download_button(
+            label="💾 Save Session Archive (.zip)",
+            data=st.session_state[_archive_key],
+            file_name=f"kmn_archive_{session_id[:12]}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key=f"dl_archive_{session_id}",
+        )
 
     # ── Steer / Ask the AI ────────────────────────────────────────────────────
     # Modern Streamlit shows the floating 💬 chat bubble (bottom-right, rendered in
@@ -2139,28 +2162,31 @@ def show_evidence(session_details: Dict):
             _rc = {"high": "#d32f2f", "medium": "#f57f17", "low": "#2e7d32"}
             _risk_order = {"high": 0, "medium": 1, "low": 2}
 
+            def _he(value):
+                return html.escape(str(value if value is not None else ""))
+
             def _vuln_row(v):
                 rl = v.get("risk_level", "")
                 color = _rc.get(rl, "#555")
                 return (
-                    f"<tr><td style='color:{color}'><b>{rl.upper()}</b></td>"
-                    f"<td>{v.get('name','')}</td><td>{v.get('host','')}</td>"
-                    f"<td>{v.get('port','')}</td><td>{v.get('service','')}</td></tr>"
+                    f"<tr><td style='color:{_he(color)}'><b>{_he(rl).upper()}</b></td>"
+                    f"<td>{_he(v.get('name'))}</td><td>{_he(v.get('host'))}</td>"
+                    f"<td>{_he(v.get('port'))}</td><td>{_he(v.get('service'))}</td></tr>"
                 )
 
             def _cred_row(c):
                 secret = "*" * 8 if c.get("secret_type") == "password" else c.get("secret", "")[:30]
                 return (
-                    f"<tr><td>{c.get('username','')}</td><td><code>{secret}</code></td>"
-                    f"<td>{c.get('secret_type','')}</td><td>{c.get('service','')}</td></tr>"
+                    f"<tr><td>{_he(c.get('username'))}</td><td><code>{_he(secret)}</code></td>"
+                    f"<td>{_he(c.get('secret_type'))}</td><td>{_he(c.get('service'))}</td></tr>"
                 )
 
             def _cmd_row(c):
                 ok = "✓" if c.get("success") else "✗"
                 return (
                     f"<tr><td>{ok}</td>"
-                    f"<td><code>{c.get('command','')[:120]}</code></td>"
-                    f"<td>{c.get('timestamp','')}</td></tr>"
+                    f"<td><code>{_he(c.get('command','')[:120])}</code></td>"
+                    f"<td>{_he(c.get('timestamp'))}</td></tr>"
                 )
 
             vuln_rows = "".join(
@@ -2168,8 +2194,8 @@ def show_evidence(session_details: Dict):
                 for v in sorted(vulns, key=lambda x: _risk_order.get(x.get("risk_level", ""), 3))
             )
             svc_rows = "".join(
-                f"<tr><td>{s.get('host','')}</td><td>{s.get('port','')}</td>"
-                f"<td>{s.get('service','')}</td><td>{s.get('version','')}</td></tr>"
+                f"<tr><td>{_he(s.get('host'))}</td><td>{_he(s.get('port'))}</td>"
+                f"<td>{_he(s.get('service'))}</td><td>{_he(s.get('version'))}</td></tr>"
                 for s in services[:50]
             )
             cred_rows = "".join(_cred_row(c) for c in creds)
@@ -2177,7 +2203,7 @@ def show_evidence(session_details: Dict):
 
             html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
-<title>KMN-CyberSeek Report — {session_details.get('target_ip','')}</title>
+<title>KMN-CyberSeek Report — {_he(session_details.get('target_ip'))}</title>
 <style>
   body{{font-family:sans-serif;margin:2rem;color:#222;}}
   h1{{background:#1a237e;color:#fff;padding:1rem;border-radius:4px;}}
@@ -2192,9 +2218,9 @@ def show_evidence(session_details: Dict):
 <h1>KMN-CyberSeek &mdash; Penetration Test Report</h1>
 <table class="meta">
   <tr><td>Session ID</td><td>{sid[:12]}</td></tr>
-  <tr><td>Target</td><td>{session_details.get('target_ip','—')}</td></tr>
-  <tr><td>Status</td><td>{session_details.get('status','—')}</td></tr>
-  <tr><td>Started</td><td>{session_details.get('created_at','—')}</td></tr>
+  <tr><td>Target</td><td>{_he(session_details.get('target_ip','—'))}</td></tr>
+  <tr><td>Status</td><td>{_he(session_details.get('status','—'))}</td></tr>
+  <tr><td>Started</td><td>{_he(session_details.get('created_at','—'))}</td></tr>
   <tr><td>Vulns (H/M/L)</td><td>{sum(1 for v in vulns if v.get("risk_level")=="high")} / {sum(1 for v in vulns if v.get("risk_level")=="medium")} / {sum(1 for v in vulns if v.get("risk_level")=="low")}</td></tr>
 </table>
 <h2>Vulnerabilities ({len(vulns)})</h2>
@@ -2327,7 +2353,7 @@ def show_command_console():
         else:
             terminal_output = "Failed to load session details."
 
-        st.markdown(f'<div class="terminal-output">{terminal_output}</div>', unsafe_allow_html=True)
+        st.code(terminal_output, language="text")
 
         # Command history - real data from session details using session_details.get('commands_executed', [])
         st.markdown("---")

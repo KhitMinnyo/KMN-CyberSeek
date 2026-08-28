@@ -22,6 +22,7 @@ Env: BRUTEFORCE_ENABLED, BRUTEFORCE_TIER (default|rockyou|full),
 import asyncio
 import logging
 import os
+import signal
 import shutil
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, List, Optional
@@ -67,9 +68,13 @@ class BruteforceWorker:
         self.on_credential = on_credential
         self._attack_runner = attack_runner or self._default_attack_runner
         self._in_scope = in_scope or (lambda host: True)
-        self._sem = asyncio.Semaphore(
-            concurrency or int(os.getenv("BRUTEFORCE_CONCURRENCY", "2"))
+        # Python 3.9 binds asyncio synchronization primitives to the current
+        # event loop at construction time. Create the semaphore lazily inside
+        # the first async job so workers can also be configured from sync code.
+        self._concurrency = concurrency or int(
+            os.getenv("BRUTEFORCE_CONCURRENCY", "2")
         )
+        self._sem: Optional[asyncio.Semaphore] = None
         # job key "service:host:port" -> status record
         self.jobs: Dict[str, Dict] = {}
 
@@ -135,6 +140,8 @@ class BruteforceWorker:
         job = self.jobs.get(key)
         if not job:
             return
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self._concurrency)
         async with self._sem:
             job["status"] = "running"
             job["started_at"] = datetime.now().isoformat()
@@ -173,18 +180,23 @@ class BruteforceWorker:
         # Build the command (users/passwords written to temp files by real impl).
         # Intentionally minimal here; the heavy lifting/parsing is added when this
         # path is exercised on a real Kali host. Kept safe + bounded.
+        temp_paths = []
         try:
             import tempfile
             uf = tempfile.NamedTemporaryFile("w", delete=False, suffix=".u")
             uf.write("\n".join(users)); uf.close()
+            temp_paths.append(uf.name)
             # Expand a @file:PATH:N password sentinel, else write inline list.
             if passwords and passwords[0].startswith("@file:"):
                 _, path, n = passwords[0].split(":", 2)
                 pf_path = path if n == "0" else self._head(path, int(n))
+                if pf_path != path:
+                    temp_paths.append(pf_path)
             else:
                 pf = tempfile.NamedTemporaryFile("w", delete=False, suffix=".p")
                 pf.write("\n".join(passwords)); pf.close()
                 pf_path = pf.name
+                temp_paths.append(pf_path)
 
             if tool == "hydra":
                 cmd = f"hydra -L {uf.name} -P {pf_path} -f -o /dev/stdout -t 4 {service}://{host}:{port}"
@@ -198,12 +210,22 @@ class BruteforceWorker:
             try:
                 out, _ = await asyncio.wait_for(proc.communicate(), timeout=_max_seconds())
             except asyncio.TimeoutError:
-                proc.kill()
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    proc.kill()
+                await proc.communicate()
                 return []
             return self._parse_hits(out.decode(errors="replace"), service, host, port)
         except Exception as e:
             logger.warning(f"bruteforce runner error: {e}")
             return []
+        finally:
+            for path in temp_paths:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
 
     @staticmethod
     def _head(path: str, n: int) -> str:
