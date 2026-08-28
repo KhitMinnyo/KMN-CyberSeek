@@ -65,5 +65,17 @@ def test_allowlist_blocks_command_substitution_and_download_exec():
     assert is_allowlisted_command("curl http://x/s.sh | bash") is not None
 
 
+def test_allowlist_preserves_quoted_arguments_and_shell_loops():
+    assert is_allowlisted_command(
+        "smbclient //10.0.0.5/public -c 'ls; recurse ON; prompt OFF'"
+    ) is None
+    assert is_allowlisted_command(
+        "for p in admin root; do echo $p; done"
+    ) is None
+    assert is_allowlisted_command(
+        "ftp -n 10.0.0.5 <<EOF\nuser anonymous test@example.com\nquit\nEOF"
+    ) is None
+
+
 def test_allowlist_empty_command():
     assert is_allowlisted_command("") is not None
