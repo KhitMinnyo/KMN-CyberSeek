@@ -26,6 +26,10 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 - **Reachable callback selection.** Local callback discovery now follows the
   target route, and automatic public-target handlers are skipped when no reachable
   callback endpoint is configured.
+- **Non-blocking approval flow.** Routine LOW/MEDIUM actions continue through the
+  safe execution path while HIGH-risk actions remain pending for the operator.
+  Upload, web-shell, reverse-shell, credential, and destructive patterns are
+  deterministically promoted to HIGH even when the model reports a lower risk.
 
 ### Changed
 - Full-auto mode no longer bypasses the automated binary allowlist.

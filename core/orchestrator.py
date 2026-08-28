@@ -335,6 +335,7 @@ class Session:
         self.status = "initialized"  # initialized, scanning, analyzing, executing, completed, failed
         self.last_activity_at = self.created_at.isoformat()
         self.pause_reason = ""
+        self._safe_followup_active = False
         self.scan_results: List[Dict] = []
         self.discovered_hosts: List[Dict] = []
         self.discovered_services: List[Dict] = []
@@ -2084,7 +2085,8 @@ class Orchestrator:
                     return step, command
         return None
 
-    def _dispatch_deterministic_step(self, session: "Session") -> bool:
+    def _dispatch_deterministic_step(self, session: "Session",
+                                     force_auto: bool = False) -> bool:
         """Dispatch one deterministic playbook command and stop this AI turn.
 
         One step at a time keeps output parsing, coverage updates and stage
@@ -2106,7 +2108,8 @@ class Orchestrator:
         ):
             return True
 
-        if session.auto_approve or FULL_AUTO_MODE:
+        is_high_risk = self.requires_approval(command)
+        if force_auto or FULL_AUTO_MODE or (session.auto_approve and not is_high_risk):
             policy_error = self._execution_gate(
                 session.session_id, command, "playbook"
             )
@@ -2137,7 +2140,23 @@ class Orchestrator:
         )
         return True
 
-    async def _analyze_with_ai(self, session_id: str, force_command: bool = False):
+    def _schedule_safe_followup(self, session: "Session") -> None:
+        """Keep safe analysis moving while a high-risk command awaits approval."""
+        if session._safe_followup_active or session.status in {
+            "failed", "completed", "cancelled", "needs_operator"
+        }:
+            return
+        session._safe_followup_active = True
+        session.status = "analyzing"
+        self._save_session_status(session.session_id, session)
+        self._track_task(
+            session.session_id,
+            self._analyze_with_ai(session.session_id, safe_only=True),
+            "safe_followup",
+        )
+
+    async def _analyze_with_ai(self, session_id: str, force_command: bool = False,
+                               safe_only: bool = False):
         """Analyze scan results with AI.
 
         force_command: when True, append a hard directive instructing the model to
@@ -2151,11 +2170,13 @@ class Orchestrator:
         logger.info(f"Starting AI analysis for {session_id}")
         
         try:
+            if safe_only:
+                session._safe_followup_active = False
             # Run framework-owned playbook steps before asking the model to
             # improvise. This is the main coverage improvement: the LLM focuses
             # on findings and exploit-specific decisions instead of repeatedly
             # rediscovering basic enumeration work.
-            if self._dispatch_deterministic_step(session):
+            if self._dispatch_deterministic_step(session, force_auto=safe_only):
                 return
 
             _local_target = _is_local_target(session.target_ip)
@@ -2213,6 +2234,14 @@ class Orchestrator:
                     "command in suggested_command that advances the engagement toward the "
                     "objective. Pick the most promising untried service or technique. "
                     "Do NOT return an empty command.\n"
+                )
+            if safe_only:
+                _exhausted_ctx += (
+                    "\n=== SAFE FOLLOW-UP MODE ===\n"
+                    "A high-risk command is waiting for operator approval. Do not "
+                    "repeat or suggest any pending high-risk command. Choose only "
+                    "an independent LOW or MEDIUM reconnaissance/enumeration action. "
+                    "If no safe action remains, return an empty command.\n"
                 )
 
             _shell_ctx = ""
@@ -2342,7 +2371,8 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # Kick off execution or queue for approval.
             # When auto_approve=True the session operator has accepted full autonomy —
             # treat it identically to FULL_AUTO_MODE (all risk levels auto-execute).
-            if FULL_AUTO_MODE or session.auto_approve:
+            is_high_risk = self.requires_approval(_cmd) or ai_response.risk_level == "high"
+            if safe_only or FULL_AUTO_MODE or (session.auto_approve and not is_high_risk):
                 automated_error = self._execution_gate(
                     session_id, _cmd, execution_mode="ai_auto"
                 )
@@ -2375,6 +2405,8 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                     )
             else:
                 self.queue_for_approval(session_id, _cmd)
+                if is_high_risk and not safe_only:
+                    self._schedule_safe_followup(session)
                 logger.info(f"Initial command queued for approval: {_cmd[:100]}")
 
         except Exception as e:
@@ -2396,6 +2428,12 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         exact_patterns = [
             "rm -rf", "dd if=", "reverse_shell", "crackmapexec",
             "msfconsole", "meterpreter",
+            "curl -t ", "curl -t=", "curl -t/", "curl -t",
+            "ftp-put", "into outfile", "into dumpfile", "webshell",
+            "shell.php", "mimikatz", "secretsdump", "pass-the-hash",
+            "sshpass", "bash -i", "powershell -enc", "site cpfr", "site cpto",
+            " put ", "--os-shell", "--file-read", "--file-write",
+            "drop table", "delete from", "grant all",
         ]
         for pat in exact_patterns:
             if pat in command_lower:
@@ -3392,11 +3430,17 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         f"[{ai_response.risk_level}] command: {ai_response.suggested_command[:100]}"
                     )
             else:
-                # auto_approve=True means the operator accepts full autonomy for this
-                # session — execute all risk levels (same behaviour as FULL_AUTO_MODE).
+                # Session auto-approve covers routine LOW/MEDIUM work. HIGH-risk
+                # actions remain approval-gated unless explicit full-auto mode is on.
+                _suggested = ai_response.suggested_command or ""
+                _high_risk = (
+                    self.requires_approval(_suggested)
+                    or ai_response.risk_level == "high"
+                )
                 should_auto_execute = (
                     session.auto_approve and
-                    bool(ai_response.suggested_command) and
+                    not _high_risk and
+                    bool(_suggested) and
                     (ai_response.confidence is None or ai_response.confidence >= 0.5)
                 )
 
@@ -3490,9 +3534,15 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     "ai_command",
                 )
             elif not _queued_already:
-                # Manual mode (auto_approve=False, FULL_AUTO_MODE=False) and no prior queue call.
-                # Queue for operator review regardless of risk level — don't silently drop commands.
+                # Manual mode or a HIGH-risk command. Keep the command pending,
+                # but continue safe work in a separate decision turn.
                 self.queue_for_approval(session_id, ai_response.suggested_command)
+                if (
+                    (self.requires_approval(ai_response.suggested_command)
+                     or ai_response.risk_level == "high")
+                    and not safe_only
+                ):
+                    self._schedule_safe_followup(session)
 
         except Exception as e:
             # Do NOT silently die — a swallowed exception here leaves the session
@@ -3541,6 +3591,9 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 session.status = "executing"
                 session._auto_pivot_count = 0
                 session._stagnation_counter = 0
+                session._commands_since_progress = 0
+                session._last_effort_marker = None
+                session.pause_reason = ""
                 self._save_session_status(session_id, session)
 
         # Execute the command asynchronously
@@ -6126,6 +6179,9 @@ Web apps: {webapps}
             session._auto_pivot_count = 0
             session.auto_depth_counter = 0
             session._stagnation_counter = 0
+            session._commands_since_progress = 0
+            session._last_effort_marker = None
+            session.pause_reason = ""
             self._save_session_status(session_id, session)
             self._touch_activity(session_id)
             try:
