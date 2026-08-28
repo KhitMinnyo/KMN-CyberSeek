@@ -24,6 +24,7 @@ import uvicorn
 from ai.connector import KMN_AI_Connector
 from core.orchestrator import Orchestrator
 from core.scanner import Scanner
+from core.shell_manager import validate_handler_config
 from core.validators import is_valid_target, is_cidr
 
 # Single source of truth for the version (see _version.py / bump_version.py).
@@ -404,6 +405,24 @@ async def get_session(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     return session_report
 
+
+@app.get("/api/sessions/{session_id}/events")
+async def get_session_events(session_id: str):
+    """Return the append-only lifecycle timeline for a session."""
+    if not orchestrator.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    events = orchestrator.get_session_events(session_id)
+    return {"session_id": session_id, "events": events, "count": len(events)}
+
+
+@app.get("/api/sessions/{session_id}/jobs")
+async def get_session_jobs(session_id: str):
+    """Return durable background jobs and their recovery state."""
+    if not orchestrator.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    jobs = orchestrator.get_session_jobs(session_id)
+    return {"session_id": session_id, "jobs": jobs, "count": len(jobs)}
+
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str):
     """Delete a specific session and all its associated data."""
@@ -583,6 +602,26 @@ async def download_session_report_md(session_id: str):
     )
 
 
+@app.get("/api/sessions/{session_id}/archive")
+async def download_session_archive(session_id: str):
+    """Download a portable session bundle containing report, events and jobs."""
+    try:
+        archive_path = orchestrator.archive_session(session_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    except Exception as exc:
+        logger.error(f"Session archive failed for {session_id}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Session archive failed: {exc}")
+
+    filename = f"kmn_archive_{session_id[:12]}.zip"
+    return FileResponse(
+        path=archive_path,
+        media_type="application/zip",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/api/schedules")
 async def list_schedules():
     """List all non-deleted scheduled scans."""
@@ -700,6 +739,15 @@ async def complete_session(session_id: str):
     return result
 
 
+@app.post("/api/sessions/{session_id}/cancel")
+async def cancel_session(session_id: str):
+    """Cancel an active session and stop its owned handlers."""
+    result = await orchestrator.cancel_session(session_id)
+    if result["status"] == "error":
+        raise HTTPException(status_code=404, detail=result["message"])
+    return result
+
+
 @app.get("/api/sessions/{session_id}/vulnerabilities")
 async def get_vulnerabilities(session_id: str):
     """Get all recorded vulnerability findings for a session (structured, from
@@ -722,6 +770,20 @@ class StartHandlerRequest(BaseModel):
     lport: int = 4444
     payload: str = "windows/x64/meterpreter/reverse_tcp"
 
+    @field_validator("lhost", "lport", "payload")
+    @classmethod
+    def _validate_handler_values(cls, value, info):
+        values = info.data
+        lhost = value if info.field_name == "lhost" else values.get("lhost", "")
+        lport = value if info.field_name == "lport" else values.get("lport", 4444)
+        payload = value if info.field_name == "payload" else values.get(
+            "payload", "windows/x64/meterpreter/reverse_tcp"
+        )
+        error = validate_handler_config(lhost, lport, payload)
+        if error:
+            raise ValueError(error)
+        return value
+
 
 class ShellExecRequest(BaseModel):
     command: str
@@ -732,9 +794,12 @@ async def start_handler(session_id: str, req: StartHandlerRequest):
     """Start a Metasploit multi/handler listener for this session."""
     if not orchestrator.get_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
-    info = await orchestrator.start_shell_handler(
-        session_id, req.lhost, req.lport, req.payload
-    )
+    try:
+        info = await orchestrator.start_shell_handler(
+            session_id, req.lhost, req.lport, req.payload
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "started", "handler": info}
 
 
@@ -1324,11 +1389,27 @@ async def update_advanced_settings(settings: AdvancedSettings):
 async def execute_command(command_request: CommandRequest):
     """Execute a command in a session."""
     try:
-        # Check if command requires approval
+        # API requests are never allowed to self-grant an approval. The
+        # auto_approve field is retained for client compatibility, but the
+        # backend decides whether this is a safe direct execution.
+        base_error = orchestrator.validate_command(
+            command_request.session_id,
+            command_request.command,
+            execution_mode="approved",
+        )
+        if base_error:
+            raise HTTPException(status_code=400, detail=base_error)
+
         requires_approval = orchestrator.requires_approval(command_request.command)
+        automated_error = orchestrator.validate_command(
+            command_request.session_id,
+            command_request.command,
+            execution_mode="manual",
+        )
         
-        if requires_approval and not command_request.auto_approve:
-            # Queue for approval
+        # High-risk commands and commands outside the automated allowlist are
+        # queued. Only /api/approve can move them to the explicit approved path.
+        if requires_approval or automated_error:
             command_id = orchestrator.queue_for_approval(
                 session_id=command_request.session_id,
                 command=command_request.command
@@ -1347,7 +1428,8 @@ async def execute_command(command_request: CommandRequest):
             # Execute immediately
             result = await orchestrator.execute_command(
                 session_id=command_request.session_id,
-                command=command_request.command
+                command=command_request.command,
+                execution_mode="manual",
             )
             await broadcast_message("command_executed", {
                 "session_id": command_request.session_id,

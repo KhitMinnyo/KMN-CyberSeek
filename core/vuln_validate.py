@@ -108,3 +108,24 @@ def validate(finding: Dict, discovered_version: str = "") -> Dict:
             f["status"] = "potential"
         f["confidence"] = f.get("confidence", 0.5)
     return f
+
+
+def priority_score(finding: Dict) -> float:
+    """Rank practical findings by evidence, impact, and exploitability.
+
+    CVSS alone over-prioritizes theoretical issues. KEV/EPSS and confirmed
+    evidence should move actionable findings ahead of noisy keyword matches.
+    """
+    confidence = float(finding.get("confidence") or 0.0)
+    cvss = max(0.0, min(10.0, float(finding.get("cvss_score") or 0.0))) / 10.0
+    epss = max(0.0, min(1.0, float(finding.get("epss") or 0.0)))
+    kev = 1.0 if finding.get("kev") else 0.0
+    confirmed = 1.0 if finding.get("status") == "confirmed" else 0.0
+    score = (
+        0.30 * confirmed
+        + 0.25 * confidence
+        + 0.20 * kev
+        + 0.15 * epss
+        + 0.10 * cvss
+    )
+    return round(min(1.0, max(0.0, score)), 3)

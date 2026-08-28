@@ -72,3 +72,14 @@ def test_default_lport_from_env(monkeypatch):
     monkeypatch.setenv("EXPLOIT_LPORT", "9001")
     c = cb.resolve_callback("10.10.10.10")
     assert c.advertised_port == 9001
+
+
+def test_auto_public_without_reachable_endpoint_is_not_trusted(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setattr(cb, "ngrok_available", lambda: False)
+    monkeypatch.setattr(cb, "get_public_ip", lambda: None)
+    monkeypatch.setattr(cb, "get_local_ip", lambda target=None: "192.168.1.20")
+
+    result = cb.resolve_callback("8.8.8.8")
+    assert result.reachable is False
+    assert result.advertised_host == "192.168.1.20"

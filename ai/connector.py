@@ -116,25 +116,26 @@ class KMN_AI_Connector:
             "insert_key_here"
         ]
         
-        # FORCE API mode if we have a valid, non-placeholder API key
+        # Respect an explicit provider choice. A stale API key in .env must not
+        # silently switch a user who selected local Ollama to remote inference.
         is_valid_api_key = (
             self.api_key and 
             len(self.api_key) > 10 and  # Reasonable minimum length for real API key
             not any(pattern in self.api_key.lower() for pattern in placeholder_patterns)
         )
-        
-        if is_valid_api_key:
-            self.provider = "api"
-            logger.info("Valid API key found. Forcing AI provider to: API")
-        else:
-            # Only use local if explicitly requested AND no valid API key exists
-            self.provider = provider or os.getenv("AI_PROVIDER", "local")
-            if self.provider == "api" and not is_valid_api_key:
-                logger.warning("AI_PROVIDER set to 'api' but no valid API key found. Falling back to local.")
-                self.provider = "local"
-            logger.info(f"No valid API key found. Using provider: {self.provider}")
-            # Clear API key if it's invalid/placeholder
+
+        requested_provider = (provider or os.getenv("AI_PROVIDER", "") or "").strip().lower()
+        if requested_provider not in {"api", "local"}:
+            requested_provider = "api" if is_valid_api_key else "local"
+        if requested_provider == "api" and not is_valid_api_key:
+            logger.warning(
+                "AI_PROVIDER is 'api' but no valid API key was found; falling back to local."
+            )
+            requested_provider = "local"
+        self.provider = requested_provider
+        if not is_valid_api_key:
             self.api_key = None
+        logger.info(f"Using AI provider: {self.provider}")
         
         # URLs for different providers - explicit args win, then env vars, then defaults.
         ollama_base = (ollama_url or os.getenv("OLLAMA_URL") or "http://localhost:11434").strip().rstrip("/")

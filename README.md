@@ -1,6 +1,6 @@
 # KMN-CyberSeek
 
-![Version](https://img.shields.io/badge/Version-2.5.0-brightgreen)
+![Version](https://img.shields.io/badge/Version-2.6.0-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
@@ -98,6 +98,7 @@ SCOPE_ALLOWLIST=10.0.0.0/8,lab.local
 
 ```env
 FULL_AUTO_MODE=false   # true = no approval prompts — isolated labs only
+# Automated execution policy and the binary allowlist remain active in full-auto mode.
 ```
 
 ### Advanced tuning (optional)
@@ -126,6 +127,7 @@ MSF_CVE_RESOLVE_LIMIT=3  # how many top-priority CVEs to resolve per pass
 # Scan / command timeouts (seconds)
 SCAN_TIMEOUT=300
 VULN_SCAN_TIMEOUT=120
+VULN_SCAN_CONCURRENCY=4  # bounded parallel per-port NSE scans
 COMMAND_TIMEOUT=600
 
 # Agentic-loop safety
@@ -144,8 +146,8 @@ OSINT_MAX_TURNS=6        # hard cap so a low-OSINT target still advances
 COVERAGE_ENGINE=true
 
 # Decoupled brute-force worker — background credential brute-force on discovered
-# auth services (SSH/FTP/RDP/MySQL/SMB/WinRM). ON by default; toggle in Settings.
-BRUTEFORCE_ENABLED=true
+# auth services (SSH/FTP/RDP/MySQL/SMB/WinRM). Explicit opt-in; toggle in Settings.
+BRUTEFORCE_ENABLED=false   # explicit opt-in; may trigger account lockouts
 BRUTEFORCE_TIER=default            # default | rockyou | full
 BRUTEFORCE_MAX_SECONDS_PER_SERVICE=600
 BRUTEFORCE_CONCURRENCY=2
@@ -161,6 +163,24 @@ BRUTEFORCE_CONCURRENCY=2
 
 - [Features & Architecture Detail](features.md)
 - [Changelog](change_log.md)
+
+## Session Retention
+
+Sessions persist their lifecycle events, background jobs, scan state, findings,
+and asset relationships in SQLite. The dashboard can export a portable session
+archive containing the report, event timeline, job records, and manifest:
+
+```text
+GET /api/sessions/{session_id}/archive
+GET /api/sessions/{session_id}/events
+GET /api/sessions/{session_id}/jobs
+POST /api/sessions/{session_id}/cancel
+```
+
+Independent NSE and ExploitDB lookups use bounded concurrency. State-dependent
+exploitation and post-exploitation actions remain ordered. Public targets do not
+receive a private workstation callback address unless a reachable callback mode
+or explicit public endpoint is configured.
 
 ---
 
