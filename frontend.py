@@ -840,9 +840,9 @@ def show_new_session():
             
             with col1:
                 auto_approval = st.checkbox(
-                    "Auto-approve low-risk commands",
+                    "Auto-run routine LOW/MEDIUM commands",
                     value=True,
-                    help="Automatically execute low-risk commands without manual approval"
+                    help="Automatically execute routine reconnaissance and enumeration commands. HIGH-risk actions still wait for approval."
                 )
                 
                 parallel_scans = st.checkbox(

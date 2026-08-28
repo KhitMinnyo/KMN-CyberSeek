@@ -37,6 +37,16 @@ def test_requires_approval_high_risk_keywords():
         assert orch.requires_approval(cmd) is True, f"Expected True for: {cmd!r}"
 
 
+def test_upload_and_webshell_commands_are_high_risk():
+    orch = make_orch()
+    for cmd in [
+        "curl -s -T /tmp/shell.php ftp://10.0.0.5/",
+        "echo payload > /tmp/shell.php; curl http://10.0.0.5/shell.php?c=id",
+        "mysql -e \"SELECT '<?php system($_GET[c]); ?>' INTO OUTFILE '/var/www/html/shell.php'\"",
+    ]:
+        assert orch.requires_approval(cmd) is True
+
+
 def test_low_risk_no_approval():
     orch = make_orch()
     assert orch.requires_approval("nmap -sV 10.0.0.5") is False

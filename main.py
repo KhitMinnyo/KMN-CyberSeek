@@ -187,7 +187,7 @@ class TargetRequest(BaseModel):
     ip: str = Field(..., description="Target IP address, hostname, or CIDR subnet (e.g. 192.168.1.0/24)")
     domain: Optional[str] = Field(None, description="Optional domain name")
     session_name: Optional[str] = Field(None, description="Custom session name")
-    auto_approve: bool = Field(False, description="Auto-approve low/medium risk commands")
+    auto_approve: bool = Field(True, description="Auto-run routine low/medium risk commands")
     max_auto_depth: int = Field(25, description="Maximum consecutive auto-executed commands before a manual checkpoint (the counter resets on any critical finding)")
     objective: Optional[str] = Field(
         None,
@@ -1029,6 +1029,15 @@ async def resume_session(session_id: str):
         return {"status": "already_running", "message": f"Session is already active (status: {session.status})"}
 
     logger.info(f"Manual resume triggered for {session_id} (paused_ctx={_last_ctx or 'none'})")
+    if _is_paused or session.status == "needs_operator":
+        # A resumed session must receive a fresh no-progress budget. Otherwise
+        # the next completed command sees the old MAX_COMMANDS_NO_PROGRESS value
+        # and immediately enters needs_operator again.
+        session._commands_since_progress = 0
+        session._last_effort_marker = None
+        session._stagnation_counter = 0
+        session._auto_pivot_count = 0
+        session.pause_reason = ""
     session.status = "analyzing"
     asyncio.create_task(orchestrator._analyze_with_ai(session_id))
     return {"status": "success", "message": "AI analysis resumed"}
