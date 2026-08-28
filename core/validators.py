@@ -162,7 +162,7 @@ ALLOWED_BINARIES = {
     "beef-xss",
 
     # ── SMB / Windows / Active Directory ────────────────────────────────
-    "smbclient", "smbmap", "smbget",
+    "smbclient", "smbmap", "smbget", "ftp", "mysql", "psql", "redis-cli",
     "enum4linux", "enum4linux-ng",
     "rpcclient", "net", "rpcinfo",
     "ldapsearch", "ldapdomaindump", "ldapmodify", "ldapadd",
@@ -277,6 +277,51 @@ _DOWNLOAD_EXEC_RE = re.compile(
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
+def _split_shell_segments(command: str):
+    """Split top-level shell operators without splitting quoted arguments."""
+    segments = []
+    current = []
+    quote = None
+    escaped = False
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if escaped:
+            current.append(char)
+            escaped = False
+            i += 1
+            continue
+        if char == "\\" and quote != "'":
+            current.append(char)
+            escaped = True
+            i += 1
+            continue
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            i += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            current.append(char)
+            i += 1
+            continue
+        if char in ";|\n":
+            if current:
+                segments.append("".join(current))
+                current = []
+            if char in "|" and i + 1 < len(command) and command[i + 1] == char:
+                i += 1
+            i += 1
+            continue
+        current.append(char)
+        i += 1
+    if current:
+        segments.append("".join(current))
+    return segments
+
+
 def is_allowlisted_command(command: Optional[str]) -> Optional[str]:
     """Gate for the fully-autonomous auto-execute path (no human review).
 
@@ -297,7 +342,15 @@ def is_allowlisted_command(command: Optional[str]) -> Optional[str]:
     if _DOWNLOAD_EXEC_RE.search(command):
         return "Download-and-execute pattern (curl/wget piped into a shell/interpreter) is not allowed in auto-executed commands"
 
-    segments = re.split(r"&&|\|\||;|\||\n", command)
+    # A here-document is one command body. Validate its launcher, but do not
+    # mistake protocol words inside the body for local binaries.
+    heredoc_prefix = command.split("<<", 1)[0] if "<<" in command else None
+    segments = _split_shell_segments(heredoc_prefix or command)
+    shell_words = {
+        "if", "then", "else", "elif", "fi", "for", "while", "until",
+        "do", "done", "case", "esac", "in", "function", "select",
+        "time", "!", "[", "]", "test", "true", "false",
+    }
     for segment in segments:
         segment = segment.strip()
         if not segment:
@@ -306,6 +359,12 @@ def is_allowlisted_command(command: Optional[str]) -> Optional[str]:
         idx = 0
         # Skip leading environment variable assignments (FOO=bar cmd ...)
         while idx < len(tokens) and _ENV_ASSIGNMENT_RE.match(tokens[idx]):
+            idx += 1
+        if idx < len(tokens) and tokens[idx] in {"for", "while", "until"}:
+            # The loop declaration has no executable binary yet. Its body is
+            # validated when the following `do` segment is encountered.
+            continue
+        while idx < len(tokens) and tokens[idx] in shell_words:
             idx += 1
         # Skip a leading sudo
         if idx < len(tokens) and tokens[idx] == "sudo":

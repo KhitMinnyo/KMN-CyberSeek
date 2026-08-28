@@ -107,7 +107,6 @@ async def lookup_cves(service: str, version: str, max_results: int = 5,
     version = (version or "").strip()
     if not service or not version or service.lower() == "unknown":
         return []
-
     query = f'"{service}" AND "{version}" AND type:cve'
     payload = {
         "query": query,
@@ -218,6 +217,11 @@ async def lookup_cves_nvd(
     Always returns [] on any error — never raises.
     """
     if not service:
+        return []
+    if not re.search(r"\b\d+\.\d+(?:\.\d+)?\b", version or ""):
+        logger.info(
+            f"Skipping NVD lookup for {service!r}: no numeric version in banner"
+        )
         return []
 
     query = _clean_nvd_query(service, version)
