@@ -14,7 +14,7 @@ shrink blast radius for two realistic failure modes of an LLM-driven agent that 
 import ipaddress
 import os
 import re
-from typing import Optional
+from typing import Optional, List
 
 # --- Target format validation -------------------------------------------------
 
@@ -381,4 +381,280 @@ def is_allowlisted_command(command: Optional[str]) -> Optional[str]:
         if binary not in ALLOWED_BINARIES:
             return f"Binary '{binary}' is not in the auto-execute allowlist"
 
+    return None
+
+
+# ── Tool-specific verification engine ─────────────────────────────────────────
+# Each validator receives the raw tool output string and returns True when the
+# tool's own success criteria are satisfied.  Return False means inconclusive
+# or failure; the caller should NOT upgrade status to "exploited/verified" on
+# False.  These replace the legacy single-keyword heuristic.
+
+import re as _re
+
+def validate_msf_session_open(output: str) -> bool:
+    """Meterpreter or shell session opened via Metasploit."""
+    pat = _re.compile(
+        r"(Meterpreter session \d+ opened"
+        r"|Command shell session \d+ opened"
+        r"|session \d+ created)",
+        _re.IGNORECASE,
+    )
+    return bool(pat.search(output or ""))
+
+
+def validate_ssh_auth(output: str) -> bool:
+    """SSH authentication succeeded — we got a prompt or banner, not a denial."""
+    out = output or ""
+    # Common failure markers
+    fail_pats = _re.compile(
+        r"(Permission denied|Authentication failed"
+        r"|Connection refused|Could not resolve|Too many authentication failures"
+        r"|Host key verification failed)",
+        _re.IGNORECASE,
+    )
+    if fail_pats.search(out):
+        return False
+    # Success indicators: shell prompt, banner grab, or hydra success line
+    ok_pats = _re.compile(
+        r"(\$\s*$|#\s*$|\[SUCCESS\]|login:\s*\[\d+\]"
+        r"|Welcome to|Last login|OpenSSH)",
+        _re.IGNORECASE,
+    )
+    return bool(ok_pats.search(out))
+
+
+def validate_winrm_auth(output: str) -> bool:
+    """WinRM / evil-winrm authentication succeeded."""
+    out = output or ""
+    fail_pats = _re.compile(
+        r"(WinRM::WinRMAuthorizationError|401 Unauthorized"
+        r"|Connection refused|HTTPAUTH_CREDS_UNAVAILABLE"
+        r"|Logon failure)",
+        _re.IGNORECASE,
+    )
+    if fail_pats.search(out):
+        return False
+    ok_pats = _re.compile(
+        r"(Evil-WinRM shell|PS .+>|\*Evil-WinRM\*)",
+        _re.IGNORECASE,
+    )
+    return bool(ok_pats.search(out))
+
+
+def validate_smb_auth(output: str) -> bool:
+    """SMB authentication and share access succeeded."""
+    out = output or ""
+    fail_pats = _re.compile(
+        r"(NT_STATUS_LOGON_FAILURE|NT_STATUS_ACCESS_DENIED"
+        r"|NT_STATUS_INVALID_PARAMETER|NT_STATUS_CONNECTION_REFUSED"
+        r"|STATUS_LOGON_FAILURE|Login failed)",
+        _re.IGNORECASE,
+    )
+    if fail_pats.search(out):
+        return False
+    ok_pats = _re.compile(
+        r"(Sharename|Domain=|\[+\]\s+Authenticated"
+        r"|smb: \\\\>|tree connect andx response)",
+        _re.IGNORECASE,
+    )
+    return bool(ok_pats.search(out))
+
+
+_WEB_RCE_NONCE_RE = _re.compile(r"KMN_RCE_[A-F0-9]{8}", _re.IGNORECASE)
+
+def validate_web_rce(output: str, nonce: Optional[str] = None) -> bool:
+    """Web RCE confirmed — check nonce echo or known execution indicators."""
+    out = output or ""
+    if nonce:
+        return nonce in out
+    # Fallback: common execution evidence
+    ok_pats = _re.compile(
+        r"(uid=\d+|root:|www-data|apache|nginx"
+        r"|Linux .*#\d+|Microsoft Windows|\[System Process\]"
+        r"|Successfully uploaded|shell uploaded)",
+        _re.IGNORECASE,
+    )
+    return bool(ok_pats.search(out))
+
+
+def validate_sql_query(output: str, expected_table: str = "") -> bool:
+    """SQL query returned real rows (not an auth/connection error)."""
+    out = output or ""
+    fail_pats = _re.compile(
+        r"(Access denied for user|ERROR \d+|authentication failed"
+        r"|Connection refused|could not connect|FATAL:)",
+        _re.IGNORECASE,
+    )
+    if fail_pats.search(out):
+        return False
+    if expected_table:
+        return expected_table.lower() in out.lower()
+    ok_pats = _re.compile(
+        r"(rows in set|row affected|\+[-+]+\+|\|.*\||SELECT|INSERT|UPDATE)",
+        _re.IGNORECASE,
+    )
+    return bool(ok_pats.search(out))
+
+
+def validate_ftp_access(output: str) -> bool:
+    """FTP login and directory listing succeeded."""
+    out = output or ""
+    fail_pats = _re.compile(
+        r"(530 Login|530 Not logged|Connection refused|Login failed|Auth failed)",
+        _re.IGNORECASE,
+    )
+    if fail_pats.search(out):
+        return False
+    ok_pats = _re.compile(
+        r"(230 Login|drwx|[-r][-w][-x]|ftp>|\[\+\] anonymous|total \d+)",
+        _re.IGNORECASE,
+    )
+    return bool(ok_pats.search(out))
+
+
+def validate_root_privilege(output: str) -> bool:
+    """Confirm root (Linux) or SYSTEM (Windows) privilege from shell output."""
+    out = output or ""
+    linux_root = _re.compile(
+        r"(uid=0\(root\)|euid=0|\broot\b.*\broot\b|#\s*$)",
+        _re.IGNORECASE,
+    )
+    win_system = _re.compile(
+        r"(NT AUTHORITY\\\\SYSTEM|User Name.*SYSTEM"
+        r"|SeDebugPrivilege.*Enabled|BUILTIN\\\\Administrators)",
+        _re.IGNORECASE,
+    )
+    return bool(linux_root.search(out) or win_system.search(out))
+
+
+def validate_credential(output: str) -> bool:
+    """Credential validity — at least one tool-agnostic success indicator."""
+    ok_pats = _re.compile(
+        r"(\[\+\].*valid|\[\+\].*success|230 Login|Authenticated"
+        r"|Valid credentials|Password OK|Login successful"
+        r"|\[SUCCESS\]|STATUS_SUCCESS)",
+        _re.IGNORECASE,
+    )
+    fail_pats = _re.compile(
+        r"(Invalid|incorrect|failed|denied|FAILED|BAD)",
+        _re.IGNORECASE,
+    )
+    out = output or ""
+    if ok_pats.search(out):
+        return True
+    # If only failure patterns found, definitively False; otherwise ambiguous=False
+    return False
+
+
+def validate_callback_delivery(output: str, expected_lhost: str = "") -> bool:
+    """Payload callback reached the handler."""
+    out = output or ""
+    ok_pats = _re.compile(
+        r"(session \d+ opened|Meterpreter session|Command shell session"
+        r"|Sending stage|Payload Handler Started)",
+        _re.IGNORECASE,
+    )
+    if not ok_pats.search(out):
+        return False
+    if expected_lhost and expected_lhost not in out:
+        return False
+    return True
+
+
+# Dispatcher: map tool name -> validator function
+_TOOL_VALIDATORS = {
+    "msf_session":  validate_msf_session_open,
+    "ssh":          validate_ssh_auth,
+    "winrm":        validate_winrm_auth,
+    "smb":          validate_smb_auth,
+    "web_rce":      validate_web_rce,
+    "sql":          validate_sql_query,
+    "ftp":          validate_ftp_access,
+    "root_priv":    validate_root_privilege,
+    "credential":   validate_credential,
+    "callback":     validate_callback_delivery,
+}
+
+
+def tool_validate(tool_name: str, output: str, **kwargs) -> bool:
+    """Route output to the appropriate tool-specific validator.
+
+    Args:
+        tool_name: one of the keys in _TOOL_VALIDATORS
+        output:    raw stdout/stderr from the tool
+        **kwargs:  extra args forwarded to the specific validator (e.g. nonce=)
+    Returns:
+        True  = success confirmed by this tool's own criteria
+        False = failure or inconclusive (do NOT upgrade exploit state)
+    """
+    fn = _TOOL_VALIDATORS.get(tool_name)
+    if fn is None:
+        return False
+    try:
+        return fn(output, **kwargs)
+    except Exception:
+        return False
+
+
+# ── Command-level scope enforcement ───────────────────────────────────────────
+# Extracts every destination host embedded in a command string and checks each
+# against the scope allowlist.  Covers MSF option flags, URL host parts, and
+# common tool argument patterns.
+
+_MSF_HOST_FLAGS = _re.compile(
+    r"(?:set\s+(?:RHOSTS?|LHOST|TARGET|SRVHOST)|"
+    r"-H|-h|--host|--target|-t|RHOSTS?=|TARGET=)"
+    r"\s+([\w.:-]+)",
+    _re.IGNORECASE,
+)
+_URL_HOST_RE = _re.compile(
+    r"https?://([\w.-]+(?::\d+)?)",
+    _re.IGNORECASE,
+)
+_GENERIC_HOST_FLAG = _re.compile(
+    r"(?:-H|-h|--host|--rhost|--target|-T)\s+([\w.:/+-]+)",
+    _re.IGNORECASE,
+)
+_FTP_DEST   = _re.compile(r"(?:ftp|sftp)(?:-?cli)?\s+(?:[^@]+@)?([\w.-]+)", _re.IGNORECASE)
+_SMB_DEST   = _re.compile(r"//([\w.:-]+)/", _re.IGNORECASE)
+_PROXY_DEST = _re.compile(r"--proxy[=\s]+(?:socks[45]?://|http://)?([\w.:-]+)", _re.IGNORECASE)
+_CIDR_ARG   = _re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})\b")
+
+
+def _strip_port(host: str) -> str:
+    if host.startswith("["):  # IPv6 bracket notation
+        return host.split("]")[0].lstrip("[")
+    return host.split(":")[0] if ":" in host else host
+
+
+def extract_command_destinations(command: str) -> List[str]:
+    """Return every unique destination host found in *command*."""
+    out = set()
+    for pat in (_MSF_HOST_FLAGS, _URL_HOST_RE, _GENERIC_HOST_FLAG,
+                _FTP_DEST, _SMB_DEST, _PROXY_DEST):
+        for m in pat.finditer(command or ""):
+            host = _strip_port(m.group(1).strip())
+            if host:
+                out.add(host)
+    # CIDR arguments
+    for m in _CIDR_ARG.finditer(command or ""):
+        out.add(m.group(1))
+    return list(out)
+
+
+def check_command_scope(command: str, allowlist_str: Optional[str]) -> Optional[str]:
+    """Return None if every destination in *command* is in scope, or a
+    human-readable rejection reason if any destination is out of scope.
+
+    Fail-closed: if allowlist_str is set and any extracted host fails
+    is_target_in_scope(), the command is blocked.
+    """
+    if not allowlist_str or not allowlist_str.strip():
+        return None  # no allowlist configured, unrestricted
+
+    destinations = extract_command_destinations(command)
+    for dest in destinations:
+        if not is_target_in_scope(dest, allowlist_str):
+            return f"Out-of-scope destination in command: {dest!r}"
     return None
