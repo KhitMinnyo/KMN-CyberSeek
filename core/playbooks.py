@@ -243,6 +243,52 @@ PLAYBOOKS: Dict[str, List[PlaybookStep]] = {
         PlaybookStep("generic.probe", "Banner-grab and interrogate the service", PHASE_ENUM,
                      KIND_AI, produces=["tech"]),
     ],
+    "webdav": [
+        PlaybookStep("webdav.detect", "Check WebDAV OPTIONS and methods",
+                     PHASE_ENUM, KIND_DET,
+                     "curl -sS -X OPTIONS {url} -D - | head -20", tool="curl",
+                     produces=["tech"], signals=["webdav", "dav", "options"]),
+        PlaybookStep("webdav.davtest", "Test WebDAV upload capability",
+                     PHASE_VULN, KIND_DET, "davtest -url {url}", tool="davtest",
+                     produces=["upload", "rce"]),
+        PlaybookStep("webdav.nikto", "Nikto WebDAV scan",
+                     PHASE_VULN, KIND_DET, "nikto -h {url} -Plugins +webdav",
+                     tool="nikto", produces=["cve"]),
+        PlaybookStep("webdav.upload_shell", "Upload web shell via WebDAV PUT",
+                     PHASE_EXPLOIT, KIND_AI, produces=["rce"],
+                     signals=["put ", "shell.php", "shell.aspx", "davtest"]),
+        PlaybookStep("webdav.exec", "Execute uploaded shell and confirm RCE",
+                     PHASE_EXPLOIT, KIND_AI, produces=["rce"],
+                     signals=["curl", "wget", "id", "whoami"]),
+    ],
+    "jmx": [
+        PlaybookStep("jmx.nmap", "Probe JMX / RMI service with nmap",
+                     PHASE_ENUM, KIND_DET,
+                     "nmap -p{port} --script=rmi-dumpregistry,jmx-info -Pn {host}",
+                     tool="nmap", produces=["tech", "endpoints"]),
+        PlaybookStep("jmx.mbean_rce", "Exploit JMX MBean for OS command execution",
+                     PHASE_EXPLOIT, KIND_AI, produces=["rce"],
+                     signals=["ysoserial", "jmxterm", "invoke", "createMBean"]),
+        PlaybookStep("jmx.msf_exploit", "MSF exploit/multi/misc/java_jmx_server",
+                     PHASE_EXPLOIT, KIND_AI, produces=["shell"],
+                     signals=["java_jmx_server", "jmx"]),
+    ],
+    "unknown": [
+        PlaybookStep("unknown.banner", "Grab service banner via netcat",
+                     PHASE_ENUM, KIND_DET,
+                     "echo '' | nc -w 3 {host} {port} 2>&1 | head -5", tool="nc",
+                     produces=["tech", "banner"]),
+        PlaybookStep("unknown.nmap_sv", "Version + default scripts against unknown port",
+                     PHASE_ENUM, KIND_DET,
+                     "nmap -sV -sC -p{port} -Pn {host}", tool="nmap",
+                     produces=["tech", "cve"]),
+        PlaybookStep("unknown.searchsploit", "Search exploitdb for identified service",
+                     PHASE_VULN, KIND_AI, produces=["cve"],
+                     signals=["searchsploit"]),
+        PlaybookStep("unknown.version_exploit", "Attempt version-matched exploit",
+                     PHASE_EXPLOIT, KIND_AI, produces=["shell"],
+                     signals=["exploit", "use ", "payload"]),
+    ],
 }
 
 
@@ -338,8 +384,16 @@ def classify_service(svc: dict) -> List[str]:
     if "winrm" in name or port in (5985, 5986):
         add("winrm")
 
+    if "webdav" in blob or "dav" in blob:
+        add("webdav")
+    if "jmx" in blob or port in (1090, 9010, 9999, 1617, 7199):
+        add("jmx")
+    # AJP/Tomcat already handled above; add jmx for JMX on Tomcat
+    if port in (8686, 12345) and "tomcat" in blob:
+        add("jmx")
+
     if not keys:
-        add("generic")
+        add("unknown")
     return keys
 
 
