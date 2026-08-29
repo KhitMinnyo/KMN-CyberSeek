@@ -789,6 +789,28 @@ class ShellExecRequest(BaseModel):
     command: str
 
 
+class PivotRouteRequest(BaseModel):
+    handler_id: str
+    msf_id: int
+    subnet: str
+
+
+class PortForwardRequest(BaseModel):
+    handler_id: str
+    msf_id: int
+    remote_host: str
+    remote_port: int
+    local_port: int
+    local_host: str = "127.0.0.1"
+
+
+class SocksProxyRequest(BaseModel):
+    handler_id: str
+    msf_id: int
+    local_port: int
+    local_host: str = "127.0.0.1"
+
+
 @app.post("/api/sessions/{session_id}/shells/handler")
 async def start_handler(session_id: str, req: StartHandlerRequest):
     """Start a Metasploit multi/handler listener for this session."""
@@ -844,6 +866,55 @@ async def exec_in_shell(session_id: str, handler_id: str, msf_id: int,
         "command":    req.command,
         "output":     output,
     }
+
+
+@app.post("/api/sessions/{session_id}/pivot/route")
+async def add_pivot_route(session_id: str, req: PivotRouteRequest):
+    result = await orchestrator.add_pivot_route(
+        session_id, req.handler_id, req.msf_id, req.subnet
+    )
+    if result.get("status") != "success":
+        raise HTTPException(status_code=400, detail=result.get("message", "Pivot route failed"))
+    return result
+
+
+@app.post("/api/sessions/{session_id}/pivot/portfwd")
+async def add_port_forward(session_id: str, req: PortForwardRequest):
+    result = await orchestrator.add_port_forward(
+        session_id, req.handler_id, req.msf_id, req.remote_host,
+        req.remote_port, req.local_port, req.local_host,
+    )
+    if result.get("status") != "success":
+        raise HTTPException(status_code=400, detail=result.get("message", "Port forward failed"))
+    return result
+
+
+@app.delete("/api/sessions/{session_id}/pivot/portfwd/{local_port}")
+async def remove_port_forward(session_id: str, local_port: int,
+                              handler_id: str, msf_id: int):
+    result = await orchestrator.remove_port_forward(
+        session_id, handler_id, msf_id, local_port
+    )
+    if result.get("status") != "success":
+        raise HTTPException(status_code=400, detail=result.get("message", "Port forward removal failed"))
+    return result
+
+
+@app.post("/api/sessions/{session_id}/pivot/socks")
+async def start_socks_proxy(session_id: str, req: SocksProxyRequest):
+    result = await orchestrator.start_socks_proxy(
+        session_id, req.handler_id, req.msf_id, req.local_port, req.local_host
+    )
+    if result.get("status") != "success":
+        raise HTTPException(status_code=400, detail=result.get("message", "SOCKS proxy failed"))
+    return result
+
+
+@app.get("/api/sessions/{session_id}/pivot")
+async def get_pivot_state(session_id: str):
+    if not orchestrator.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"session_id": session_id, **orchestrator.get_pivot_state(session_id)}
 
 
 @app.get("/api/sessions/{session_id}/shells/{handler_id}/{msf_id}/history")
@@ -1084,47 +1155,15 @@ async def restart_session(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = orchestrator.sessions[session_id]
-
-    # Preserve scan data — hosts, services, and raw scan blobs stay intact so
-    # the AI sees the same network context without re-running nmap.
-    session.commands_executed.clear()
-    session.ai_decisions.clear()
-    session.vulnerabilities.clear()
-    session.auto_depth_counter = 0
-    session.current_stage = "reconnaissance"
-    session.status = "analyzing"
-
-    import sqlite3 as _sqlite3
-    import json as _json
-    _conn = _sqlite3.connect(orchestrator.db_path)
-
-    # Clear AI decisions for this session.
-    _conn.execute('DELETE FROM ai_decisions WHERE session_id = ?', (session_id,))
-
-    # Clear previously stored vulnerability findings so a fresh analysis run
-    # produces clean results (avoids stale dedup entries blocking new findings).
-    _conn.execute('DELETE FROM vulnerabilities WHERE session_id = ?', (session_id,))
-
-    # Remove vuln-analysis completion markers so _run_vulnerability_analysis()
-    # re-runs every step instead of skipping everything as "already done".
-    # We keep the real nmap scan blobs (scan_type not matching these prefixes)
-    # so hosts/services/ports are preserved for the AI context.
-    _conn.execute("""
-        DELETE FROM scan_results
-        WHERE session_id = ?
-          AND (scan_type LIKE 'nmap_vuln_p%'
-               OR scan_type LIKE 'ss_%'
-               OR scan_type LIKE 'nvd_%'
-               OR scan_type LIKE 'vul_%')
-    """, (session_id,))
-
-    _conn.commit()
-    _conn.close()
-
+    reset = await orchestrator.reset_session_state(session_id, full_scan=False)
+    if reset.get("status") != "success":
+        raise HTTPException(status_code=500, detail=reset.get("message", "Reset failed"))
     logger.info(f"Smart restart for session {session_id} — keeping scan data, resetting AI + vuln state")
     # Re-run both AI analysis and vulnerability analysis from scratch.
-    asyncio.create_task(orchestrator._analyze_with_ai(session_id))
-    asyncio.create_task(orchestrator._run_vulnerability_analysis(session_id))
+    orchestrator._track_task(session_id, orchestrator._analyze_with_ai(session_id), "restart_ai")
+    orchestrator._track_task(
+        session_id, orchestrator._run_vulnerability_analysis(session_id), "restart_vulnerability"
+    )
     return {"status": "success", "message": "AI state reset — re-analyzing existing scan data"}
 
 
@@ -1140,25 +1179,9 @@ async def rescan_session(session_id: str):
     if session_id not in orchestrator.sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    session = orchestrator.sessions[session_id]
-
-    session.discovered_hosts.clear()
-    session.discovered_services.clear()
-    session.scan_results.clear()
-    session.commands_executed.clear()
-    session.ai_decisions.clear()
-    session.vulnerabilities.clear()
-    session.credentials.clear()
-    session.auto_depth_counter = 0
-    session.current_stage = "reconnaissance"
-    session.status = "scanning"
-
-    import sqlite3 as _sqlite3
-    _conn = _sqlite3.connect(orchestrator.db_path)
-    _conn.execute('DELETE FROM ai_decisions WHERE session_id = ?', (session_id,))
-    _conn.commit()
-    _conn.close()
-
+    reset = await orchestrator.reset_session_state(session_id, full_scan=True)
+    if reset.get("status") != "success":
+        raise HTTPException(status_code=500, detail=reset.get("message", "Reset failed"))
     logger.info(f"Full rescan for session {session_id} — all data cleared")
     asyncio.create_task(orchestrator.start_reconnaissance(session_id))
     return {"status": "success", "message": "Full rescan started from scratch"}

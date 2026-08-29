@@ -30,6 +30,7 @@ streamlit-option-menu>=0.3.6
 openai>=1.6.1  # OpenAI 1.x is stable
 requests>=2.31.0
 httpx>=0.25.2,<1.0.0
+msgpack>=1.0.7  # Optional MSFRPC transport; unused when MSFRPC_URL is unset
 
 # Security tools integration
 python-nmap>=0.7.1

@@ -34,6 +34,7 @@ import ipaddress
 import logging
 import os
 import re
+import signal
 import uuid
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
@@ -149,6 +150,7 @@ class MsfHandlerProcess:
 
         self._process: Optional[asyncio.subprocess.Process] = None
         self._monitor_task: Optional[asyncio.Task]          = None
+        self._rc_path: Optional[str] = None
         self._buffer: List[str]        = []
         self._sessions: Dict[int, ShellSession] = {}
 
@@ -156,6 +158,9 @@ class MsfHandlerProcess:
         self._pending_marker: Optional[str]  = None
         self._marker_event: asyncio.Event    = asyncio.Event()
         self._buf_snapshot_start: int        = 0
+        # msfconsole has one stdin/stdout stream. Serialize commands so one
+        # operator request cannot overwrite another request's marker state.
+        self._command_lock = asyncio.Lock()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -167,6 +172,7 @@ class MsfHandlerProcess:
             self.status = "error"
             return False
         rc_path = f"/tmp/kmn_handler_{self.handler_id}.rc"
+        self._rc_path = rc_path
         # LHOST/LPORT are what the payload dials (the reachable, advertised
         # address). When the listener must bind elsewhere — behind a tunnel or a
         # port-forward — ReverseListenerBindAddress/Port point the actual socket
@@ -208,6 +214,21 @@ class MsfHandlerProcess:
             return False
 
         self._monitor_task = asyncio.create_task(self._monitor())
+        # Do not report a listener as ready until msfconsole has emitted a
+        # readiness line. This prevents exploits from racing a still-starting
+        # handler and makes startup failures retryable.
+        for _ in range(40):
+            if self.status == "listening":
+                break
+            if self._process.returncode is not None:
+                self.status = "error"
+                return False
+            await asyncio.sleep(0.25)
+        if self.status != "listening":
+            logger.error(f"[Handler {self.handler_id}] Listener did not become ready")
+            await self.stop()
+            self.status = "error"
+            return False
         logger.info(
             f"[Handler {self.handler_id}] Started: {self.lhost}:{self.lport} "
             f"payload={self.payload}"
@@ -229,6 +250,32 @@ class MsfHandlerProcess:
                 pass
         if self._monitor_task:
             self._monitor_task.cancel()
+        if self._process and self._process.returncode is None:
+            try:
+                await asyncio.wait_for(self._process.wait(), timeout=2)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                try:
+                    os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        self._process.kill()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    await self._process.wait()
+                except Exception:
+                    pass
+        if self._monitor_task:
+            await asyncio.gather(self._monitor_task, return_exceptions=True)
+        for sess in self._sessions.values():
+            sess.status = "closed"
+        if self._rc_path:
+            try:
+                os.unlink(self._rc_path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.debug(f"[Handler {self.handler_id}] RC cleanup failed: {exc}")
         self.status = "stopped"
         logger.info(f"[Handler {self.handler_id}] Stopped")
 
@@ -312,6 +359,10 @@ class MsfHandlerProcess:
     # ── Command execution ─────────────────────────────────────────────────────
 
     async def run_command(self, msf_id: int, command: str) -> str:
+        async with self._command_lock:
+            return await self._run_command(msf_id, command)
+
+    async def _run_command(self, msf_id: int, command: str) -> str:
         """Run a command in an active session and return captured output."""
         if not self._process or self._process.returncode is not None:
             return "[Error: handler process is not running]"
@@ -393,6 +444,37 @@ class MsfHandlerProcess:
 
         return output
 
+    async def run_console_command(self, command: str) -> str:
+        """Run a non-interactive command in the persistent MSF console itself."""
+        if not self._process or self._process.returncode is not None:
+            return "[Error: handler process is not running]"
+        marker = f"__KMN_CONSOLE_{uuid.uuid4().hex[:10]}__"
+        async with self._command_lock:
+            self._pending_marker = marker
+            self._marker_event.clear()
+            start = len(self._buffer)
+            try:
+                self._process.stdin.write(
+                    f"{command}\necho {marker}\n".encode()
+                )
+                await self._process.stdin.drain()
+                await asyncio.wait_for(self._marker_event.wait(), timeout=CMD_OUTPUT_TIMEOUT)
+            except asyncio.TimeoutError:
+                pass
+            except Exception as exc:
+                self._pending_marker = None
+                return f"[Error writing to handler stdin: {exc}]"
+            finally:
+                self._pending_marker = None
+            lines = self._buffer[start:]
+            clean = [
+                line for line in lines
+                if not line.startswith("msf")
+                and marker not in line
+                and not line.strip().startswith("[*] Started")
+            ]
+            return "\n".join(clean).strip() or "[No output captured within timeout]"
+
     # ── Public accessors ──────────────────────────────────────────────────────
 
     def get_sessions(self) -> List[Dict]:
@@ -451,16 +533,28 @@ class ShellManager:
         key = f"{lhost}:{lport} (bind {b_host}:{b_port})"
         # Reuse an existing live handler bound to the same local socket.
         for h in self._handlers.values():
-            if h.bind_host == b_host and h.bind_port == b_port and h.status in ("listening", "starting"):
+            if (h.bind_host == b_host and h.bind_port == b_port
+                    and h.status in ("listening", "starting")
+                    and h.payload == payload):
                 logger.info(f"Reusing handler {h.handler_id} for {key}")
                 return h
+            if (h.bind_host == b_host and h.bind_port == b_port
+                    and h.status in ("listening", "starting")
+                    and h.payload != payload):
+                raise ValueError(
+                    f"Listener {b_host}:{b_port} is already bound for payload {h.payload}"
+                )
 
         handler = MsfHandlerProcess(
             lhost, lport, payload, on_session_opened=on_session_opened,
             bind_host=b_host, bind_port=b_port,
         )
         self._handlers[handler.handler_id] = handler
-        await handler.start()
+        if not await handler.start():
+            self._handlers.pop(handler.handler_id, None)
+            raise RuntimeError(
+                f"Metasploit handler {handler.handler_id} failed to become ready"
+            )
         return handler
 
     async def stop_handler(self, handler_id: str) -> bool:
@@ -493,6 +587,12 @@ class ShellManager:
         if not h:
             return f"[Handler {handler_id} not found]"
         return await h.run_command(msf_id, command)
+
+    async def run_console_command(self, handler_id: str, command: str) -> str:
+        h = self._handlers.get(handler_id)
+        if not h:
+            return f"[Handler {handler_id} not found]"
+        return await h.run_console_command(command)
 
     def has_active_sessions(self) -> bool:
         return any(

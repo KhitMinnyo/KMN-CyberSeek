@@ -19,6 +19,7 @@ trivially unit-testable and safe to import anywhere.
 """
 
 from dataclasses import dataclass, field
+import re
 from typing import Callable, Dict, List, Optional
 
 # Phases align with the engagement stages the orchestrator already tracks.
@@ -51,7 +52,11 @@ class PlaybookStep:
         c = (command or "").lower()
         if self.tool and self.tool.lower() in c:
             return True
-        return any(sig.lower() in c for sig in self.signals)
+        return any(
+            (re.search(rf"(?<![\w-]){re.escape(sig.lower())}(?![\w-])", c)
+             if sig.isidentifier() else sig.lower() in c)
+            for sig in self.signals
+        )
 
     def render(self, ctx: dict) -> Optional[str]:
         """Render a deterministic command template with {host}/{port}/{url}/{domain}.
@@ -79,7 +84,8 @@ def _wordpress(ctx: dict) -> bool:
 
 def _webdav(ctx: dict) -> bool:
     body = (ctx.get("body") or "").lower()
-    return "webdav" in body or "dav" in (ctx.get("tech") or [])
+    tech = " ".join(str(item) for item in (ctx.get("tech") or [])).lower()
+    return "webdav" in body or "dav" in tech
 
 
 PLAYBOOKS: Dict[str, List[PlaybookStep]] = {
@@ -190,6 +196,47 @@ PLAYBOOKS: Dict[str, List[PlaybookStep]] = {
                      tool="nmap", produces=["misconfig"]),
         # RDP brute-force is handled by the decoupled worker (M5).
     ],
+    "postgresql": [
+        PlaybookStep("postgresql.info", "Enumerate PostgreSQL version and auth posture", PHASE_ENUM,
+                     KIND_DET, "nmap -p{port} --script pgsql-info {host}", tool="nmap",
+                     produces=["tech"]),
+        PlaybookStep("postgresql.auth", "Test discovered PostgreSQL credentials", PHASE_VULN,
+                     KIND_AI, produces=["creds", "db"], signals=["psql", "pgsql"]),
+    ],
+    "redis": [
+        PlaybookStep("redis.info", "Check Redis unauthenticated access and server info", PHASE_VULN,
+                     KIND_DET, "redis-cli -h {host} -p {port} ping && redis-cli -h {host} -p {port} info server",
+                     tool="redis-cli", produces=["db", "misconfig"]),
+        PlaybookStep("redis.config", "Review Redis configuration exposure", PHASE_EXPLOIT,
+                     KIND_AI, produces=["file_read", "rce"], signals=["config get", "redis-cli"]),
+    ],
+    "rmi": [
+        PlaybookStep("rmi.registry", "Enumerate Java RMI registry bindings", PHASE_ENUM,
+                     KIND_DET, "nmap -p{port} --script rmi-dumpregistry {host}", tool="nmap",
+                     produces=["tech", "endpoints"]),
+        PlaybookStep("rmi.exploit", "Validate an identified Java RMI/JMX exposure", PHASE_EXPLOIT,
+                     KIND_AI, produces=["rce"], signals=["rmi", "jmx", "ysoserial"]),
+    ],
+    "nfs": [
+        PlaybookStep("nfs.exports", "Enumerate NFS exports and root-squash posture", PHASE_ENUM,
+                     KIND_DET, "showmount -e {host}", tool="showmount", produces=["shares", "misconfig"]),
+        PlaybookStep("nfs.loot", "Review permitted NFS exports for sensitive files", PHASE_EXPLOIT,
+                     KIND_AI, produces=["file_read", "creds"], signals=["mount.nfs", "showmount"]),
+    ],
+    "vnc": [
+        PlaybookStep("vnc.info", "Enumerate VNC security and protocol details", PHASE_ENUM,
+                     KIND_DET, "nmap -p{port} --script vnc-info,vnc-title {host}", tool="nmap",
+                     produces=["tech", "misconfig"]),
+        PlaybookStep("vnc.auth", "Test authorized VNC credentials", PHASE_EXPLOIT,
+                     KIND_AI, produces=["shell"], signals=["vncviewer", "vncdo"]),
+    ],
+    "ipp": [
+        PlaybookStep("ipp.info", "Enumerate IPP/CUPS service and printer metadata", PHASE_ENUM,
+                     KIND_DET, "curl -sk --max-time 10 http://{host}:{port}/", tool="curl",
+                     produces=["tech"]),
+        PlaybookStep("ipp.exploit", "Validate an identified CUPS/IPP vulnerability", PHASE_EXPLOIT,
+                     KIND_AI, produces=["rce"], signals=["cups", "ipp", "msfconsole"]),
+    ],
     "generic": [
         PlaybookStep("generic.version_cve", "Map service+version to known CVEs/exploits",
                      PHASE_VULN, KIND_AI, produces=["cve"]),
@@ -203,7 +250,7 @@ PLAYBOOKS: Dict[str, List[PlaybookStep]] = {
 # single service). OS-aware intents; the AI adapts commands to the shell it has.
 POSTEX_STEPS: List[PlaybookStep] = [
     PlaybookStep("postex.identity", "Confirm identity & privileges (whoami /all, id)",
-                 PHASE_POST, KIND_AI, produces=["priv"], signals=["whoami /all", "whoami /priv", "id;"]),
+                 PHASE_POST, KIND_AI, produces=["priv"], signals=["whoami", "id"]),
     PlaybookStep("postex.system", "Host/OS details (systeminfo, uname -a)",
                  PHASE_POST, KIND_AI, produces=["os"], signals=["systeminfo", "uname -a"]),
     PlaybookStep("postex.users", "Local users & groups; admins",
@@ -261,12 +308,29 @@ def classify_service(svc: dict) -> List[str]:
         if "jenkins" in blob or "jetty" in blob or port in (8888, 8081):
             add("jenkins")
 
+    # AJP is not HTTP, so port 8009 must be classified independently or the
+    # Ghostcat checklist is never selected for an AJP-only Tomcat service.
+    if port == 8009 or "ajp" in blob or "tomcat" in blob:
+        add("tomcat")
+
     if "ftp" in name:
         add("ftp")
     if name == "ssh" or "ssh" in name:
         add("ssh")
     if "mysql" in blob or "maria" in blob:
         add("mysql")
+    if "postgres" in blob or "pgsql" in blob or port == 5432:
+        add("postgresql")
+    if "redis" in blob or port == 6379:
+        add("redis")
+    if "rmi" in blob or "jmx" in blob or port in (1099, 9010):
+        add("rmi")
+    if "nfs" in blob or port == 2049:
+        add("nfs")
+    if "vnc" in blob or port in (5900, 5901, 5902):
+        add("vnc")
+    if "ipp" in blob or "cups" in blob or port == 631:
+        add("ipp")
     if any(t in name for t in ("microsoft-ds", "netbios-ssn", "smb")) or port in (139, 445):
         add("smb")
     if "wbt" in name or "rdp" in name or port == 3389:

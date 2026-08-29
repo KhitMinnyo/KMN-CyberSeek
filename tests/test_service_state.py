@@ -66,6 +66,19 @@ def test_exploit_signals_no_false_positive_on_web_output():
             f"False exploit promotion for output: {output!r}"
 
 
+def test_msf_banner_does_not_count_as_compromise():
+    orch = make_orch()
+    s = _sess(); orch.sessions[s.session_id] = s
+    orch._settle_service_states(
+        s,
+        "msfconsole -q -x 'use exploit/linux/http/cups_browsed_rce; run'",
+        "Payload: linux/x64/meterpreter/reverse_tcp\nExploit running",
+        success=True,
+    )
+    assert s.compromise_evidence == []
+    assert all(item.get("test_state") != "exploited" for item in s.discovered_services)
+
+
 def test_failed_command_does_not_settle():
     orch = make_orch()
     s = _sess(); orch.sessions[s.session_id] = s

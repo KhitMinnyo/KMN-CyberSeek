@@ -20,6 +20,7 @@ def test_is_private_ip():
     assert cb.is_private_ip("10.0.0.5") is True
     assert cb.is_private_ip("172.16.4.4") is True
     assert cb.is_private_ip("127.0.0.1") is True
+    assert cb.is_private_ip("192.168.100.0/24") is True
     assert cb.is_private_ip("8.8.8.8") is False
     assert cb.is_private_ip("example.com") is False   # hostname -> treated public
     assert cb.is_private_ip("") is False

@@ -124,8 +124,18 @@ NVD_MIN_INTERVAL=6.5     # seconds between NVD calls when no key is set
 MSF_CVE_RESOLVE=true     # resolve CVE -> Metasploit module via local msfconsole
 MSF_CVE_RESOLVE_LIMIT=3  # how many top-priority CVEs to resolve per pass
 
+# Optional session-aware Metasploit RPC transport. Leave empty to use the
+# managed msfconsole transport. Requires msgrpc and the msgpack dependency.
+MSFRPC_URL=
+MSFRPC_USER=msf
+MSFRPC_PASSWORD=
+MSFRPC_TOKEN=
+
 # Scan / command timeouts (seconds)
 SCAN_TIMEOUT=300
+# Use Nmap OS fingerprinting when the backend has raw-packet privileges; the
+# framework falls back to service/banner evidence for unprivileged runs.
+NMAP_OS_DETECTION=true
 VULN_SCAN_TIMEOUT=120
 VULN_SCAN_CONCURRENCY=4  # bounded parallel per-port NSE scans
 COMMAND_TIMEOUT=600

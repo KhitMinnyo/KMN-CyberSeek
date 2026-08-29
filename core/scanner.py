@@ -70,6 +70,108 @@ async def _run_shell_bounded(cmd: str, timeout: int, cwd: str = "/tmp"
 _CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 
 
+def classify_os(os_guess: str = "", ports: Optional[List[Dict]] = None) -> Dict:
+    """Classify a host using explicit OS and service evidence.
+
+    SMB is deliberately not treated as a Windows signal by itself: Samba is
+    common on Linux lab targets, including Metasploitable.  The result is a
+    hypothesis with evidence and confidence, not an assertion that an LLM can
+    silently override.
+    """
+    guess = (os_guess or "").lower()
+    ports = ports or []
+    linux_score = 0
+    windows_score = 0
+    linux_evidence: List[str] = []
+    windows_evidence: List[str] = []
+
+    def add(family: str, score: int, evidence: str) -> None:
+        nonlocal linux_score, windows_score
+        if family == "linux":
+            linux_score += score
+            linux_evidence.append(evidence)
+        else:
+            windows_score += score
+            windows_evidence.append(evidence)
+
+    for marker in ("linux", "unix", "ubuntu", "debian", "red hat", "centos",
+                   "fedora", "freebsd", "openbsd", "suse"):
+        if marker in guess:
+            add("linux", 5, f"Nmap OS guess contains {marker}")
+    for marker in ("windows", "microsoft", "windows server", "win32", "win64"):
+        if marker in guess:
+            add("windows", 5, f"Nmap OS guess contains {marker}")
+
+    linux_services = ("openssh", "ssh", "vsftpd", "proftpd", "apache", "nginx",
+                      "httpd", "cups", "rpcbind", "postfix", "dovecot", "samba")
+    windows_services = ("ms-wbt-server", "msrpc", "microsoft-ds", "netbios-ssn",
+                        "winrm", "iis")
+    for port in ports:
+        service = f"{port.get('service', '')} {port.get('version', '')}".lower()
+        try:
+            number = int(port.get("port"))
+        except (TypeError, ValueError):
+            number = 0
+        if any(marker in service for marker in linux_services):
+            add("linux", 2, f"Linux service/banner: {service.strip()[:90]}")
+        if any(marker in service for marker in windows_services):
+            # Generic SMB service names are weak evidence and are outweighed by
+            # an explicit Unix/Linux service or OS fingerprint.
+            weight = 3 if any(marker in service for marker in ("ms-wbt-server", "msrpc", "winrm", "iis")) else 1
+            add("windows", weight, f"Windows service/banner: {service.strip()[:90]}")
+        if number in (22, 21, 631):
+            add("linux", 1, f"Unix-typical open port: {number}")
+        if number in (3389, 5985, 5986):
+            add("windows", 2, f"Windows-typical open port: {number}")
+
+    if linux_score == windows_score:
+        family = "unknown"
+        confidence = 0.0
+    else:
+        family = "linux" if linux_score > windows_score else "windows"
+        lead = abs(linux_score - windows_score)
+        confidence = min(0.98, 0.55 + (0.08 * lead))
+        # A weak service-only result should remain visibly uncertain.
+        if max(linux_score, windows_score) < 3:
+            confidence = min(confidence, 0.60)
+
+    evidence = linux_evidence if family == "linux" else windows_evidence
+    if family == "unknown":
+        evidence = linux_evidence + windows_evidence
+    arch_text = f"{guess} " + " ".join(
+        f"{port.get('service', '')} {port.get('version', '')}" for port in ports
+    ).lower()
+    if re.search(r"\b(?:x86_64|amd64|x64|64-bit|64 bit)\b", arch_text):
+        architecture = "x64"
+        architecture_confidence = 0.90
+        architecture_evidence = "OS/service evidence contains x64/64-bit marker"
+    elif re.search(r"\b(?:i[3-6]86|x86|i386|32-bit|32 bit)\b", arch_text):
+        architecture = "x86"
+        architecture_confidence = 0.85
+        architecture_evidence = "OS/service evidence contains x86/32-bit marker"
+    elif re.search(r"\b(?:aarch64|arm64)\b", arch_text):
+        architecture = "arm64"
+        architecture_confidence = 0.90
+        architecture_evidence = "OS/service evidence contains arm64 marker"
+    elif re.search(r"\b(?:armv[5-8]|arm)\b", arch_text):
+        architecture = "arm"
+        architecture_confidence = 0.75
+        architecture_evidence = "OS/service evidence contains ARM marker"
+    else:
+        architecture = "unknown"
+        architecture_confidence = 0.0
+        architecture_evidence = ""
+
+    return {
+        "os_family": family,
+        "os_confidence": round(confidence, 2),
+        "os_evidence": list(dict.fromkeys(evidence))[:12],
+        "architecture": architecture,
+        "architecture_confidence": architecture_confidence,
+        "architecture_evidence": architecture_evidence,
+    }
+
+
 def _invalid_target_result(target: str, extra_fields: Optional[Dict] = None) -> Dict:
     """Build a standard failure response for a target that fails validation,
     instead of ever letting it reach a shell command string."""
@@ -132,16 +234,32 @@ class Scanner:
         # the engagement then has no attack surface and the loop fast-forwards
         # through every stage with nothing to do. -Pn makes nmap scan the ports
         # regardless. (Subnet ping-sweep uses -sn separately and is unaffected.)
+        # OS fingerprinting needs raw-packet privileges.  Keep service/banner
+        # classification available for unprivileged runs instead of making the
+        # whole scan fail with Nmap's "requires root" error.
+        _os_detection = ""
+        if os.getenv("NMAP_OS_DETECTION", "true").lower() == "true":
+            try:
+                _os_detection = "-O --osscan-guess" if os.geteuid() == 0 else ""
+            except AttributeError:
+                _os_detection = ""
+
         scan_profiles = {
             "quick":    f"-Pn -T4 -F --open {_bound}",                          # top 100, fast
-            "default":  f"-Pn -T4 -sV --top-ports 1000 --open {_bound}",        # top 1000, no scripts
-            "full":     f"-Pn -T4 -sV -sC --top-ports 5000 --open {_bound}",    # top 5000 + scripts
+            "default":  f"-Pn -T4 -sV {_os_detection} --top-ports 1000 --open {_bound}",
+            "full":     f"-Pn -T4 -sV -sC {_os_detection} --top-ports 5000 --open {_bound}",
             "stealth":  f"-Pn -sS -T2 -sV --top-ports 1000 --open {_bound}",    # stealth SYN
             "vuln":     f"-Pn -T4 -sV --script vuln --top-ports 1000 {_bound}", # vuln NSE
-            "allports": f"-Pn -T4 -sV -sC -p- --open {_bound}",                 # all 65535 (slow!)
+            "allports": f"-Pn -T4 -sV -sC {_os_detection} -p- --open {_bound}", # all 65535 (slow!)
         }
 
-        scan_options = scan_profiles.get(scan_type, scan_profiles["default"])
+        # perform_service_discovery() may pass a fully formed option string for
+        # a known port set; do not silently replace it with the default top-1000
+        # profile.
+        scan_options = (
+            scan_type if isinstance(scan_type, str) and scan_type.lstrip().startswith("-")
+            else scan_profiles.get(scan_type, scan_profiles["default"])
+        )
 
         try:
             # target is validated above; shlex.quote is defense-in-depth against injection.
@@ -256,7 +374,10 @@ class Scanner:
                         "status": "unknown",
                         "ports": [],
                         "os_guess": None,
-                        "os_accuracy": 0
+                        "os_accuracy": 0,
+                        "os_family": "unknown",
+                        "os_confidence": 0.0,
+                        "os_evidence": []
                     }
                     continue
                 
@@ -289,10 +410,18 @@ class Scanner:
                         if service != "closed" and service != "filtered":
                             results["summary"]["services_found"] += 1
                     
-                    # Parse OS detection
-                    if "OS details:" in line or "Aggressive OS guesses:" in line:
+                    # Parse OS detection.  -O is optional on unprivileged hosts,
+                    # so also consume Running/Service Info lines emitted by -sV.
+                    if ("OS details:" in line or "Aggressive OS guesses:" in line
+                            or line.startswith("Running:")
+                            or line.startswith("Service Info: OS:")):
                         os_info = line.split(":", 1)[1].strip()
-                        current_host["os_guess"] = os_info
+                        if line.startswith("Service Info: OS:"):
+                            os_info = os_info.split(";", 1)[0].strip()
+                        current_host["os_guess"] = (
+                            f"{current_host['os_guess']}; {os_info}"
+                            if current_host.get("os_guess") else os_info
+                        )
                         
                         # Try to extract accuracy
                         accuracy_match = re.search(r'\((\d+)%\)', os_info)
@@ -302,6 +431,9 @@ class Scanner:
             # Add the last host if exists
             if current_host:
                 results["hosts"].append(current_host)
+
+            for host in results["hosts"]:
+                host.update(classify_os(host.get("os_guess", ""), host.get("ports", [])))
             
             results["summary"]["total_hosts"] = len(results["hosts"])
             

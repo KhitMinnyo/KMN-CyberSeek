@@ -38,6 +38,13 @@ def test_classify_network_and_db_services():
     assert "mysql" in pb.classify_service({"service": "mysql", "port": 3306, "version": "MariaDB 5.5"})
     assert "rdp" in pb.classify_service({"service": "ms-wbt-server", "port": 3389})
     assert "winrm" in pb.classify_service({"service": "http", "port": 5985})
+    assert "tomcat" in pb.classify_service({"service": "ajp13", "port": 8009})
+    assert "postgresql" in pb.classify_service({"service": "postgresql", "port": 5432})
+    assert "redis" in pb.classify_service({"service": "unknown", "port": 6379})
+    assert "rmi" in pb.classify_service({"service": "java-rmi", "port": 1099})
+    assert "nfs" in pb.classify_service({"service": "nfs", "port": 2049})
+    assert "vnc" in pb.classify_service({"service": "vnc", "port": 5900})
+    assert "ipp" in pb.classify_service({"service": "ipp", "port": 631})
 
 
 def test_classify_falls_back_to_generic():
@@ -70,6 +77,8 @@ def test_applies_if_gates_wordpress_and_webdav():
     wpscan = next(s for s in steps if s.id == "http.wpscan")
     assert wpscan.applies_if({"tech": ["WordPress 5.0"]}) is True
     assert wpscan.applies_if({"tech": ["Apache"]}) is False
+    webdav = next(s for s in steps if s.id == "http.webdav")
+    assert webdav.applies_if({"tech": ["WebDAV"]}) is True
 
 
 def test_get_steps_dedups_across_keys():

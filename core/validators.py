@@ -142,6 +142,7 @@ ALLOWED_BINARIES = {
     "wpscan", "joomscan", "droopescan", "cmseek",
     "sqlmap", "ghauri", "commix", "xsser", "dalfox", "arjun",
     "nuclei", "jaeles",
+    "davtest",
     "nosqlmap", "jwt_tool", "jwttool",
     "burpsuite", "zaproxy", "mitmproxy",
     "cutycapt", "wkhtmltoimage",
@@ -162,7 +163,7 @@ ALLOWED_BINARIES = {
     "beef-xss",
 
     # ── SMB / Windows / Active Directory ────────────────────────────────
-    "smbclient", "smbmap", "smbget", "ftp", "mysql", "psql", "redis-cli",
+    "smbclient", "smbmap", "smbget", "ftp", "mysql", "psql", "redis-cli", "showmount",
     "enum4linux", "enum4linux-ng",
     "rpcclient", "net", "rpcinfo",
     "ldapsearch", "ldapdomaindump", "ldapmodify", "ldapadd",
@@ -364,7 +365,12 @@ def is_allowlisted_command(command: Optional[str]) -> Optional[str]:
             # The loop declaration has no executable binary yet. Its body is
             # validated when the following `do` segment is encountered.
             continue
+        # Shell keywords can precede a command-local assignment, e.g.
+        # `do user="..."; echo ...`. Skip both in that order before checking
+        # the actual executable binary.
         while idx < len(tokens) and tokens[idx] in shell_words:
+            idx += 1
+        while idx < len(tokens) and _ENV_ASSIGNMENT_RE.match(tokens[idx]):
             idx += 1
         # Skip a leading sudo
         if idx < len(tokens) and tokens[idx] == "sudo":
