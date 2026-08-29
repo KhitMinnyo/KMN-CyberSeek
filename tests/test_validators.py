@@ -75,6 +75,10 @@ def test_allowlist_preserves_quoted_arguments_and_shell_loops():
     assert is_allowlisted_command(
         "ftp -n 10.0.0.5 <<EOF\nuser anonymous test@example.com\nquit\nEOF"
     ) is None
+    assert is_allowlisted_command(
+        "for cred in 'root:' 'root:root'; do u=\"${cred%%:*}\"; "
+        "p=\"${cred#*:}\"; mysql -h 10.0.0.5 -u \"$u\" -p\"$p\" -e 'SELECT 1;'; done"
+    ) is None
 
 
 def test_allowlist_empty_command():

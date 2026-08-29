@@ -18,7 +18,7 @@ import time
 import uuid
 import zipfile
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 # ---------------------------------------------------------------------------
 # Credential extraction patterns
@@ -42,7 +42,7 @@ _CRED_PATTERNS: List[re.Pattern] = [
 ]
 
 from ai.connector import KMN_AI_Connector, AIResponse
-from core.scanner import Scanner
+from core.scanner import Scanner, classify_os
 from core.memory_index import FindingsIndex
 from core.validators import is_valid_target, is_target_in_scope, is_allowlisted_command, is_cidr
 from core import cve_lookup
@@ -54,7 +54,9 @@ from core import vuln_validate as _vuln_validate
 from core import exploit_map as _exploit_map
 from core import callback as _callback
 from core import msf_resolver as _msf_resolver
+from core import pivot as _pivot
 from core.bruteforce_worker import BruteforceWorker
+from core.msf_rpc import MsfRpcClient
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +131,60 @@ _EXPLOIT_STAGES = frozenset({
     "lateral_movement",
     "credential_reuse",
 })
+
+
+_MSF_COMMAND_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])msf(?:console|venom|db|rpc|rpcd|pattern_create|pattern_offset)\b",
+    re.IGNORECASE,
+)
+_CURL_COMMAND_RE = re.compile(r"(?<![A-Za-z0-9_-])curl(?:\s|$)", re.IGNORECASE)
+
+
+def _is_msf_command(command: str) -> bool:
+    """Return True when a command invokes a Metasploit CLI component."""
+    return bool(_MSF_COMMAND_RE.search(command or ""))
+
+
+def _is_curl_command(command: str) -> bool:
+    """Return True when curl is one of the commands in a shell command line."""
+    return bool(_CURL_COMMAND_RE.search(command or ""))
+
+
+def _command_risk_level(command: str, model_risk: Optional[str] = None) -> str:
+    """Normalize the displayed/execution risk for known framework commands.
+
+    Curl and Metasploit are approved medium-tier tools in this application.
+    Their non-interactive and binary allowlist gates still apply; this only
+    prevents the model from turning every request into a second approval gate.
+    """
+    if _is_msf_command(command) or _is_curl_command(command):
+        return "medium"
+    risk = (model_risk or "unknown").lower()
+    return risk if risk in {"low", "medium", "high"} else "unknown"
+
+
+def _route_msf_to_managed_handler(command: str, session: "Session") -> str:
+    """Make an MSF exploit use the session's persistent external handler.
+
+    A one-shot ``msfconsole -x`` otherwise creates its own payload handler. That
+    handler is destroyed with the console and its sessions never reach the
+    Shells tab. ``DisablePayloadHandler true`` makes the exploit's payload call
+    back to the already-running managed multi/handler instead.
+    """
+    if not _is_msf_command(command) or not session.exploit_lhost:
+        return command
+    lower = command.lower()
+    if "multi/handler" in lower or "disablepayloadhandler" in lower:
+        return command
+    if not re.search(r"\b(?:exploit|run)(?:\s+-[a-z0-9-]+)*\b", command, re.IGNORECASE):
+        return command
+    return re.sub(
+        r"(;\s*)(exploit|run)(?=\s|$)",
+        r"\1set DisablePayloadHandler true; \2",
+        command,
+        count=1,
+        flags=re.IGNORECASE,
+    )
 
 
 def _advance_stage(current: str, proposed: str) -> str:
@@ -206,27 +262,6 @@ _SERVICE_STATE_ORDER: Dict[str, int] = {
     "exploited": 3,
 }
 
-# Output signals that a service was not merely probed but actually compromised /
-# yielded sensitive data — used to promote a service straight to 'exploited'.
-#
-# These are intentionally NARROW. Broad words like "password", "hash", "200 ok",
-# and "database" were removed because they appear in normal recon output (web login
-# pages, whatweb CMS detection, HTTP status lines) and would incorrectly mark
-# services as exploited after routine enumeration.
-_EXPLOIT_SIGNALS = (
-    "meterpreter",
-    "session opened",
-    "session 1 opened",
-    "shell opened",
-    "command shell session",
-    "uid=0",                    # root shell (not generic uid=www-data etc.)
-    "pwn3d",                    # crackmapexec success marker
-    "root@",                    # root prompt in captured output
-    "reverse shell",
-    "dumped",                   # credential dump tools (secretsdump, mimikatz)
-    "flag{",                    # CTF-style flag capture
-)
-
 # Commands that merely ENUMERATE and routinely print "NT AUTHORITY\SYSTEM" (as a
 # well-known SID) — these must NOT be treated as a compromise on that string alone.
 _ENUM_ONLY_TOOLS = (
@@ -255,6 +290,37 @@ def _is_windows_rce_proof(command: str, output: str) -> bool:
     if any(t in c for t in _ENUM_ONLY_TOOLS):
         return False
     return True
+
+
+def _matched_compromise_signals(command: str, output: str) -> List[str]:
+    """Return only positive, command-aware compromise proof signals.
+
+    Words such as ``shell``, ``dumped`` and ``reverse shell`` occur in tool
+    banners, help text, and failed exploit messages. They are leads, not proof.
+    """
+    c = (command or "").lower()
+    o = (output or "").lower()
+    matched: List[str] = []
+    if re.search(r"(?:meterpreter|command shell)\s+session\s+\d+\s+opened", o):
+        matched.append("session opened")
+    if re.search(r"\buid=0\([^\n)]*\)", o):
+        matched.append("uid=0")
+    if "root@" in o:
+        matched.append("root@")
+    if "pwn3d" in o and re.search(r"\b(?:crackmapexec|cme|nxc)\b", c):
+        matched.append("pwn3d")
+    if "flag{" in o:
+        matched.append("flag{")
+
+    # In-band web RCE is a valid foothold even when no reverse shell exists,
+    # but only when the request is an execution endpoint and it returns a Unix
+    # identity. A generic curl response containing the word `root` is not enough.
+    inband_endpoint = bool(re.search(
+        r"(?:shell\.php|[?&](?:cmd|exec|command)=|scripttext|script_console)", c
+    ))
+    if inband_endpoint and re.search(r"\buid=\d+\([^\n)]*\)", o):
+        matched.append("in-band-rce")
+    return list(dict.fromkeys(matched))
 
 
 def _detect_privilege_level(output: str) -> Optional[str]:
@@ -339,6 +405,18 @@ class Session:
         self.scan_results: List[Dict] = []
         self.discovered_hosts: List[Dict] = []
         self.discovered_services: List[Dict] = []
+        # Evidence-based target OS hypothesis.  This is deliberately separate
+        # from the LLM's attack_phase so payload selection cannot rely on a guess.
+        self.target_os: str = "unknown"
+        self.target_os_confidence: float = 0.0
+        self.target_os_evidence: List[str] = []
+        self.target_architecture: str = "unknown"
+        self.target_architecture_confidence: float = 0.0
+        self.target_architecture_evidence: str = ""
+        self.host_states: Dict[str, Dict] = {}
+        self.pivot_routes: List[Dict] = []
+        self.port_forwards: List[Dict] = []
+        self.socks_proxies: List[Dict] = []
         self.credentials: List[Dict] = []
         self.commands_executed: List[Dict] = []
         self.ai_decisions: List[Dict] = []
@@ -502,6 +580,16 @@ class Session:
             "scan_results_count": len(self.scan_results),
             "discovered_hosts_count": len(self.discovered_hosts),
             "discovered_services_count": len(self.discovered_services),
+            "target_os": self.target_os,
+            "target_os_confidence": self.target_os_confidence,
+            "target_os_evidence": self.target_os_evidence,
+            "target_architecture": self.target_architecture,
+            "target_architecture_confidence": self.target_architecture_confidence,
+            "target_architecture_evidence": self.target_architecture_evidence,
+            "host_states": self.host_states,
+            "pivot_routes": self.pivot_routes,
+            "port_forwards": self.port_forwards,
+            "socks_proxies": self.socks_proxies,
             "credentials_count": len(self.credentials),
             "commands_executed_count": len(self.commands_executed),
             "ai_decisions_count": len(self.ai_decisions),
@@ -571,6 +659,9 @@ class Orchestrator:
         # Each manager holds the persistent msfconsole multi/handler process(es)
         # and tracks active meterpreter/shell connections for that session.
         self._shell_managers: Dict[str, ShellManager] = {}
+        # Optional session-aware transport. It is only enabled when MSFRPC_URL
+        # is configured; the console handler remains the default.
+        self._msf_rpc = MsfRpcClient.from_env()
 
         # Reverse-shell callback tunnels (e.g. an ngrok process) keyed by
         # session_id, so they can be torn down when the session ends.
@@ -617,6 +708,7 @@ class Orchestrator:
         # queued into self._sessions_to_auto_resume so the caller can restart
         # their AI loop after the event loop is running (see auto_resume_sessions).
         self._sessions_to_auto_resume: list = []
+        self._commands_to_auto_resume: list = []
         self._restore_sessions()
 
         # Load the threat-intel reference cache
@@ -640,7 +732,8 @@ class Orchestrator:
                     status TEXT NOT NULL,
                     current_stage TEXT NOT NULL,
                     auto_approve BOOLEAN DEFAULT FALSE,
-                    authorization_confirmed BOOLEAN DEFAULT FALSE
+                     authorization_confirmed BOOLEAN DEFAULT FALSE,
+                     pivot_state TEXT DEFAULT '{}'
                 )
             ''')
 
@@ -678,6 +771,7 @@ class Orchestrator:
                 ("scope_allowlist", "TEXT DEFAULT ''"),
                 ("last_activity_at", "TEXT DEFAULT ''"),
                 ("pause_reason", "TEXT DEFAULT ''"),
+                ("pivot_state", "TEXT DEFAULT '{}'"),
             ]:
                 try:
                     cursor.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_def}")
@@ -706,11 +800,25 @@ class Orchestrator:
                     status TEXT NOT NULL,
                     output TEXT,
                     risk_level TEXT,
+                    execution_channel TEXT DEFAULT 'local',
+                    handler_id TEXT,
+                    msf_id INTEGER,
                     timestamp TIMESTAMP NOT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions (session_id)
                 )
             ''')
-            
+            for col_name, col_def in [
+                ("execution_channel", "TEXT DEFAULT 'local'"),
+                ("handler_id", "TEXT"),
+                ("msf_id", "INTEGER"),
+            ]:
+                try:
+                    cursor.execute(
+                        f"ALTER TABLE commands ADD COLUMN {col_name} {col_def}"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+
             # Create evidence table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS evidence (
@@ -822,9 +930,23 @@ class Orchestrator:
                     confidence  REAL,
                     attack_phase TEXT,
                     context     TEXT,
+                    execution_channel TEXT DEFAULT 'local',
+                    handler_id  TEXT,
+                    msf_id      INTEGER,
                     FOREIGN KEY (session_id) REFERENCES sessions (session_id)
                 )
             ''')
+            for col_name, col_def in [
+                ("execution_channel", "TEXT DEFAULT 'local'"),
+                ("handler_id", "TEXT"),
+                ("msf_id", "INTEGER"),
+            ]:
+                try:
+                    cursor.execute(
+                        f"ALTER TABLE ai_decisions ADD COLUMN {col_name} {col_def}"
+                    )
+                except sqlite3.OperationalError:
+                    pass
 
             # Shell handler config — persists LHOST/LPORT/payload so the user
             # can restart a handler with the same settings after a backend restart.
@@ -1162,8 +1284,9 @@ class Orchestrator:
             cursor.execute(
                 """INSERT INTO ai_decisions
                        (session_id, timestamp, reasoning, suggested_command,
-                        risk_level, confidence, attack_phase, context)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        risk_level, confidence, attack_phase, context,
+                        execution_channel, handler_id, msf_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     decision.get("timestamp", datetime.now().isoformat()),
@@ -1173,6 +1296,9 @@ class Orchestrator:
                     decision.get("confidence"),
                     decision.get("attack_phase"),
                     decision.get("context"),
+                    decision.get("execution_channel", "local"),
+                    decision.get("handler_id"),
+                    decision.get("msf_id"),
                 ),
             )
             conn.commit()
@@ -1366,6 +1492,7 @@ class Orchestrator:
             ]
             self._merge_hosts(session, discovered_hosts)
             self._merge_services(session, discovered_hosts)
+            self._refresh_target_os(session)
             self._sync_asset_graph(session)
 
             # Coverage engine: seed per-service playbooks from the scan (no-op off).
@@ -1701,6 +1828,7 @@ class Orchestrator:
                     before = len(session.discovered_services)
                     self._merge_hosts(session, new_hosts)
                     self._merge_services(session, new_hosts)
+                    self._refresh_target_os(session)
                     self._sync_asset_graph(session)
                     self._ensure_coverage(session)          # seed playbooks for new svcs
                     self._recompute_coverage_progress(session)
@@ -1742,30 +1870,42 @@ class Orchestrator:
             metadata={"service_count": len(session.discovered_services)},
         )
 
-        # Collect open ports and build a port→service lookup once.
-        open_ports = sorted({
-            p['port'] for h in session.discovered_hosts
-            for p in h.get('ports', [])
-            if p.get('state') == 'open'
+        # Collect host/port pairs. Port-only keys corrupt findings when two lab
+        # hosts expose the same service (for example both have SMB on 445).
+        open_targets = sorted({
+            (h.get("ip") or h.get("host") or session.target_ip, p["port"])
+            for h in session.discovered_hosts
+            for p in h.get("ports", [])
+            if p.get("state") == "open" and p.get("port")
         })
-        port_to_service: Dict[int, Dict] = {
-            s['port']: s for s in session.discovered_services
+        service_by_target = {
+            (s.get("host") or session.target_ip, s.get("port")): s
+            for s in session.discovered_services
         }
+
+        def _vuln_marker(host: str, port: int) -> str:
+            safe_host = re.sub(r"[^A-Za-z0-9_.-]", "_", str(host))
+            return f"nmap_vuln_{safe_host}_p{port}"
+
+        def _vuln_scan_done(host: str, port: int) -> bool:
+            marker = _vuln_marker(host, port)
+            return self._scan_already_done(session_id, marker) or (
+                host == session.target_ip
+                and self._scan_already_done(session_id, f"nmap_vuln_p{port}")
+            )
 
         # ── 1. Per-port nmap NSE vuln scan ───────────────────────────────────
         # Each port is scanned individually with its own timeout so a single slow
         # port (e.g. a heavily filtered SMB) cannot starve all others.
-        if open_ports:
+        if open_targets:
             logger.info(
-                f"[{session_id}] Per-port NSE vuln scan: {len(open_ports)} port(s) — "
-                f"{[p for p in open_ports if not self._scan_already_done(session_id, f'nmap_vuln_p{p}')]}"
+                f"[{session_id}] Per-host/port NSE vuln scan: {len(open_targets)} target(s) — "
+                f"{[(h, p) for h, p in open_targets if not _vuln_scan_done(h, p)]}"
                 f" pending (already done: "
-                f"{[p for p in open_ports if self._scan_already_done(session_id, f'nmap_vuln_p{p}')]})"
+                f"{[(h, p) for h, p in open_targets if _vuln_scan_done(h, p)]})"
             )
-            pending_ports = [
-                port for port in open_ports
-                if not self._scan_already_done(session_id, f"nmap_vuln_p{port}")
-            ]
+            pending_targets = [(host, port) for host, port in open_targets
+                               if not _vuln_scan_done(host, port)]
             try:
                 vuln_concurrency = max(
                     1, int(os.getenv("VULN_SCAN_CONCURRENCY", "4"))
@@ -1774,35 +1914,36 @@ class Orchestrator:
                 vuln_concurrency = 4
             vuln_sem = asyncio.Semaphore(vuln_concurrency)
 
-            async def _scan_vuln_port(port: int):
+            async def _scan_vuln_target(host: str, port: int):
                 async with vuln_sem:
                     try:
-                        return port, await self.scanner.perform_vulnerability_scan_port(
-                            session.target_ip, port
+                        return host, port, await self.scanner.perform_vulnerability_scan_port(
+                            host, port
                         )
                     except Exception as exc:
                         logger.warning(
-                            f"[{session_id}] NSE scan failed for port {port}: {exc}"
+                            f"[{session_id}] NSE scan failed for {host}:{port}: {exc}"
                         )
-                        return port, {
+                        return host, port, {
                             "port": port, "success": False,
                             "error": str(exc), "vulnerabilities": [],
                         }
 
             scan_results = await asyncio.gather(
-                *(_scan_vuln_port(port) for port in pending_ports)
+                *(_scan_vuln_target(host, port) for host, port in pending_targets)
             )
-            for port, result in scan_results:
-                marker = f"nmap_vuln_p{port}"
+            for host, port, result in scan_results:
+                marker = _vuln_marker(host, port)
                 # Save marker FIRST (even on failure) to preserve true resume.
                 self._save_scan_results(session_id, marker, {
+                    "host": host,
                     "port": port, "success": result.get("success"),
                     "vuln_count": len(result.get("vulnerabilities", []))
                 })
-                svc = port_to_service.get(port, {})
+                svc = service_by_target.get((host, port), {})
                 for finding in result.get("vulnerabilities", []):
                     self.add_vulnerability(session_id, {
-                        "host": session.target_ip,
+                        "host": host,
                         "port": port,
                         "service": svc.get("service"),
                         "service_version": svc.get("version"),
@@ -1823,7 +1964,7 @@ class Orchestrator:
             version = (svc.get('version') or '').strip()
             if not svc_name or svc_name.lower() in ('unknown', ''):
                 continue
-            _svc_key = f"{svc_name.lower()}_{version.lower()}"[:55]
+            _svc_key = f"{svc.get('host', session.target_ip)}_{svc_name.lower()}_{version.lower()}"[:80]
             marker = f"ss_{_svc_key}"
             if not self._scan_already_done(session_id, marker):
                 pending_searches.append((svc, svc_name, version, marker))
@@ -1880,7 +2021,7 @@ class Orchestrator:
                 continue
             if svc_name.lower() in _NVD_SKIP:
                 continue
-            _svc_key = f"{svc_name.lower()}_{version.lower()}"[:55]
+            _svc_key = f"{svc.get('host', session.target_ip)}_{svc_name.lower()}_{version.lower()}"[:80]
             marker = f"nvd_{_svc_key}"
             if self._scan_already_done(session_id, marker):
                 continue
@@ -1915,7 +2056,7 @@ class Orchestrator:
                 version  = (svc.get('version') or '').strip()
                 if not version or svc_name.lower() in ('unknown', ''):
                     continue
-                _svc_key = f"{svc_name.lower()}_{version.lower()}"[:55]
+                _svc_key = f"{svc.get('host', session.target_ip)}_{svc_name.lower()}_{version.lower()}"[:80]
                 marker = f"vul_{_svc_key}"
                 if self._scan_already_done(session_id, marker):
                     continue
@@ -2220,6 +2361,7 @@ class Orchestrator:
             # Callback reachability — for a NATed public target, steer the AI
             # toward tunnels or non-callback techniques before exploitation.
             _exhausted_ctx += self._reachability_context_block(session)
+            _exhausted_ctx += self._pivot_context_block(session)
 
             # Missing-tool advisory so the AI doesn't retry uninstalled tools.
             _exhausted_ctx += self._tools_context_block(session)
@@ -2250,11 +2392,14 @@ class Orchestrator:
                     "\n=== ACTIVE SHELL SESSIONS (USE THESE FOR POST-EXPLOITATION) ===\n"
                     + json.dumps(_active_shells, indent=2)
                     + "\nTo run a command in a session use the shell exec API — "
-                    "do NOT suggest new exploit commands if a shell already exists.\n"
+                    "return execution_channel='managed_shell' with the matching "
+                    "handler_id/msf_id and put the OS command in suggested_command. "
+                    "Do NOT suggest new exploit commands if a shell already exists.\n"
                 )
 
             context = f"""
 {_target_type_note}
+{self._target_os_context_block(session)}
 {_exhausted_ctx}
 {self._plan_context_block(session)}
 === TARGET CONTEXT ===
@@ -2321,13 +2466,18 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 return
 
             # Store AI decision
+            _cmd = (ai_response.suggested_command or "").strip()
+            _decision_risk = _command_risk_level(_cmd, ai_response.risk_level)
             decision = {
                 "timestamp": datetime.now().isoformat(),
                 "reasoning": ai_response.reasoning,
                 "suggested_command": ai_response.suggested_command,
-                "risk_level": ai_response.risk_level,
+                "risk_level": _decision_risk,
                 "confidence": ai_response.confidence,
-                "attack_phase": ai_response.attack_phase
+                "attack_phase": ai_response.attack_phase,
+                "execution_channel": getattr(ai_response, "execution_channel", "local"),
+                "handler_id": getattr(ai_response, "handler_id", None),
+                "msf_id": getattr(ai_response, "msf_id", None),
             }
             
             session.ai_decisions.append(decision)
@@ -2349,7 +2499,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
             # Update status based on auto-approve setting and risk level.
             # FULL_AUTO_MODE overrides: execute everything regardless of risk.
-            if FULL_AUTO_MODE or (session.auto_approve and ai_response.risk_level in ["low", "medium"]):
+            if FULL_AUTO_MODE or (session.auto_approve and _decision_risk in ["low", "medium"]):
                 session.status = "executing"
             else:
                 session.status = "ready"
@@ -2357,7 +2507,6 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # Persist stage + status so a restart resumes from the correct point.
             self._save_session_status(session_id, session)
 
-            _cmd = (ai_response.suggested_command or "").strip()
             logger.info(f"AI analysis completed for {session_id}, suggested command: {_cmd}")
 
             # Empty command → the loop would silently stall. Route to recovery.
@@ -2371,10 +2520,15 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # Kick off execution or queue for approval.
             # When auto_approve=True the session operator has accepted full autonomy —
             # treat it identically to FULL_AUTO_MODE (all risk levels auto-execute).
-            is_high_risk = self.requires_approval(_cmd) or ai_response.risk_level == "high"
+            is_high_risk = self.requires_approval(_cmd) or _decision_risk == "high"
             if safe_only or FULL_AUTO_MODE or (session.auto_approve and not is_high_risk):
                 automated_error = self._execution_gate(
-                    session_id, _cmd, execution_mode="ai_auto"
+                    session_id, _cmd,
+                    execution_mode=(
+                        "shell_auto"
+                        if getattr(ai_response, "execution_channel", "local") == "managed_shell"
+                        else "ai_auto"
+                    ),
                 )
                 if automated_error:
                     # A policy-only rejection can be reviewed and approved;
@@ -2390,7 +2544,12 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                         session.status = "ready"
                         self._save_session_status(session_id, session)
                     else:
-                        self.queue_for_approval(session_id, _cmd)
+                        self.queue_for_approval(
+                            session_id, _cmd,
+                            execution_channel=getattr(ai_response, "execution_channel", "local"),
+                            handler_id=getattr(ai_response, "handler_id", None),
+                            msf_id=getattr(ai_response, "msf_id", None),
+                        )
                         session.status = "ready"
                         self._save_session_status(session_id, session)
                         logger.info(
@@ -2400,11 +2559,18 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                     logger.info(f"Auto-executing initial command for session {session_id}: {_cmd[:100]}")
                     self._track_task(
                         session_id,
-                        self.execute_command(session_id, _cmd, execution_mode="ai_auto"),
+                        self._execute_ai_response(
+                            session_id, ai_response, execution_mode="ai_auto"
+                        ),
                         "ai_command",
                     )
             else:
-                self.queue_for_approval(session_id, _cmd)
+                self.queue_for_approval(
+                    session_id, _cmd,
+                    execution_channel=getattr(ai_response, "execution_channel", "local"),
+                    handler_id=getattr(ai_response, "handler_id", None),
+                    msf_id=getattr(ai_response, "msf_id", None),
+                )
                 if is_high_risk and not safe_only:
                     self._schedule_safe_followup(session)
                 logger.info(f"Initial command queued for approval: {_cmd[:100]}")
@@ -2423,6 +2589,13 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         specific (rm -rf, dd if=, crackmapexec) keep exact substring matching.
         """
         command_lower = command.lower()
+
+        # curl and non-interactive Metasploit are medium-tier tools in this
+        # engagement policy. Structural safety and the execution allowlist still
+        # apply, but these tools must not be promoted to HIGH by `exploit`,
+        # `shell.php`, or upload-related keywords.
+        if _is_curl_command(command) or _is_msf_command(command):
+            return False
 
         # Exact substring patterns — specific enough that substring match is fine.
         exact_patterns = [
@@ -2462,8 +2635,9 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         """
         command = command.strip()
         
-        # Check for msfconsole without -x flag (interactive mode)
-        if command.startswith("msfconsole") and "-x" not in command:
+        # Check for msfconsole without -x flag (interactive mode), including
+        # commands where it appears after a shell-chain operator.
+        if re.search(r"(?:^|[;&|]\s*)msfconsole\b", command) and "-x" not in command:
             return "Command rejected: You must use non-interactive mode (e.g., msfconsole -x \"...\")"
         
         # Check for python without -c flag (interactive mode)
@@ -2481,7 +2655,6 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             ("^bash$", "bash (interactive) - must use bash -c \"...\""),
         ]
         
-        import re
         for pattern, message in dangerous_patterns:
             if re.match(pattern, command):
                 return f"Command rejected: {message}"
@@ -2510,7 +2683,11 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         if safety_error:
             return safety_error
 
-        if execution_mode != "approved":
+        # Commands in a managed target shell are not local binaries. They still
+        # require authorization and non-interactive syntax, but the local Kali
+        # binary allowlist must not reject valid remote commands such as getuid,
+        # sysinfo, or id.
+        if execution_mode not in ("approved", "shell_auto"):
             allowlist_rejection = is_allowlisted_command(command)
             if allowlist_rejection:
                 return f"Command rejected by execution policy: {allowlist_rejection}"
@@ -2599,7 +2776,10 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
         return sanitized.strip()
     
-    def queue_for_approval(self, session_id: str, command: str) -> str:
+    def queue_for_approval(self, session_id: str, command: str,
+                           execution_channel: str = "local",
+                           handler_id: Optional[str] = None,
+                           msf_id: Optional[int] = None) -> str:
         """Queue a command for manual approval."""
         gate_error = self._execution_gate(session_id, command, "approved")
         if gate_error:
@@ -2611,7 +2791,13 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             "command": command,
             "status": "pending",
             "timestamp": datetime.now().isoformat(),
-            "requires_approval": self.requires_approval(command)
+            "requires_approval": self.requires_approval(command),
+            "risk_level": _command_risk_level(
+                command, "high" if self.requires_approval(command) else "medium"
+            ),
+            "execution_channel": execution_channel,
+            "handler_id": handler_id,
+            "msf_id": msf_id,
         }
         
         # Save to database
@@ -2619,9 +2805,13 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO commands (session_id, command_id, command_text, status, risk_level, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (session_id, command_id, command, "pending", "high" if self.requires_approval(command) else "low", datetime.now()))
+                INSERT INTO commands (
+                    session_id, command_id, command_text, status, risk_level,
+                    execution_channel, handler_id, msf_id, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (session_id, command_id, command, "pending",
+                  _command_risk_level(command, "high" if self.requires_approval(command) else "low"),
+                  execution_channel, handler_id, msf_id, datetime.now()))
             conn.commit()
             conn.close()
         except sqlite3.Error as e:
@@ -2629,6 +2819,21 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         
         logger.info(f"Command queued for approval: {command_id}")
         return command_id
+
+    def _queue_ai_response(self, session_id: str, response: AIResponse) -> str:
+        """Queue an AI action without losing its managed-shell routing metadata."""
+        channel = getattr(response, "execution_channel", "local") or "local"
+        if channel == "local" and not getattr(response, "handler_id", None) and getattr(response, "msf_id", None) is None:
+            # Keep the small two-argument seam usable by integrations/tests that
+            # replace queue_for_approval with a lightweight callback.
+            return self.queue_for_approval(session_id, response.suggested_command)
+        return self.queue_for_approval(
+            session_id,
+            response.suggested_command,
+            execution_channel=getattr(response, "execution_channel", "local"),
+            handler_id=getattr(response, "handler_id", None),
+            msf_id=getattr(response, "msf_id", None),
+        )
     
     def _inject_credentials(self, command: str, session) -> str:
         """Rewrite a command to embed known credentials so it runs non-interactively.
@@ -2754,6 +2959,27 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 command = command.replace(big, small)
         return command
 
+    @staticmethod
+    def _target_response_error(command: str, output: str) -> Optional[str]:
+        """Convert an HTTP failure marker into a failed target operation.
+
+        curl exits zero for HTTP 401/403/404/500 unless ``--fail`` is used. AI
+        decisions commonly add ``-w HTTP_CODE`` for evidence, so use the last
+        reported response code to stop a transport-successful 404 from becoming
+        a false exploitation success.
+        """
+        if not _is_curl_command(command):
+            return None
+        codes = re.findall(r"HTTP_CODE\s*:\s*(\d{3})", output or "", re.IGNORECASE)
+        if not codes:
+            return None
+        code = int(codes[-1])
+        if code == 0:
+            return "curl could not establish an HTTP connection (HTTP_CODE:000)"
+        if code >= 400:
+            return f"target returned HTTP {code}; requested endpoint/action was not successful"
+        return None
+
     async def execute_command(self, session_id: str, command: str,
                               execution_mode: str = "manual") -> Dict:
         """Execute a command and capture output."""
@@ -2824,6 +3050,10 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # Swap oversized brute-force wordlists for smaller ones so a single
             # gobuster/ffuf can't run for the full timeout on a 220k-line list.
             command = self._downsize_wordlists(command)
+            # Route one-shot MSF exploits to the persistent handler that the
+            # Shells tab monitors instead of letting the transient console own
+            # and then destroy the reverse session.
+            command = _route_msf_to_managed_handler(command, session)
 
             # Credential injection and wordlist rewriting change the command,
             # so the final command must pass the same gate immediately before
@@ -2959,6 +3189,13 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # Sanitize outputs to remove noise and truncate large outputs
             sanitized_output = self._sanitize_output(raw_output)
             sanitized_error = self._sanitize_output(raw_error)
+            self._update_target_fingerprint_from_output(
+                session, command, sanitized_output
+            )
+            target_error = self._target_response_error(command, sanitized_output)
+            command_success = return_code == 0 and target_error is None
+            if target_error and not sanitized_error:
+                sanitized_error = target_error
             
             # Log command execution
             command_record = {
@@ -2969,26 +3206,30 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 "error": sanitized_error,
                 "return_code": return_code,
                 "timestamp": datetime.now().isoformat(),
-                "success": return_code == 0
+                "success": command_success
             }
             
             session.commands_executed.append(command_record)
             if job_id:
-                self._update_job(job_id, "completed", exit_code=return_code)
+                self._update_job(job_id, "completed", exit_code=return_code,
+                                 error=target_error or "")
             self._record_event(session_id, "command_finished", {
                 "command_id": command_id, "job_id": job_id,
-                "success": return_code == 0, "return_code": return_code,
+                "success": command_success, "return_code": return_code,
             })
             
             # Save sanitized output to database
-            self._save_command_result(session_id, command_id, command, sanitized_output, sanitized_error, return_code)
+            self._save_command_result(
+                session_id, command_id, command, sanitized_output, sanitized_error,
+                return_code, success=command_success,
+            )
 
             # Auto-extract any credentials found in this command's output.
             self._extract_and_store_credentials(session_id, command, sanitized_output + "\n" + sanitized_error)
 
             # Settle the test-state of any service this command touched.
             self._settle_service_states(
-                session, command, sanitized_output, success=(return_code == 0)
+                session, command, sanitized_output, success=command_success
             )
 
             # Coverage engine: mark playbook steps this command attempted, and
@@ -2998,16 +3239,19 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # crackmapexec Pwn3d) — not merely on exit code 0, which most exploit
             # tools return even when they fail to compromise the target.
             _combined_out = (sanitized_output + "\n" + sanitized_error).lower()
-            _exploit_success = any(sig in _combined_out for sig in _EXPLOIT_SIGNALS)
+            _exploit_success = command_success and bool(
+                _matched_compromise_signals(command, _combined_out)
+            )
             self._ensure_coverage(session)
             self._update_coverage_from_command(
-                session, command, success=_exploit_success
+                session, command, success=command_success,
+                exploit_success=_exploit_success,
             )
             self._recompute_coverage_progress(session)
 
             # Feed this command's result into the hybrid retrieval index so it can
             # be surfaced later even after it falls out of the recent-history window.
-            if return_code == 0 and sanitized_output:
+            if command_success and sanitized_output:
                 finding_text = (
                     f"$ {command}\n{self._extract_command_summary(sanitized_output)}"
                 )
@@ -3051,7 +3295,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
             # If successful, analyze sanitized output with AI for next steps
             # If failed, analyze error with AI for correction (self-healing loop)
-            if return_code == 0 and sanitized_output:
+            if command_success and sanitized_output:
                 await self._process_command_output(session_id, command, sanitized_output, None)
             else:
                 await self._process_command_output(session_id, command, sanitized_output, sanitized_error)
@@ -3168,6 +3412,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 # SELF-HEALING / ERROR RECOVERY MODE
                 context = f"""
 {_target_type_note}
+{self._target_os_context_block(session)}
 
 {self._plan_context_block(session)}
 ### SELF-HEALING / ERROR RECOVERY REQUIRED ###
@@ -3236,7 +3481,7 @@ Subdomains found: {len(session.discovered_subdomains)}{f' — [{", ".join(sessio
 Web apps found: {len(session.web_applications)}{f' — [{", ".join(a.get("url","") for a in session.web_applications[:5])}]' if session.web_applications else ''}
 API endpoints: {len(session.discovered_api_endpoints)}
 Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
-{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._prioritized_cve_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}{self._reachability_context_block(session)}{self._tools_context_block(session)}
+{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._prioritized_cve_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}{self._reachability_context_block(session)}{self._pivot_context_block(session)}{self._tools_context_block(session)}
 Domain rule: If Target Domain is provided ({session.target_domain}), use domain name for all web tools — never IP.
 
 {self._get_relevant_threat_intel_context(session_id)}
@@ -3255,14 +3500,19 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 
             # Store AI decision — include attack_phase so the frontend timeline
             # can identify which stages actually had decisions (vs. skipped).
+            _suggested = (ai_response.suggested_command or "").strip()
+            _decision_risk = _command_risk_level(_suggested, ai_response.risk_level)
             decision = {
                 "timestamp": datetime.now().isoformat(),
                 "reasoning": ai_response.reasoning,
                 "suggested_command": ai_response.suggested_command,
-                "risk_level": ai_response.risk_level,
+                "risk_level": _decision_risk,
                 "confidence": ai_response.confidence,
                 "attack_phase": ai_response.attack_phase,
-                "context": "post_command_analysis"
+                "context": "post_command_analysis",
+                "execution_channel": getattr(ai_response, "execution_channel", "local"),
+                "handler_id": getattr(ai_response, "handler_id", None),
+                "msf_id": getattr(ai_response, "msf_id", None),
             }
 
             session.ai_decisions.append(decision)
@@ -3395,7 +3645,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 # command, run the VERIFIER pass. reject -> queue for manual
                 # approval; revise -> swap in the corrected command (re-validated
                 # by the allowlist backstop below on the next loop turn).
-                if should_auto_execute and ai_response.risk_level == "high":
+                if should_auto_execute and _decision_risk == "high":
                     vet = await self._vet_command(
                         session_id, ai_response.suggested_command, ai_response.reasoning or ""
                     )
@@ -3407,12 +3657,12 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         )
                         should_auto_execute = False
                         _queued_already = True
-                        self.queue_for_approval(session_id, ai_response.suggested_command)
+                        self._queue_ai_response(session_id, ai_response)
                         _d = {
                             "timestamp": datetime.now().isoformat(),
                             "reasoning": f"CRITIQUE REJECTED auto-exec: {vet['reason']}",
                             "suggested_command": ai_response.suggested_command,
-                            "risk_level": "high",
+                            "risk_level": _decision_risk,
                             "confidence": 1.0,
                             "context": "self_critique_reject",
                         }
@@ -3427,15 +3677,14 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 if should_auto_execute:
                     logger.info(
                         f"Session {session_id}: FULL_AUTO_MODE — auto-executing "
-                        f"[{ai_response.risk_level}] command: {ai_response.suggested_command[:100]}"
+                        f"[{_decision_risk}] command: {ai_response.suggested_command[:100]}"
                     )
             else:
                 # Session auto-approve covers routine LOW/MEDIUM work. HIGH-risk
                 # actions remain approval-gated unless explicit full-auto mode is on.
-                _suggested = ai_response.suggested_command or ""
                 _high_risk = (
                     self.requires_approval(_suggested)
-                    or ai_response.risk_level == "high"
+                    or _decision_risk == "high"
                 )
                 should_auto_execute = (
                     session.auto_approve and
@@ -3453,7 +3702,11 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 # so the final else block does NOT double-queue the same command.
                 _queued_already = False
                 if should_auto_execute:
-                    allowlist_rejection = is_allowlisted_command(ai_response.suggested_command)
+                    allowlist_rejection = (
+                        None
+                        if getattr(ai_response, "execution_channel", "local") == "managed_shell"
+                        else is_allowlisted_command(ai_response.suggested_command)
+                    )
                     if allowlist_rejection:
                         logger.warning(
                             f"Session {session_id}: blocking auto-execute — {allowlist_rejection}: "
@@ -3461,7 +3714,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         )
                         should_auto_execute = False
                         _queued_already = True
-                        self.queue_for_approval(session_id, ai_response.suggested_command)
+                        self._queue_ai_response(session_id, ai_response)
 
                 # Depth counter gate: pause auto-execution and require one manual
                 # approval after max_auto_depth consecutive non-critical commands.
@@ -3473,7 +3726,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     )
                     should_auto_execute = False
                     _queued_already = True
-                    self.queue_for_approval(session_id, ai_response.suggested_command)
+                    self._queue_ai_response(session_id, ai_response)
 
             # All automated paths share the same execution gate. A verifier
             # revision is checked here too, before it can be scheduled.
@@ -3481,7 +3734,11 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 policy_rejection = self._execution_gate(
                     session_id,
                     ai_response.suggested_command,
-                    execution_mode="ai_auto",
+                    execution_mode=(
+                        "shell_auto"
+                        if getattr(ai_response, "execution_channel", "local") == "managed_shell"
+                        else "ai_auto"
+                    ),
                 )
                 if policy_rejection:
                     logger.warning(
@@ -3510,10 +3767,21 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             session._empty_response_count = 0
 
             if should_auto_execute:
-                # Check for critical findings in output to reset auto depth counter
+                # Reset the auto-depth checkpoint only for actionable evidence.
+                # Generic words such as `root`, `shell`, `login`, or `password`
+                # are common in banners and error pages and previously kept the
+                # loop at depth zero forever.
                 output_lower = output.lower()
-                critical_keywords = ["vulnerable", "exploit", "password", "credential", "access", "login", "admin", "shell", "root"]
-                found_critical = any(keyword in output_lower for keyword in critical_keywords)
+                found_critical = bool(
+                    _matched_compromise_signals(
+                        command, output
+                    )
+                    or re.search(
+                        r"vulnerable:|account found|login successful|"
+                        r"authentication success|cve-\d{4}-\d{4,7}",
+                        output_lower,
+                    )
+                )
 
                 if found_critical:
                     session.auto_depth_counter = 0
@@ -3526,20 +3794,18 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 logger.info(f"Auto-executing command for session {session_id} (depth: {session.auto_depth_counter}): {ai_response.suggested_command[:100]}...")
                 self._track_task(
                     session_id,
-                    self.execute_command(
-                        session_id,
-                        ai_response.suggested_command,
-                        execution_mode="ai_auto",
+                    self._execute_ai_response(
+                        session_id, ai_response, execution_mode="ai_auto"
                     ),
                     "ai_command",
                 )
             elif not _queued_already:
                 # Manual mode or a HIGH-risk command. Keep the command pending,
                 # but continue safe work in a separate decision turn.
-                self.queue_for_approval(session_id, ai_response.suggested_command)
+                self._queue_ai_response(session_id, ai_response)
                 if (
                     (self.requires_approval(ai_response.suggested_command)
-                     or ai_response.risk_level == "high")
+                     or _decision_risk == "high")
                     and not safe_only
                 ):
                     self._schedule_safe_followup(session)
@@ -3597,13 +3863,26 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 self._save_session_status(session_id, session)
 
         # Execute the command asynchronously
-        self._track_task(
-            session_id,
-            self.execute_command(
-                session_id, command_data["command"], execution_mode="approved"
-            ),
-            "approved_command",
-        )
+        if command_data.get("execution_channel") == "managed_shell":
+            if not command_data.get("handler_id") or command_data.get("msf_id") is None:
+                raise ValueError("Managed-shell approval is missing handler/session metadata")
+            self._track_task(
+                session_id,
+                self.run_shell_command(
+                    session_id, command_data.get("handler_id"),
+                    int(command_data.get("msf_id")), command_data["command"],
+                    trigger_analysis=True,
+                ),
+                "approved_shell_command",
+            )
+        else:
+            self._track_task(
+                session_id,
+                self.execute_command(
+                    session_id, command_data["command"], execution_mode="approved"
+                ),
+                "approved_command",
+            )
         
         # Update database
         try:
@@ -3652,12 +3931,98 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 
     @staticmethod
     def _merge_hosts(session: "Session", new_hosts: List[Dict]) -> None:
-        """Add hosts to session.discovered_hosts, skipping IPs already present."""
-        existing_ips = {h["ip"] for h in session.discovered_hosts}
+        """Merge hosts while retaining improved OS evidence from later scans."""
+        existing = {h.get("ip"): h for h in session.discovered_hosts}
         for host in new_hosts:
-            if host.get("ip") not in existing_ips:
+            ip = host.get("ip")
+            if ip not in existing:
                 session.discovered_hosts.append(host)
-                existing_ips.add(host["ip"])
+                existing[ip] = host
+            else:
+                current = existing[ip]
+                for key in ("os_guess", "os_accuracy", "os_family", "os_confidence", "os_evidence",
+                            "architecture", "architecture_confidence", "architecture_evidence"):
+                    value = host.get(key)
+                    if value in (None, "", [], 0):
+                        continue
+                    if key in ("os_family", "architecture") and value == "unknown":
+                        if current.get(key) not in (None, "", "unknown"):
+                            continue
+                    if key in ("os_confidence", "os_accuracy", "architecture_confidence"):
+                        if value and value > (current.get(key) or 0):
+                            current[key] = value
+                    else:
+                        current[key] = value
+                if host.get("ports"):
+                    current["ports"] = host["ports"]
+
+    def _refresh_target_os(self, session: "Session") -> None:
+        """Refresh per-host OS facts and derive a safe session summary.
+
+        A CIDR may contain mixed Windows/Linux hosts; never use the first host's
+        OS as the subnet's OS. Exploitation code must select a concrete host.
+        """
+        session.host_states.clear()
+        for host in session.discovered_hosts:
+            host_ip = host.get("ip") or host.get("host")
+            if not host_ip:
+                continue
+            if not host.get("os_family") or host.get("os_family") == "unknown":
+                host.update(classify_os(host.get("os_guess", ""), host.get("ports", [])))
+            session.host_states[str(host_ip)] = {
+                "os_family": host.get("os_family", "unknown"),
+                "os_confidence": float(host.get("os_confidence") or 0.0),
+                "os_evidence": list(host.get("os_evidence") or [])[:12],
+                "architecture": host.get("architecture", "unknown"),
+                "architecture_confidence": float(host.get("architecture_confidence") or 0.0),
+                "architecture_evidence": host.get("architecture_evidence", ""),
+            }
+
+        candidates = [
+            session.host_states.get(str(session.target_ip))
+        ] if not is_cidr(session.target_ip) else []
+        if candidates and candidates[0]:
+            summary = candidates[0]
+        elif not is_cidr(session.target_ip) and session.host_states:
+            summary = next(iter(session.host_states.values()))
+        else:
+            families = {v["os_family"] for v in session.host_states.values()
+                        if v["os_family"] != "unknown"}
+            architectures = {v["architecture"] for v in session.host_states.values()
+                             if v["architecture"] != "unknown"}
+            summary = {
+                "os_family": next(iter(families)) if len(families) == 1 else ("mixed" if families else "unknown"),
+                "os_confidence": min((v["os_confidence"] for v in session.host_states.values()), default=0.0),
+                "os_evidence": [f"CIDR contains {len(families)} OS family/families"],
+                "architecture": next(iter(architectures)) if len(architectures) == 1 else ("mixed" if architectures else "unknown"),
+                "architecture_confidence": min((v["architecture_confidence"] for v in session.host_states.values()), default=0.0),
+                "architecture_evidence": "per-host architecture summary",
+            }
+        session.target_os = summary.get("os_family", "unknown")
+        session.target_os_confidence = float(summary.get("os_confidence") or 0.0)
+        session.target_os_evidence = list(summary.get("os_evidence") or [])[:12]
+        session.target_architecture = summary.get("architecture", "unknown")
+        session.target_architecture_confidence = float(summary.get("architecture_confidence") or 0.0)
+        session.target_architecture_evidence = summary.get("architecture_evidence", "")
+
+    def _update_target_fingerprint_from_output(self, session: "Session",
+                                               command: str, output: str) -> None:
+        """Upgrade OS/architecture state from an authenticated or Nmap result."""
+        c = (command or "").lower()
+        if not (c.startswith("nmap") or c.startswith("uname")
+                or c.startswith("systeminfo") or c.startswith("sysinfo")
+                or c.startswith("getuid") or c == "id"):
+            return
+        result = classify_os(output or "", [])
+        if result["os_family"] != "unknown" and result["os_confidence"] >= session.target_os_confidence:
+            session.target_os = result["os_family"]
+            session.target_os_confidence = result["os_confidence"]
+            session.target_os_evidence = result["os_evidence"]
+        if (result["architecture"] != "unknown"
+                and result["architecture_confidence"] >= session.target_architecture_confidence):
+            session.target_architecture = result["architecture"]
+            session.target_architecture_confidence = result["architecture_confidence"]
+            session.target_architecture_evidence = result["architecture_evidence"]
 
     @staticmethod
     def _merge_services(session: "Session", new_hosts: List[Dict]) -> None:
@@ -3758,11 +4123,16 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             conn = self._db_connect()
             conn.execute(
                 "UPDATE sessions SET current_stage = ?, status = ?, exhausted_services = ?, "
-                "scope_allowlist = ?, last_activity_at = ?, pause_reason = ? "
+                "scope_allowlist = ?, last_activity_at = ?, pause_reason = ?, pivot_state = ? "
                 "WHERE session_id = ?",
                 (session.current_stage, session.status,
                  json.dumps(session.exhausted_services), session.scope_allowlist,
-                 session.last_activity_at, session.pause_reason, session_id),
+                  session.last_activity_at, session.pause_reason,
+                  json.dumps({
+                      "routes": session.pivot_routes,
+                      "port_forwards": session.port_forwards,
+                      "socks_proxies": session.socks_proxies,
+                  }), session_id),
             )
             conn.commit()
             conn.close()
@@ -3919,7 +4289,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         await self._analyze_with_ai(session_id)
 
     def _save_command_result(self, session_id: str, command_id: str, command: str,
-                           output: str, error: str, return_code: int):
+                           output: str, error: str, return_code: int,
+                           success: Optional[bool] = None):
         """Save command execution result to database."""
         try:
             conn = sqlite3.connect(self.db_path)
@@ -3928,8 +4299,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 UPDATE commands 
                 SET output = ?, status = ?
                 WHERE command_id = ?
-            ''', (output + "\n\nERROR:\n" + error if error else output, 
-                  "completed_success" if return_code == 0 else "completed_failed", 
+            ''', (output + "\n\nERROR:\n" + error if error else output,
+                  "completed_success" if (success if success is not None else return_code == 0) else "completed_failed",
                   command_id))
             conn.commit()
             conn.close()
@@ -4130,19 +4501,52 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
     # ── Auto-handler for autonomous exploitation ──────────────────────────────
 
     def _guess_default_payload(self, session: "Session") -> str:
-        """Pick a sensible default reverse-payload from what we know about the
-        target OS. Windows indicators (SMB/RDP/NetBIOS ports, 'windows'/'microsoft'
-        in service banners) → Windows x64 meterpreter; otherwise Linux x64."""
+        """Pick a payload compatible with the evidence-based target OS.
+
+        Do not infer Windows from SMB alone: Samba is common on Linux targets.
+        An explicit operator payload remains authoritative but is validated by
+        ``ShellManager`` when the handler starts.
+        """
         override = os.getenv("EXPLOIT_PAYLOAD", "").strip()
         if override:
             return override
+
+        matching_hosts = [
+            h for h in session.discovered_hosts if h.get("ip") == session.target_ip
+        ]
+        if matching_hosts:
+            family = matching_hosts[0].get("os_family", "unknown")
+            confidence = float(matching_hosts[0].get("os_confidence") or 0.0)
+            architecture = matching_hosts[0].get("architecture", "unknown")
+            if family == "windows" and confidence >= 0.70:
+                return (
+                    "windows/meterpreter/reverse_tcp"
+                    if architecture == "x86"
+                    else "windows/x64/meterpreter/reverse_tcp"
+                )
+            if family == "linux" and confidence >= 0.70:
+                return (
+                    "linux/x86/meterpreter/reverse_tcp"
+                    if architecture == "x86"
+                    else "linux/x64/meterpreter/reverse_tcp"
+                )
+
         hay = " ".join(
             f"{s.get('service','')} {s.get('version','')} {s.get('port','')}"
             for s in session.discovered_services
         ).lower()
-        win_markers = ("windows", "microsoft", "microsoft-ds", "netbios", "msrpc",
-                       "ms-wbt-server", " 445", " 139", " 3389", " 135")
-        if any(m in f" {hay}" for m in win_markers):
+        # Weight explicit OS/service fingerprints.  Port 445/microsoft-ds is
+        # intentionally weak because it also describes Samba on Linux.
+        windows_score = sum(
+            3 for marker in ("windows", "ms-wbt-server", "msrpc", "winrm", "iis")
+            if marker in hay
+        )
+        linux_score = sum(
+            2 for marker in ("linux", "unix", "openssh", "ssh", "vsftpd",
+                             "proftpd", "apache", "nginx", "httpd", "cups")
+            if marker in hay
+        )
+        if windows_score > linux_score:
             return "windows/x64/meterpreter/reverse_tcp"
         return "linux/x64/meterpreter/reverse_tcp"
 
@@ -4152,6 +4556,15 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         (and therefore appear in the Shells tab). Idempotent per session."""
         session = self.sessions.get(session_id)
         if not session or session._auto_handler_started:
+            return None
+        if is_cidr(session.target_ip):
+            session._auto_handler_started = True
+            session.callback_reachable = False
+            session.callback_note = (
+                "CIDR engagement has no single callback target. Create a handler "
+                "for the concrete host being exploited."
+            )
+            self._save_session_status(session_id, session)
             return None
         session._auto_handler_started = True  # set first so concurrent calls no-op
         try:
@@ -4298,6 +4711,26 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 
         session = self.sessions.get(session_id)
         if session is not None:
+            shell_id = info.get("shell_id", "")
+            if not any(e.get("shell_id") == shell_id for e in session.compromise_evidence):
+                shell_evidence = {
+                    "service": "managed_shell",
+                    "host": info.get("target_ip") or session.target_ip,
+                    "port": "",
+                    "shell_id": shell_id,
+                    "handler_id": handler_id,
+                    "msf_id": info.get("msf_id"),
+                    "command": "managed handler session opened",
+                    "privilege": "user",
+                    "signal": "managed-session-opened",
+                    "proof": (
+                        f"{info.get('type', 'shell')} session "
+                        f"{info.get('msf_id')} opened by the managed handler"
+                    ),
+                    "timestamp": datetime.now().isoformat(),
+                }
+                session.compromise_evidence.append(shell_evidence)
+                self.add_evidence(session_id, "exploitation", shell_evidence)
             logger.warning(
                 f"Session {session_id}: LIVE {info.get('type','shell')} session "
                 f"caught from {info.get('target_ip','?')} (msf id {info.get('msf_id')}) "
@@ -4318,8 +4751,34 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             session.ai_decisions.append(_d)
             self._save_ai_decision(session_id, _d)
 
+    async def _execute_ai_response(self, session_id: str, response: AIResponse,
+                                   execution_mode: str = "ai_auto") -> Dict:
+        """Dispatch an AI action to the local or managed-shell channel."""
+        channel = (getattr(response, "execution_channel", "local") or "local").lower()
+        if channel == "local":
+            return await self.execute_command(
+                session_id, response.suggested_command, execution_mode=execution_mode
+            )
+        if channel != "managed_shell":
+            raise ValueError(f"Unsupported AI execution channel: {channel}")
+        handler_id = getattr(response, "handler_id", None)
+        msf_id = getattr(response, "msf_id", None)
+        if not handler_id or msf_id is None:
+            raise ValueError("managed_shell action requires handler_id and msf_id")
+        output = await self.run_shell_command(
+            session_id, str(handler_id), int(msf_id),
+            response.suggested_command, trigger_analysis=True,
+        )
+        return {
+            "command": response.suggested_command,
+            "output": output,
+            "success": not (output or "").lstrip().startswith("[Error:"),
+            "channel": "managed_shell",
+        }
+
     async def run_shell_command(self, session_id: str, handler_id: str,
-                                msf_id: int, command: str) -> str:
+                                msf_id: int, command: str,
+                                trigger_analysis: bool = False) -> str:
         session = self.sessions.get(session_id)
         if not session:
             raise ValueError("Session not found")
@@ -4331,12 +4790,196 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         ):
             raise ValueError("Invalid shell command")
         mgr = self._shell_managers.get(session_id)
+        rpc_mode = False
         if not mgr:
-            return "[No shell manager for this session]"
+            rpc = getattr(self, "_msf_rpc", None)
+            if rpc is None:
+                return "[No shell manager for this session]"
+            try:
+                rpc_result = await rpc.run_session_command(msf_id, command)
+                output = str(
+                    rpc_result.get("data")
+                    or rpc_result.get("result")
+                    or rpc_result.get("response")
+                    or rpc_result
+                )
+                rpc_mode = True
+            except Exception as exc:
+                output = f"[Error: MSFRPC command failed: {exc}]"
+                rpc_mode = True
+        else:
+            output = None
         self._record_event(session_id, "shell_command_started", {
             "handler_id": handler_id, "msf_id": msf_id, "command": command[:300],
         })
-        return await mgr.run_command(handler_id, msf_id, command)
+        if not rpc_mode:
+            output = await mgr.run_command(handler_id, msf_id, command)
+        success = not (output or "").lstrip().startswith(
+            ("[Error:", "[No output captured")
+        )
+        command_id = str(uuid.uuid4())
+        handler = mgr.get_handler(handler_id) if mgr else None
+        shell = handler.get_session(msf_id) if handler else None
+        target_ip = shell.target_ip if shell else session.target_ip
+        record = {
+            "command_id": command_id,
+            "command": command,
+            "output": output or "",
+            "error": "" if success else (output or ""),
+            "return_code": 0 if success else 1,
+            "timestamp": datetime.now().isoformat(),
+            "success": success,
+            "channel": "managed_shell",
+            "handler_id": handler_id,
+            "msf_id": msf_id,
+            "target_ip": target_ip,
+        }
+        session.commands_executed.append(record)
+        self._touch_activity(session_id)
+        if len(session.commands_executed) > 500:
+            session.commands_executed = session.commands_executed[-500:]
+        try:
+            conn = self._db_connect()
+            conn.execute(
+                "INSERT INTO commands "
+                "(session_id, command_id, command_text, status, output, risk_level, "
+                "execution_channel, handler_id, msf_id, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, command_id, command,
+                 "completed_success" if success else "completed_failed",
+                 output or "", _command_risk_level(command, "medium"),
+                 "managed_shell", handler_id, msf_id, record["timestamp"]),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            logger.warning(f"Failed to persist managed-shell command: {exc}")
+
+        if success:
+            self._extract_and_store_credentials(session_id, command, output or "")
+            self._update_target_fingerprint_from_output(session, command, output or "")
+        self._ensure_coverage(session)
+        self._update_coverage_from_command(
+            session, command, success=success, exploit_success=False
+        )
+        self._recompute_coverage_progress(session)
+        self._record_event(session_id, "shell_command_finished", {
+            "command_id": command_id, "handler_id": handler_id, "msf_id": msf_id,
+            "success": success,
+        })
+        if trigger_analysis:
+            session.status = "ready"
+            await self._process_command_output(
+                session_id, command, output or "", None if success else (output or "")
+            )
+        return output
+
+    async def add_pivot_route(self, session_id: str, handler_id: str,
+                              msf_id: int, subnet: str) -> Dict:
+        """Add a Meterpreter autoroute through a confirmed shell session."""
+        session = self.sessions.get(session_id)
+        route = _pivot.validate_route(subnet)
+        if not session or not route:
+            return {"status": "error", "message": "Invalid session or subnet"}
+        command = _pivot.build_autoroute_command(subnet)
+        output = await self.run_shell_command(session_id, handler_id, msf_id, command)
+        if (output or "").lstrip().startswith(("[Error:", "[No output captured")):
+            return {"status": "error", "message": output, "command": command}
+        record = {
+            "subnet": route.subnet, "netmask": route.netmask,
+            "handler_id": handler_id, "msf_id": msf_id, "status": "active",
+            "created_at": datetime.now().isoformat(),
+        }
+        if not any(r.get("subnet") == route.subnet and r.get("netmask") == route.netmask
+                   and r.get("status") == "active" for r in session.pivot_routes):
+            session.pivot_routes.append(record)
+        self._save_session_status(session_id, session)
+        self.add_evidence(session_id, "pivot_route", {"command": command, **record})
+        return {"status": "success", "route": record, "output": output}
+
+    async def add_port_forward(self, session_id: str, handler_id: str,
+                               msf_id: int, remote_host: str, remote_port: int,
+                               local_port: int, local_host: str = "127.0.0.1") -> Dict:
+        """Create a Meterpreter port forward to an in-scope internal host."""
+        session = self.sessions.get(session_id)
+        if not session or not self._host_in_session_scope(session, remote_host):
+            return {"status": "error", "message": "Remote host is not in session scope"}
+        command = _pivot.build_portfwd_command(
+            remote_host, remote_port, local_port, local_host
+        )
+        if not command:
+            return {"status": "error", "message": "Invalid port-forward parameters"}
+        output = await self.run_shell_command(session_id, handler_id, msf_id, command)
+        if (output or "").lstrip().startswith(("[Error:", "[No output captured")):
+            return {"status": "error", "message": output, "command": command}
+        record = {
+            "remote_host": remote_host, "remote_port": int(remote_port),
+            "local_host": local_host, "local_port": int(local_port),
+            "handler_id": handler_id, "msf_id": msf_id, "status": "active",
+            "created_at": datetime.now().isoformat(),
+        }
+        session.port_forwards.append(record)
+        self._save_session_status(session_id, session)
+        self.add_evidence(session_id, "port_forward", {"command": command, **record})
+        return {"status": "success", "port_forward": record, "output": output}
+
+    async def start_socks_proxy(self, session_id: str, handler_id: str,
+                                msf_id: int, local_port: int,
+                                local_host: str = "127.0.0.1") -> Dict:
+        """Start a tracked SOCKS proxy job from a confirmed Meterpreter pivot."""
+        session = self.sessions.get(session_id)
+        command = _pivot.build_socks_proxy_command(local_port, local_host)
+        if not session or not command:
+            return {"status": "error", "message": "Invalid session or proxy parameters"}
+        manager = self._shell_managers.get(session_id)
+        if not manager:
+            return {"status": "error", "message": "No shell manager for this session"}
+        output = await manager.run_console_command(handler_id, command)
+        if (output or "").lstrip().startswith(("[Error:", "[No output captured")):
+            return {"status": "error", "message": output, "command": command}
+        record = {
+            "local_host": local_host, "local_port": int(local_port),
+            "handler_id": handler_id, "msf_id": msf_id, "version": 5,
+            "status": "active", "created_at": datetime.now().isoformat(),
+        }
+        session.socks_proxies.append(record)
+        self._save_session_status(session_id, session)
+        self.add_evidence(session_id, "socks_proxy", {"command": command, **record})
+        return {"status": "success", "socks_proxy": record, "output": output}
+
+    async def remove_port_forward(self, session_id: str, handler_id: str,
+                                  msf_id: int, local_port: int) -> Dict:
+        """Remove one tracked Meterpreter port forward."""
+        session = self.sessions.get(session_id)
+        if not session or not _pivot.validate_port(local_port):
+            return {"status": "error", "message": "Invalid session or local port"}
+        matches = [f for f in session.port_forwards
+                   if f.get("local_port") == int(local_port)
+                   and f.get("status") == "active"]
+        if not matches:
+            return {"status": "error", "message": "Port forward not found"}
+        forward = matches[-1]
+        command = _pivot.build_portfwd_command(
+            forward["remote_host"], forward["remote_port"], forward["local_port"],
+            forward.get("local_host", "127.0.0.1"), remove=True,
+        )
+        output = await self.run_shell_command(session_id, handler_id, msf_id, command)
+        if (output or "").lstrip().startswith(("[Error:", "[No output captured")):
+            return {"status": "error", "message": output, "command": command}
+        forward["status"] = "stopped"
+        forward["stopped_at"] = datetime.now().isoformat()
+        self._save_session_status(session_id, session)
+        return {"status": "success", "port_forward": forward, "output": output}
+
+    def get_pivot_state(self, session_id: str) -> Dict:
+        session = self.sessions.get(session_id)
+        if not session:
+            return {}
+        return {
+            "routes": list(session.pivot_routes),
+            "port_forwards": list(session.port_forwards),
+            "socks_proxies": list(session.socks_proxies),
+        }
 
     def get_shell_command_history(self, session_id: str, handler_id: str,
                                   msf_id: int) -> List[Dict]:
@@ -4531,8 +5174,9 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         qs = shlex.quote(secret)
         qu = shlex.quote(user)
 
-        # Which services exist on the target? Map service-name -> host.
-        targets: Dict[str, str] = {}
+        # Keep each host/port instance. Mapping only by service name silently
+        # dropped identical services on other lab machines.
+        targets: List[Tuple[str, str, Optional[int]]] = []
         for svc in session.discovered_services:
             name = (svc.get("service") or "").lower()
             host = svc.get("host") or session.target_ip
@@ -4543,7 +5187,13 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         f"credential reuse target {host}"
                     )
                     continue
-                targets.setdefault(name, host)
+                try:
+                    port = int(svc.get("port")) if svc.get("port") else None
+                except (TypeError, ValueError):
+                    port = None
+                item = (name, host, port)
+                if item not in targets:
+                    targets.append(item)
         # Always allow spraying against the primary host even with no service map.
         host = session.target_ip
 
@@ -4557,7 +5207,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             return svc_name
 
         seen_norm = set()
-        for raw_name, svc_host in targets.items():
+        for raw_name, svc_host, svc_port in targets:
             name = _norm(raw_name)
             if name in seen_norm:
                 continue
@@ -4573,22 +5223,27 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 continue
 
             if name == "ssh":
+                port_flag = f" -p {svc_port}" if svc_port and svc_port != 22 else ""
                 cmds.append(
                     f"sshpass -p {qs} ssh -o StrictHostKeyChecking=no "
-                    f"-o ConnectTimeout=8 -o BatchMode=no {qu}@{svc_host} 'id; hostname'"
+                    f"-o ConnectTimeout=8 -o BatchMode=no{port_flag} "
+                    f"{qu}@{svc_host} 'id; hostname'"
                 )
             elif name == "smb":
                 cmds.append(f"crackmapexec smb {svc_host} -u {qu} -p {qs} --shares")
             elif name == "ftp":
-                cmds.append(f"curl -s --max-time 10 ftp://{qu}:{qs}@{svc_host}/")
+                port_suffix = f":{svc_port}" if svc_port and svc_port != 21 else ""
+                cmds.append(f"curl -s --max-time 10 ftp://{qu}:{qs}@{svc_host}{port_suffix}/")
             elif name in ("http", "https"):
                 scheme = "https" if name == "https" else "http"
+                port_suffix = f":{svc_port}" if svc_port else ""
                 cmds.append(
                     f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 10 "
-                    f"-u {qu}:{qs} {scheme}://{svc_host}/"
+                    f"-u {qu}:{qs} {scheme}://{svc_host}{port_suffix}/"
                 )
             elif name == "mysql":
-                cmds.append(f"mysql -h {svc_host} -u {qu} -p{qs} -e 'show databases;'")
+                port_flag = f" -P {svc_port}" if svc_port else ""
+                cmds.append(f"mysql -h {svc_host}{port_flag} -u {qu} -p{qs} -e 'show databases;'")
             elif name == "postgresql":
                 cmds.append(
                     f"PGPASSWORD={qs} psql -h {svc_host} -U {qu} -c '\\l' -w"
@@ -4692,6 +5347,11 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         session = self.sessions.get(session_id)
         if not session:
             return
+        if session.status in ("cancelled", "failed", "completed"):
+            logger.info(
+                f"Ignoring brute-force credential for terminal session {session_id}"
+            )
+            return
         username = (cred.get("username") or "").strip()
         secret = (cred.get("secret") or "")
         if not username:
@@ -4708,6 +5368,12 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         }
         session.credentials.append(record)
         self._save_credential_db(session_id, record)
+        try:
+            self._dispatch_credential_reuse(session_id, record)
+        except Exception as exc:
+            logger.warning(
+                f"Brute-force credential reuse dispatch failed for {session_id}: {exc}"
+            )
         logger.warning(
             f"BRUTEFORCE credential for {session_id}: {username}:{'*' * len(secret)} "
             f"on {record.get('service')} {record.get('host')}"
@@ -4971,13 +5637,124 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         manager = self._shell_managers.get(session_id)
         if manager:
             await manager.stop_all()
-        for task in list(self._background_tasks.pop(session_id, set())):
+        worker = self._brute_workers.pop(session_id, None)
+        if worker:
+            await worker.cancel_all()
+        reset_tasks = list(self._background_tasks.pop(session_id, set()))
+        for task in reset_tasks:
             if not task.done():
                 task.cancel()
+        if reset_tasks:
+            await asyncio.gather(*reset_tasks, return_exceptions=True)
         self._cleanup_callback_tunnel(session_id)
         self._save_session_status(session_id, session)
         self._record_event(session_id, "session_cancelled", {"reason": session.pause_reason})
         return {"status": "success", "session_id": session_id}
+
+    async def reset_session_state(self, session_id: str, full_scan: bool = False) -> Dict:
+        """Reset a session transactionally before a retry or full rescan.
+
+        Retry/rescan must stop old tasks and handlers first; otherwise stale
+        commands and vulnerability jobs race the new engagement and repopulate
+        data the UI says was cleared.
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return {"status": "error", "message": "Session not found"}
+
+        reset_tasks = list(self._background_tasks.pop(session_id, set()))
+        for task in reset_tasks:
+            if not task.done():
+                task.cancel()
+        if reset_tasks:
+            await asyncio.gather(*reset_tasks, return_exceptions=True)
+        worker = self._brute_workers.pop(session_id, None)
+        if worker:
+            await worker.cancel_all()
+        manager = self._shell_managers.pop(session_id, None)
+        if manager:
+            await manager.stop_all()
+        self._cleanup_callback_tunnel(session_id)
+
+        session.commands_executed.clear()
+        session.ai_decisions.clear()
+        session.vulnerabilities.clear()
+        session.service_coverage.clear()
+        session._reuse_dispatched.clear()
+        session.exhausted_services.clear()
+        session._auto_handler_started = False
+        session.exploit_lhost = ""
+        session.exploit_lport = 0
+        session.exploit_payload = ""
+        session.callback_mode = ""
+        session.callback_reachable = True
+        session.callback_note = ""
+        session.callback_bind = ""
+        session.auto_depth_counter = 0
+        session._commands_since_progress = 0
+        session._last_effort_marker = None
+        session._stagnation_counter = 0
+        session._last_progress_marker = ()
+        session._empty_response_count = 0
+        session._planner_cmd_count = 0
+        session._last_strategist_stage = ""
+        session.pivot_routes.clear()
+        session.port_forwards.clear()
+        session.socks_proxies.clear()
+
+        if full_scan:
+            session.compromise_evidence.clear()
+            session.discovered_hosts.clear()
+            session.discovered_services.clear()
+            session.scan_results.clear()
+            session.credentials.clear()
+            session.evidence = [
+                evidence for evidence in session.evidence
+                if evidence.get("type") == "authorization_confirmation"
+            ]
+            session.target_os = "unknown"
+            session.target_os_confidence = 0.0
+            session.target_os_evidence = []
+            session.target_architecture = "unknown"
+            session.target_architecture_confidence = 0.0
+            session.target_architecture_evidence = ""
+            session.current_stage = "reconnaissance"
+            session.status = "scanning"
+        else:
+            session.current_stage = "osint" if self._should_run_osint(session) else "enumeration"
+            session.status = "analyzing"
+
+        try:
+            conn = self._db_connect()
+            conn.execute("DELETE FROM ai_decisions WHERE session_id=?", (session_id,))
+            conn.execute("DELETE FROM commands WHERE session_id=?", (session_id,))
+            conn.execute("DELETE FROM vulnerabilities WHERE session_id=?", (session_id,))
+            conn.execute("DELETE FROM shell_sessions_log WHERE session_id=?", (session_id,))
+            conn.execute("UPDATE shell_handlers SET status='stopped' WHERE session_id=?", (session_id,))
+            if full_scan:
+                conn.execute("DELETE FROM scan_results WHERE session_id=?", (session_id,))
+                conn.execute("DELETE FROM credentials WHERE session_id=?", (session_id,))
+                conn.execute(
+                    "DELETE FROM evidence WHERE session_id=? AND evidence_type != ?",
+                    (session_id, "authorization_confirmation"),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM scan_results WHERE session_id=? AND "
+                    "(scan_type LIKE 'nmap_vuln_%' OR scan_type LIKE 'ss_%' "
+                    "OR scan_type LIKE 'nvd_%' OR scan_type LIKE 'vul_%')",
+                    (session_id,),
+                )
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            logger.warning(f"Session reset database cleanup failed for {session_id}: {exc}")
+
+        if not full_scan:
+            self._ensure_coverage(session)
+            self._recompute_coverage_progress(session)
+        self._save_session_status(session_id, session)
+        return {"status": "success", "session_id": session_id, "full_scan": full_scan}
 
     def _cleanup_callback_tunnel(self, session_id: str) -> None:
         """Terminate any reverse-shell callback tunnel (e.g. ngrok) started for
@@ -5181,7 +5958,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                        COALESCE(exhausted_services, '[]'),
                        COALESCE(scope_allowlist, ''),
                        COALESCE(last_activity_at, ''),
-                       COALESCE(pause_reason, '')
+                       COALESCE(pause_reason, ''),
+                       COALESCE(pivot_state, '{}')
                 FROM sessions
                 WHERE status NOT IN ('completed', 'failed')
                 ORDER BY created_at DESC
@@ -5194,8 +5972,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                  auto_approve, authorization_confirmed,
                  db_objective, db_plan_json, db_reflections_json,
                   db_progress, db_progress_note, db_complete,
-                  db_exhausted_json, db_scope, db_last_activity,
-                  db_pause_reason) = session_row
+                   db_exhausted_json, db_scope, db_last_activity,
+                   db_pause_reason, db_pivot_state) = session_row
 
                 # Create session object
                 session = Session(session_id, target_ip, target_domain, auto_approve, bool(authorization_confirmed))
@@ -5204,6 +5982,13 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 session.scope_allowlist = db_scope or session.scope_allowlist
                 session.last_activity_at = db_last_activity or session.last_activity_at
                 session.pause_reason = db_pause_reason or ""
+                try:
+                    pivot_state = json.loads(db_pivot_state or "{}")
+                    session.pivot_routes = pivot_state.get("routes", []) or []
+                    session.port_forwards = pivot_state.get("port_forwards", []) or []
+                    session.socks_proxies = pivot_state.get("socks_proxies", []) or []
+                except (json.JSONDecodeError, TypeError):
+                    pass
                 session._last_persisted_state = (current_stage, status)
 
                 # Restore strategic layer state persisted by _save_strategic_state.
@@ -5253,12 +6038,14 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                             discovered_hosts = self.scanner.parse_nmap_results(scan_data)
                             self._merge_hosts(session, discovered_hosts)
                             self._merge_services(session, discovered_hosts)
+                            self._refresh_target_os(session)
                     except json.JSONDecodeError:
                         logger.warning(f"Failed to parse scan data for session {session_id}")
                 
                 # Load executed commands
                 cursor.execute('''
                     SELECT command_id, command_text, output, status, risk_level, timestamp
+                           , execution_channel, handler_id, msf_id
                     FROM commands 
                     WHERE session_id = ? AND status IN ('completed_success', 'completed_failed')
                     ORDER BY timestamp
@@ -5266,7 +6053,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 
                 command_rows = cursor.fetchall()
                 for cmd_row in command_rows:
-                    command_id, command_text, output, status, risk_level, timestamp = cmd_row
+                    command_id, command_text, output, status, risk_level, timestamp, channel, handler_id, msf_id = cmd_row
                     command_record = {
                         "command_id": command_id,
                         "command": command_text,
@@ -5274,7 +6061,10 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         "error": "",
                         "return_code": 0 if status == 'completed_success' else 1,
                         "timestamp": timestamp,
-                        "success": status == 'completed_success'
+                        "success": status == 'completed_success',
+                        "channel": channel or "local",
+                        "handler_id": handler_id,
+                        "msf_id": msf_id,
                     }
                     session.commands_executed.append(command_record)
                 
@@ -5297,6 +6087,22 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                             "timestamp": timestamp
                         }
                         session.evidence.append(evidence)
+                        if evidence_type == "exploitation" and isinstance(evidence_data, dict):
+                            proof_command = evidence_data.get("command", "")
+                            proof_output = evidence_data.get("proof", "")
+                            valid_proof = (
+                                evidence_data.get("signal") == "managed-session-opened"
+                                or bool(_matched_compromise_signals(proof_command, proof_output))
+                                or (
+                                    evidence_data.get("signal") == "windows-rce"
+                                    and _is_windows_rce_proof(proof_command, proof_output)
+                                )
+                            )
+                            if valid_proof and not any(
+                                e.get("timestamp") == evidence_data.get("timestamp")
+                                for e in session.compromise_evidence
+                            ):
+                                session.compromise_evidence.append(evidence_data)
                     except json.JSONDecodeError:
                         logger.warning(f"Failed to parse evidence data for session {session_id}")
 
@@ -5346,18 +6152,22 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 # Load AI decisions for this session
                 cursor.execute('''
                     SELECT timestamp, reasoning, suggested_command, risk_level,
-                           confidence, attack_phase, context
+                           confidence, attack_phase, context,
+                           COALESCE(execution_channel, 'local'), handler_id, msf_id
                     FROM ai_decisions
                     WHERE session_id = ?
                     ORDER BY id
                 ''', (session_id,))
                 for dec_row in cursor.fetchall():
-                    ts, reasoning, cmd, risk, conf, phase, ctx = dec_row
+                    ts, reasoning, cmd, risk, conf, phase, ctx, channel, handler_id, msf_id = dec_row
                     _dec = {
                         "timestamp": ts,
                         "reasoning": reasoning or "",
                         "suggested_command": cmd or "",
-                        "risk_level": risk or "",
+                        "risk_level": _command_risk_level(cmd or "", risk),
+                        "execution_channel": channel or "local",
+                        "handler_id": handler_id,
+                        "msf_id": msf_id,
                     }
                     if conf is not None:
                         _dec["confidence"] = conf
@@ -5390,7 +6200,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 
                 # Load pending commands into orchestrator's pending_commands dict
                 cursor.execute('''
-                    SELECT command_id, command_text, status, risk_level, timestamp
+                     SELECT command_id, command_text, status, risk_level,
+                            COALESCE(execution_channel, 'local'), handler_id, msf_id, timestamp
                     FROM commands 
                     WHERE session_id = ? AND status IN ('pending', 'approved', 'denied')
                     ORDER BY timestamp
@@ -5398,13 +6209,34 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 
                 pending_rows = cursor.fetchall()
                 for pending_row in pending_rows:
-                    command_id, command_text, status, risk_level, timestamp = pending_row
+                    command_id, command_text, status, risk_level, channel, handler_id, msf_id, timestamp = pending_row
+                    normalized_risk = _command_risk_level(command_text, risk_level)
+                    # A command queued by an older policy may now be medium-tier
+                    # (curl/MSF). Do not leave an already-authorized autonomous
+                    # session blocked on a stale approval record after restart.
+                    if (status == "pending" and normalized_risk == "medium"
+                            and (FULL_AUTO_MODE or bool(session.auto_approve))):
+                        status = "approved"
+                        self._commands_to_auto_resume.append(
+                            (session_id, command_id, command_text)
+                        )
+                        try:
+                            cursor.execute(
+                                "UPDATE commands SET status='approved' WHERE command_id=?",
+                                (command_id,),
+                            )
+                        except sqlite3.Error:
+                            pass
                     self.pending_commands[command_id] = {
                         "session_id": session_id,
                         "command": command_text,
                         "status": status,
                         "timestamp": timestamp,
-                        "requires_approval": risk_level == "high"
+                        "requires_approval": normalized_risk == "high",
+                        "risk_level": normalized_risk,
+                        "execution_channel": channel or "local",
+                        "handler_id": handler_id,
+                        "msf_id": msf_id,
                     }
                 
                 # Store session in memory
@@ -5462,6 +6294,20 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             if not session:
                 continue
             try:
+                stale_medium = [
+                    item for item in self._commands_to_auto_resume
+                    if item[0] == sid
+                ]
+                if stale_medium:
+                    # Execute the command that was waiting under the old risk
+                    # policy before asking the AI for another step.
+                    for _, _, command in stale_medium:
+                        session.status = "executing"
+                        await self.execute_command(sid, command, execution_mode="ai_auto")
+                    self._commands_to_auto_resume = [
+                        item for item in self._commands_to_auto_resume if item[0] != sid
+                    ]
+                    continue
                 if skip_scan:
                     # We already have scan data — go straight to AI analysis.
                     logger.info(
@@ -5482,6 +6328,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 logger.error(f"Auto-resume failed for session {sid}: {exc}")
 
         self._sessions_to_auto_resume.clear()
+        self._commands_to_auto_resume.clear()
 
     # ── Stuck-session watchdog ────────────────────────────────────────────────
 
@@ -6031,19 +6878,55 @@ Web apps: {webapps}
             return []
         cmd_l = command.lower()
 
+        explicit_hosts = {
+            str(svc.get("host") or "").lower()
+            for svc in session.discovered_services
+            if svc.get("host") and str(svc.get("host")).lower() in cmd_l
+        }
+
         port_hits: List[Dict] = []
         for svc in session.discovered_services:
             port = str(svc.get("port", "")).strip()
             if port and re.search(rf"(?<!\d){re.escape(port)}(?!\d)", cmd_l):
                 port_hits.append(svc)
         if port_hits:
+            if explicit_hosts:
+                scoped = [svc for svc in port_hits
+                          if str(svc.get("host") or "").lower() in explicit_hosts]
+                if scoped:
+                    return scoped
             return port_hits
 
         # No explicit port in the command — fall back to service-name matching.
+        tool_service = {
+            "enum4linux": "smb", "smbmap": "smb", "smbclient": "smb",
+            "rpcclient": "smb", "crackmapexec": "smb", "nxc": "smb",
+            "whatweb": "http", "nikto": "http", "wpscan": "http",
+            "feroxbuster": "http", "gobuster": "http", "ffuf": "http",
+            "ftp": "ftp", "hydra": "ssh", "sshpass": "ssh",
+        }
+        for tool, service_name in tool_service.items():
+            if re.search(rf"(?<![\w-]){re.escape(tool)}(?:\b|-)", cmd_l):
+                tool_hits = [
+                    svc for svc in session.discovered_services
+                    if (
+                        str(svc.get("service") or "").lower() == service_name
+                        or (service_name == "smb" and str(svc.get("service") or "").lower()
+                            in {"microsoft-ds", "netbios-ssn", "smb"})
+                        or (service_name == "http" and "http" in str(svc.get("service") or "").lower())
+                    )
+                    and (not explicit_hosts
+                         or str(svc.get("host") or "").lower() in explicit_hosts)
+                ]
+                if tool_hits:
+                    return tool_hits
+
         name_hits: List[Dict] = []
         for svc in session.discovered_services:
             name_tokens = self._service_tokens(svc)[1:]
-            if any(t in cmd_l for t in name_tokens):
+            if any(t in cmd_l for t in name_tokens) and (
+                    not explicit_hosts
+                    or str(svc.get("host") or "").lower() in explicit_hosts):
                 name_hits.append(svc)
         return name_hits
 
@@ -6064,8 +6947,7 @@ Web apps: {webapps}
         wrongly marked done."""
         if not success:
             return
-        out_l = (output or "").lower()
-        _matched = [sig for sig in _EXPLOIT_SIGNALS if sig in out_l]
+        _matched = _matched_compromise_signals(command, output)
         # Windows web-shell / exec RCE proof (guarded against enumeration output).
         if _is_windows_rce_proof(command, output):
             _matched.append("windows-rce")
@@ -6220,6 +7102,9 @@ Web apps: {webapps}
         return (
             f"TARGET: {session.target_ip} ({session.target_domain or 'no domain'})\n"
             f"STATUS: {session.status}  STAGE: {session.current_stage}\n"
+            f"TARGET OS: {session.target_os} (confidence {session.target_os_confidence:.2f}), "
+            f"ARCH: {session.target_architecture} "
+            f"(confidence {session.target_architecture_confidence:.2f})\n"
             f"OBJECTIVE: {session.objective}\n"
             f"PROGRESS: {int(session.objective_progress * 100)}% — {session.objective_progress_note or 'n/a'}\n"
             f"PLAN: {plan}\n"
@@ -6324,20 +7209,27 @@ Web apps: {webapps}
             session.service_coverage["__postex__"] = _coverage.build_postex_coverage()
 
     def _update_coverage_from_command(
-        self, session: "Session", command: str, success: bool = True
+        self, session: "Session", command: str, success: bool = True,
+        exploit_success: Optional[bool] = None,
     ) -> None:
         """After a command runs, mark any playbook steps it attempted as done.
 
-        ``success`` gates exploitation/post-exploitation steps: those only count
-        as done when the command actually landed a confirmed result, so a failed
-        exploit attempt does not falsely mark a service "covered" and get it
-        abandoned before it is compromised. Enumeration/vuln steps ignore it.
+        Service coverage is scoped to the host/port referenced by the command.
+        ``success`` means the command itself completed; ``exploit_success`` is
+        the stricter proof flag used only for exploitation steps.
         """
         if not COVERAGE_ENGINE or not command:
             return
-        for cov in session.service_coverage.values():
+        referenced = self._services_referenced(session, command)
+        referenced_keys = {self._svc_key(svc) for svc in referenced}
+        for key, cov in session.service_coverage.items():
+            if key != "__postex__" and key not in referenced_keys:
+                continue
             try:
-                _coverage.match_and_mark(cov, command, success=success)
+                _coverage.match_and_mark(
+                    cov, command, success=success,
+                    exploit_success=exploit_success,
+                )
             except Exception:
                 pass
 
@@ -6662,6 +7554,37 @@ Web apps: {webapps}
             f"{_reach_line}"
         )
 
+    def _target_os_context_block(self, session: "Session") -> str:
+        """Tell the tactical model which OS hypothesis is currently supported.
+
+        The model may choose the technique, but it must not silently replace a
+        measured OS fact with a Windows/Linux assumption.
+        """
+        family = session.target_os or "unknown"
+        confidence = float(session.target_os_confidence or 0.0)
+        evidence = "; ".join(session.target_os_evidence[:6]) or "no OS evidence yet"
+        host_lines = ""
+        if session.host_states:
+            host_lines = "\nPer-host facts:\n" + "\n".join(
+                f"- {host}: {state.get('os_family', 'unknown')} / "
+                f"{state.get('architecture', 'unknown')} "
+                f"(confidence {float(state.get('os_confidence') or 0):.2f})"
+                for host, state in list(session.host_states.items())[:20]
+            )
+        return (
+            "\n=== TARGET OS CLASSIFICATION (framework evidence) ===\n"
+            f"OS family: {family} | confidence: {confidence:.2f}\n"
+            f"Architecture: {session.target_architecture} | confidence: "
+            f"{session.target_architecture_confidence:.2f}\n"
+            f"Evidence: {evidence}\n"
+            f"Architecture evidence: {session.target_architecture_evidence or 'none'}\n"
+            f"{host_lines}\n"
+            "Use only payloads and post-exploitation commands compatible with this OS. "
+            "If OS or architecture confidence is below 0.70, run an OS/service "
+            "fingerprint before choosing an OS-specific exploit; do not infer Windows "
+            "from SMB/Samba alone.\n"
+        )
+
     @staticmethod
     def _detect_missing_tools() -> List[str]:
         """Return the subset of key pentest tools that are NOT on PATH, plus a
@@ -6671,7 +7594,8 @@ Web apps: {webapps}
             "sshpass", "gobuster", "ffuf", "nmap", "nikto", "wpscan", "nuclei",
             "hydra", "crackmapexec", "nxc", "smbclient", "enum4linux-ng",
             "evil-winrm", "msfconsole", "searchsploit", "subfinder", "whatweb",
-            "wafw00f", "sqlmap", "dnsrecon", "curl", "dig",
+            "wafw00f", "sqlmap", "dnsrecon", "davtest", "redis-cli", "showmount",
+            "curl", "dig",
         ]
         missing = [t for t in checked if not _shutil.which(t)]
         if not any(os.path.isdir(p) for p in (
@@ -6730,6 +7654,39 @@ Web apps: {webapps}
             "\n=== CALLBACK REACHABILITY (public target) ===\n"
             f"Target {session.target_ip} is on the public internet. {_hint}\n"
         )
+
+    def _pivot_context_block(self, session: "Session") -> str:
+        """Describe real pivot transport state and the next usable actions."""
+        if not session.compromise_evidence and not session.pivot_routes:
+            return ""
+        lines = [
+            "\n=== NETWORK PIVOT STATE ===",
+            "Auto-pivoting attack vectors is not network pivoting. Use a confirmed "
+            "managed shell to add an autoroute, port forward, or SOCKS proxy before "
+            "scanning an internal network.",
+        ]
+        for route in session.pivot_routes[-8:]:
+            lines.append(
+                f"- route {route.get('subnet')}/{route.get('netmask')} "
+                f"via handler={route.get('handler_id')} session={route.get('msf_id')} "
+                f"[{route.get('status', 'unknown')}]"
+            )
+        for forward in session.port_forwards[-8:]:
+            lines.append(
+                f"- portfwd {forward.get('local_host')}:{forward.get('local_port')} "
+                f"-> {forward.get('remote_host')}:{forward.get('remote_port')} "
+                f"[{forward.get('status', 'unknown')}]"
+            )
+        for proxy in session.socks_proxies[-4:]:
+            lines.append(
+                f"- SOCKS{proxy.get('version', 5)} at {proxy.get('local_host')}"
+                f":{proxy.get('local_port')} [{proxy.get('status', 'unknown')}]"
+            )
+        lines.append(
+            "If an internal subnet is discovered, use the managed-shell action to "
+            "add autoroute first, then use proxychains with an explicit in-scope host.\n"
+        )
+        return "\n".join(lines)
 
     def _compromise_context_block(self, session: "Session") -> str:
         """Render confirmed compromises for the AI prompt. Empty string when none,

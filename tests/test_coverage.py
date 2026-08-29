@@ -81,6 +81,12 @@ def test_match_and_mark_ai_step_by_signal():
     assert "mysql.file_write" in done
 
 
+def test_postex_step_uses_command_success_not_exploit_proof():
+    c = cov.build_postex_coverage()
+    done = cov.match_and_mark(c, "id", success=True, exploit_success=False)
+    assert "postex.identity" in done
+
+
 def test_pending_steps_shrinks_as_marked():
     c = cov.build_service_coverage({"service": "ftp", "port": 21, "host": "10.0.0.5"})
     before = len(cov.pending_steps(c))

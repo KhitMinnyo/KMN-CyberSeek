@@ -70,6 +70,9 @@ class AIResponse(BaseModel):
     target_info: Optional[Dict[str, Any]] = Field(None, description="Additional target information")
     confidence: float = Field(0.0, description="Confidence score (0.0 to 1.0)")
     attack_phase: str = Field(..., description="Current attack phase: osint, reconnaissance, enumeration, vulnerability_analysis, exploitation, post_exploitation, privilege_escalation, lateral_movement, credential_reuse")
+    execution_channel: str = Field("local", description="local or managed_shell")
+    handler_id: Optional[str] = Field(None, description="Managed shell handler id when execution_channel is managed_shell")
+    msf_id: Optional[int] = Field(None, description="Managed Meterpreter/command-shell id when execution_channel is managed_shell")
 
 
 class KMN_AI_Connector:

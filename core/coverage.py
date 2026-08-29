@@ -16,7 +16,7 @@ safe to import anywhere. Integration into the live loop lands behind the
 COVERAGE_ENGINE flag.
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from core import playbooks as pb
 
@@ -71,24 +71,29 @@ def _steps_for(cov: dict) -> List:
     return pb.get_steps(cov.get("keys", []))
 
 
-def match_and_mark(cov: dict, command: str, success: bool = True) -> List[str]:
+def match_and_mark(cov: dict, command: str, success: bool = True,
+                   exploit_success: Optional[bool] = None) -> List[str]:
     """Mark any PENDING step this executed command attempts (tool name or signal
     match) as DONE. Returns the list of newly-completed step ids. Best-effort —
     coverage tracking is a guide, not an oracle.
 
     ``success`` distinguishes *attempting* a step from *achieving* it. Running a
     tool is enough to complete an ENUMERATION or VULNERABILITY step (the recon
-    value is in the output either way), but an EXPLOITATION or POST-EXPLOITATION
-    step only counts as DONE when the command actually succeeded (a confirmed
-    exploit signal). Otherwise a failed exploit attempt would falsely mark the
-    service "covered" and the loop would abandon it before it is compromised —
-    the root cause of a high touched-rate but a near-zero confirmed-rate.
+    value is in the output either way), but an EXPLOITATION step only counts as
+    DONE when the command actually achieved a confirmed exploit. A
+    POST-EXPLOITATION inventory step only requires successful command execution.
+    Otherwise a failed exploit attempt would falsely mark the service "covered"
+    and the loop would abandon it before it is compromised.
     The default (True) preserves the recon/enumeration behaviour.
     """
     done_now: List[str] = []
     for st in _steps_for(cov):
         if cov["steps"].get(st.id) == PENDING and st.matches_command(command):
-            if st.phase in (pb.PHASE_EXPLOIT, pb.PHASE_POST) and not success:
+            phase_success = (
+                (exploit_success if exploit_success is not None else success)
+                if st.phase == pb.PHASE_EXPLOIT else success
+            )
+            if st.phase == pb.PHASE_EXPLOIT and not phase_success:
                 # Attempted but not confirmed — leave PENDING so the loop keeps
                 # working this vector instead of marking it complete.
                 continue

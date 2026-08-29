@@ -77,6 +77,7 @@ class BruteforceWorker:
         self._sem: Optional[asyncio.Semaphore] = None
         # job key "service:host:port" -> status record
         self.jobs: Dict[str, Dict] = {}
+        self._tasks = set()
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -100,11 +101,26 @@ class BruteforceWorker:
             "status": "queued", "creds_found": 0,
             "queued_at": datetime.now().isoformat(),
         }
-        asyncio.create_task(self._process_job(key))
+        task = asyncio.create_task(self._process_job(key))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         return key
 
     def status(self) -> List[Dict]:
         return list(self.jobs.values())
+
+    async def cancel_all(self) -> None:
+        """Cancel worker jobs owned by a session and mark them cancelled."""
+        tasks = list(self._tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for job in self.jobs.values():
+            if job.get("status") in ("queued", "running"):
+                job["status"] = "cancelled"
+                job["finished_at"] = datetime.now().isoformat()
 
     # ── internals ─────────────────────────────────────────────────────────────
 

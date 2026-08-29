@@ -1196,6 +1196,13 @@ def show_session_overview(session_details: Dict):
     with col4:
         st.metric("AI Decisions", session_details.get('ai_decisions_count', 0))
 
+    target_os = session_details.get("target_os", "unknown")
+    if target_os != "unknown":
+        st.caption(
+            f"Target OS: **{target_os}** | framework confidence "
+            f"{float(session_details.get('target_os_confidence') or 0):.2f}"
+        )
+
     st.markdown("---")
 
     # ── ACTION REQUIRED banner — shown before anything else so operator sees it immediately ──
@@ -1672,6 +1679,18 @@ def show_scan_results(session_details: Dict):
             st.markdown(f"**Status:** {host.get('status', 'unknown').upper()}")
             if host.get("os_guess"):
                 st.markdown(f"**OS Guess:** {host['os_guess']}")
+            if host.get("os_family"):
+                st.markdown(
+                    f"**OS Classification:** `{host['os_family']}` "
+                    f"(confidence {float(host.get('os_confidence') or 0):.2f})"
+                )
+                if host.get("architecture"):
+                    st.markdown(
+                        f"**Architecture:** `{host['architecture']}` "
+                        f"(confidence {float(host.get('architecture_confidence') or 0):.2f})"
+                    )
+                if host.get("os_evidence"):
+                    st.caption("Evidence: " + "; ".join(host["os_evidence"][:4]))
 
             if not ports:
                 st.caption("No open ports recorded for this host.")

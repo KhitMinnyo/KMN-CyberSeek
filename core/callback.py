@@ -90,6 +90,11 @@ def is_private_ip(host: str) -> bool:
     host = (host or "").strip()
     if not host:
         return False
+    if "/" in host:
+        try:
+            return ipaddress.ip_network(host, strict=False).is_private
+        except ValueError:
+            return False
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:

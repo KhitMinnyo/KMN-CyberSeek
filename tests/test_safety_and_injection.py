@@ -25,10 +25,10 @@ def test_rejects_bare_python_and_bash():
 
 def test_requires_approval_high_risk_keywords():
     orch = make_orch()
-    # Each command contains a genuine high-risk keyword; all must require approval.
+    # Each command contains a genuine high-risk keyword; Metasploit and curl are
+    # medium-tier exceptions handled by the engagement policy.
     for cmd in [
         "hydra -l root ssh://x",          # hydra (word boundary)
-        "msfconsole -x 'use exploit/x'",  # msfconsole (exact) + exploit (word)
         "sudo -l",                         # sudo (word boundary)
         "hashcat -m 0 h w",               # hashcat (word boundary)
         "crackmapexec smb x",             # crackmapexec (exact substr)
@@ -36,15 +36,27 @@ def test_requires_approval_high_risk_keywords():
     ]:
         assert orch.requires_approval(cmd) is True, f"Expected True for: {cmd!r}"
 
+    assert orch.requires_approval("msfconsole -q -x 'use exploit/x'") is False
 
-def test_upload_and_webshell_commands_are_high_risk():
+
+def test_upload_and_webshell_commands_are_not_promoted_by_curl():
     orch = make_orch()
     for cmd in [
         "curl -s -T /tmp/shell.php ftp://10.0.0.5/",
         "echo payload > /tmp/shell.php; curl http://10.0.0.5/shell.php?c=id",
-        "mysql -e \"SELECT '<?php system($_GET[c]); ?>' INTO OUTFILE '/var/www/html/shell.php'\"",
     ]:
-        assert orch.requires_approval(cmd) is True
+        assert orch.requires_approval(cmd) is False
+    assert orch.requires_approval(
+        "mysql -e \"SELECT '<?php system($_GET[c]); ?>' INTO OUTFILE '/var/www/html/shell.php'\""
+    ) is True
+
+
+def test_curl_and_msf_are_medium_tier():
+    orch = make_orch()
+    assert orch.requires_approval("curl -s http://10.0.0.5/shell.php?cmd=id") is False
+    assert orch.requires_approval(
+        "msfconsole -q -x 'use exploit/unix/ftp/proftpd_modcopy_exec; run'"
+    ) is False
 
 
 def test_low_risk_no_approval():
