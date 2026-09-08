@@ -5,7 +5,7 @@
       "status": "done"
     },
     {
-      "text": "Implement multi-credential rotation (loop creds until one works, incl. pass-the-hash) — wire _rotation_tried + _auth_failure_in_output",
+      "text": "Implement multi-credential rotation (already present in repo: _pick_credential/_inject_credentials/_rotation_tried/_auth_failure_in_output)",
       "status": "done"
     },
     {
@@ -13,12 +13,12 @@
       "status": "done"
     },
     {
-      "text": "Implement post-shell auto-delivery (wire auto_post_shell + _post_shell_delivered in _persist_shell_session)",
-      "status": "in_progress"
+      "text": "Implement post-shell auto-delivery (wire auto_post_shell + _post_shell_delivered in _persist_shell_session → _deliver_post_shell)",
+      "status": "done"
     },
     {
-      "text": "Add/extend tests for both features",
-      "status": "pending"
+      "text": "Add/extend tests for post-shell auto-delivery",
+      "status": "in_progress"
     },
     {
       "text": "Run test suite + compileall; fix regressions",
@@ -29,5 +29,5 @@
       "status": "pending"
     }
   ],
-  "updatedAt": 1788884413956
+  "updatedAt": 1788886219142
 }
