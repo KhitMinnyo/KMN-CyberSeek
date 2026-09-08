@@ -74,6 +74,13 @@ COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "600"))
 # Session-level authorization_confirmed is still required to create a session.
 FULL_AUTO_MODE: bool = os.getenv("FULL_AUTO_MODE", "false").lower() == "true"
 
+# AUTO_POST_SHELL: when true, a freshly caught shell on the managed handler
+# immediately runs the canned post-exploitation recon/harvest batch through the
+# persistent handler (post_shell.build_post_shell_script) instead of only
+# *describing* the batch to the AI and hoping it runs it. Per-session opt-out is
+# possible via session.auto_post_shell.
+AUTO_POST_SHELL: bool = os.getenv("AUTO_POST_SHELL", "true").lower() == "true"
+
 # COVERAGE_ENGINE: when true, the orchestrator drives a per-service methodology
 # (playbooks) and derives objective progress from measured coverage. Default ON —
 # toggleable at runtime from the Settings page (no .env editing required).
@@ -82,6 +89,14 @@ COVERAGE_ENGINE: bool = os.getenv("COVERAGE_ENGINE", "true").lower() == "true"
 # BRUTEFORCE_ENABLED: run the decoupled brute-force worker against discovered auth
 # services (produces credentials the main loop reuses). Explicit opt-in only.
 BRUTEFORCE_ENABLED: bool = os.getenv("BRUTEFORCE_ENABLED", "false").lower() == "true"
+
+# AUTO_CRED_ROTATION: when a command authenticating with an injected credential
+# fails (SMB logon failure / SSH permission denied / FTP 530 / mysql 1045, etc.),
+# automatically retry the command with the NEXT unused credential in the session's
+# pool (plaintext first, then NTLM hashes pass-the-hash) instead of giving up on
+# the first one. On by default for unattended runs; the retries still respect the
+# execution gate and risk model of the original command.
+AUTO_CRED_ROTATION: bool = os.getenv("AUTO_CRED_ROTATION", "true").lower() == "true"
 
 # Feature flags exposed to the Settings UI. Names map to the module globals above
 # (and FULL_AUTO_MODE). Toggling updates the live global immediately AND is
@@ -255,6 +270,54 @@ def _detect_exhausted_target(cmds: List[str], stage: str) -> str:
         return "snmp"
     # Fallback: label by stage
     return f"{stage}_exhausted"
+
+
+# ---------------------------------------------------------------------------
+# Auth-failure detection for multi-credential rotation
+#
+# When a command authenticates to a service with an injected credential and the
+# credential is wrong, tools print a distinctive failure line. Matching these
+# lets the loop know the *credential* (not the command) failed, so it can retry
+# the same command with the next credential in the session pool instead of
+# abandoning the vector (review issue #6: only the first credential was ever
+# tried).
+# ---------------------------------------------------------------------------
+_AUTH_FAILURE_RE = re.compile(
+    r"NT_STATUS_LOGON_FAILURE|NT_STATUS_ACCESS_DENIED|STATUS_LOGON_FAILURE|"
+    r"LOGON_FAILURE|ACCESS_DENIED|AUTHENTICATION FAILED|"
+    r"Login incorrect|Login failed|login failure|"
+    r"Permission denied|Permission denied, please try again|"
+    r"Authentication failed|authentication failure|invalid password|"
+    r"password authentication failed|publickey.*denied|"
+    r"ERROR 1045|Access denied for user|"
+    r"530 Login incorrect|"
+    r"401 Unauthorized|"
+    r"Wrong password|Incorrect password|"
+    r"account.*disabled|account locked|too many authentication failures",
+    re.IGNORECASE,
+)
+
+# Tool families whose output may contain an auth-failure marker.
+_AUTH_TOOL_RE = re.compile(
+    r"\b(smbclient|smbmap|rpcclient|crackmapexec|nxc|enum4linux|enum4linux-ng|"
+    r"evil-winrm|wmiexec\.py|psexec\.py|smbexec\.py|secretsdump\.py|"
+    r"sshpass|ssh|mysql|psql|sqlcmd|hydra|medusa|ncrack|ftplib|curl)\b",
+    re.IGNORECASE,
+)
+
+
+def _auth_failure_in_output(command: str, output: str, error: str = "") -> bool:
+    """True when the command looks like an authenticated-service attempt AND the
+    combined output carries a credential-rejection signal.
+
+    Intentionally conservative: a generic "denied" in unrelated scanner output
+    (nmap, nikto) must not trigger rotation, so we require an auth-family tool
+    name in the command line.
+    """
+    if not _AUTH_TOOL_RE.search(command or ""):
+        return False
+    hay = f"{output or ''}\n{error or ''}"
+    return bool(_AUTH_FAILURE_RE.search(hay))
 
 
 # Service test-lifecycle ordering. Transitions only ever move a service UP this
@@ -536,6 +599,20 @@ class Session:
         # Surfaced to the AI so it pivots to post-exploitation instead of
         # re-running the same exploit (a common cause of enumeration loops).
         self.compromise_evidence: List[Dict] = []
+
+        # Post-shell auto-delivery state: (handler_id, msf_id) keys for which the
+        # canned post-exploitation batch has already been run, so a fresh shell is
+        # fingerprinted exactly once even if the callback fires again on reconnect.
+        self._post_shell_delivered: set = set()
+        # Multi-credential rotation state: command fingerprint -> set of
+        # (username, secret) keys already tried and rejected. Lets the loop retry
+        # a command with a NEWLY discovered credential without re-burning the old
+        # failures, and prevents endless rotation on a single command.
+        self._rotation_tried: Dict[str, set] = {}
+        # Per-session opt-out for automatic post-shell batch delivery (global
+        # default comes from AUTO_POST_SHELL). Set False to leave post-shell work
+        # to the AI/operator for a particular engagement.
+        self.auto_post_shell: bool = True
 
         # Auto-started Metasploit multi/handler for this engagement. When the AI
         # reaches the exploitation stage the orchestrator spins up a managed
