@@ -2916,35 +2916,57 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             msf_id=getattr(response, "msf_id", None),
         )
     
-    def _inject_credentials(self, command: str, session) -> str:
-        """Rewrite a command to embed known credentials so it runs non-interactively.
+    @staticmethod
+    def _command_fingerprint(command: str) -> str:
+        """Stable key for a command vector, used to remember which credentials
+        have already been tried against it (whitespace-normalized)."""
+        return hashlib.sha1(" ".join((command or "").split()).encode()).hexdigest()
 
-        When the session has discovered credentials, this rewrites common tool
-        invocations to use them via command-line flags instead of relying on
-        interactive prompts (which are broken now that stdin=DEVNULL).
+    def _pick_credential(self, session, tried: Optional[set] = None) -> Optional[Dict]:
+        """Return the next credential to inject, or None if none are untried.
 
-        Only the first suitable credential is used (target-IP match preferred,
-        otherwise any credential). Returns the original command unchanged if no
-        credential is available or the tool pattern is not recognised.
+        Ordering: credentials matching the target host first, then any; plaintext
+        passwords before NTLM hashes (broad tool support). ``tried`` is a set of
+        ``(username, secret)`` keys already rejected by a service, used by the
+        rotation loop to advance past auth failures instead of giving up.
         """
+        tried = tried or set()
         if not session.credentials:
-            return command
-
-        # Prefer creds that match the target host; fall back to any available.
+            return None
         creds_for_target = [
             c for c in session.credentials
             if session.target_ip in (c.get('host', ''), c.get('service', ''), '')
         ]
         pool = creds_for_target or session.credentials
-        # Prefer plaintext-password creds (broad tool support); fall back to an
-        # NTLM hash for pass-the-hash against SMB/WinRM/Impacket tools only.
         password_creds = [
             c for c in pool if (c.get('secret_type') or 'password') != 'hash'
         ]
         hash_creds = [
             c for c in pool if (c.get('secret_type') or 'password') == 'hash'
         ]
-        cred = (password_creds or hash_creds or [None])[0]
+        for candidate in (password_creds or []) + (hash_creds or []):
+            key = ((candidate.get('username') or '').strip(),
+                   (candidate.get('secret') or '').strip())
+            if key not in tried:
+                return candidate
+        return None
+
+    def _inject_credentials(self, command: str, session,
+                            tried: Optional[set] = None,
+                            cred: Optional[Dict] = None) -> str:
+        """Rewrite a command to embed a known credential so it runs non-interactively.
+
+        When the session has discovered credentials, this rewrites common tool
+        invocations to use them via command-line flags instead of relying on
+        interactive prompts (which are broken now that stdin=DEVNULL).
+
+        ``cred`` is the specific credential to inject (from ``_pick_credential``);
+        when omitted, the first untried credential is chosen. Returns the original
+        command unchanged if no credential is available or the tool pattern is not
+        recognised.
+        """
+        if cred is None:
+            cred = self._pick_credential(session, tried)
         if not cred:
             return command
         user = (cred.get('username') or '').strip()
@@ -3161,242 +3183,57 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # Mark any service this command targets as in_progress (state machine).
             self._mark_services_in_progress(session, command)
 
-            # Inject known credentials before execution so tools run non-interactively
-            command = self._inject_credentials(command, session)
-            # Swap oversized brute-force wordlists for smaller ones so a single
-            # gobuster/ffuf can't run for the full timeout on a 220k-line list.
-            command = self._downsize_wordlists(command)
-            # Route one-shot MSF exploits to the persistent handler that the
-            # Shells tab monitors instead of letting the transient console own
-            # and then destroy the reverse session.
-            command = _route_msf_to_managed_handler(command, session)
-
-            # Credential injection and wordlist rewriting change the command,
-            # so the final command must pass the same gate immediately before
-            # it reaches create_subprocess_shell().
-            final_gate_error = self._execution_gate(
-                session_id, command, execution_mode
-            )
-            if final_gate_error:
-                logger.warning(
-                    f"Final command rejected for session {session_id}: "
-                    f"{final_gate_error}"
+            # Multi-credential rotation: try each untried credential in turn.
+            # On an auth-failure signal mark the rejected credential and retry
+            # the SAME command with the next one instead of abandoning the
+            # vector. Commands with no injectable credential run exactly once.
+            original_command = command
+            _fp = self._command_fingerprint(original_command)
+            _tried = self._rotation_tried.setdefault(_fp, set())
+            _max_attempts = 1 + len(session.credentials or [])
+            _record = None
+            for _attempt in range(_max_attempts):
+                _cred = self._pick_credential(session, tried=_tried)
+                command = self._inject_credentials(
+                    original_command, session, cred=_cred
                 )
-                session.status = "ready"
-                if job_id:
-                    self._update_job(
-                        job_id, "failed", exit_code=-1, error=final_gate_error
-                    )
+                command = self._downsize_wordlists(command)
+                command = _route_msf_to_managed_handler(command, session)
+                _record = await self._execute_prepared_command(
+                    session_id, command, command_id, job_id,
+                    execution_mode, session,
+                )
+                if not _auth_failure_in_output(
+                    command, _record.get("output", ""),
+                    _record.get("error", ""),
+                ):
+                    break
+                if _cred is None:
+                    break
+                _tried.add((
+                    (_cred.get("username") or "").strip(),
+                    (_cred.get("secret") or "").strip(),
+                ))
+            if _record is None:
                 return {
                     "command_id": command_id,
-                    "command": command,
+                    "command": original_command,
                     "output": "",
-                    "error": final_gate_error,
+                    "error": "Command execution failed",
                     "return_code": -1,
                     "timestamp": datetime.now().isoformat(),
                     "success": False,
                 }
 
-            # Per-command timeout: long directory/DNS brute-forcers are capped much
-            # tighter than the global timeout (they return useful partial output
-            # early), so one big scan can't burn 10 minutes.
-            _cmd_timeout = self._command_timeout(command)
+            # Advance the agentic loop exactly once on the FINAL result. The
+            # helper above already recorded/saved/streamed each attempt; rotation
+            # must NOT let the AI pivot between credential attempts, so the
+            # strategist + tactical decision run only after rotation settles.
+            command = _record.get("command", original_command)
+            command_success = bool(_record.get("success"))
+            sanitized_output = _record.get("output", "")
+            sanitized_error = _record.get("error", "")
 
-            # stdin=DEVNULL: close stdin so tools that prompt for a password
-            # (smbclient, mysql, ftp, etc.) receive EOF instead of blocking on
-            # terminal input. All credentials must be embedded in command flags.
-            # start_new_session=True puts the tool in its own process group so a
-            # timeout can kill the WHOLE tree. Without it, process.kill() would
-            # only kill the /bin/sh wrapper and leave the real tool (nmap, hydra,
-            # smbclient…) orphaned and running.
-            # limit=: raise the StreamReader line-buffer well above the 64 KB
-            # default so a single very long output line (ffuf/gobuster progress,
-            # minified JS) does not crash the reader with "Separator is not found,
-            # and chunk exceed the limit" — which silently failed whole commands.
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd="/tmp",  # Safe directory
-                start_new_session=True,
-                limit=10 * 1024 * 1024,  # 10 MB per line
-            )
-            try:
-                conn = self._db_connect()
-                conn.execute(
-                    "UPDATE jobs SET pid=? WHERE job_id=?", (process.pid, job_id)
-                )
-                conn.commit()
-                conn.close()
-            except Exception:
-                pass
-
-            # Stream stdout + stderr line-by-line, broadcasting each chunk to
-            # WebSocket clients if a broadcast_callback is registered (set by
-            # main.py). Falls back gracefully if no callback is set.
-            stdout_chunks: List[str] = []
-            stderr_chunks: List[str] = []
-
-            _LIVE_MAX = 8000  # rolling cap so buffer never grows unbounded
-
-            async def _read_stream(stream, chunks, stream_name):
-                """Read a subprocess stream line-by-line, but survive lines that
-                exceed the buffer limit (LimitOverrunError / ValueError) by draining
-                a raw chunk instead of letting the whole command fail."""
-                while True:
-                    try:
-                        line = await stream.readline()
-                    except (asyncio.LimitOverrunError, ValueError):
-                        try:
-                            line = await stream.read(65536)
-                        except Exception:
-                            break
-                    except Exception:
-                        break
-                    if not line:
-                        break
-                    text = line.decode(errors="replace") if isinstance(line, (bytes, bytearray)) else line
-                    chunks.append(text)
-                    self._live_output[session_id] = (
-                        self._live_output.get(session_id, "") + text
-                    )[-_LIVE_MAX:]
-                    if self.broadcast_callback:
-                        try:
-                            await self.broadcast_callback("command_output_chunk", {
-                                "session_id": session_id,
-                                "command_id": command_id,
-                                "stream": stream_name,
-                                "chunk": text,
-                            })
-                        except Exception:
-                            pass
-
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(
-                        _read_stream(process.stdout, stdout_chunks, "stdout"),
-                        _read_stream(process.stderr, stderr_chunks, "stderr"),
-                    ),
-                    timeout=_cmd_timeout
-                )
-            except asyncio.TimeoutError:
-                # Kill the whole process group so the real tool dies, not just
-                # the shell wrapper (which would leave an orphaned nmap/hydra).
-                try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    pass
-                logger.warning(f"Command timed out after {_cmd_timeout}s for session {session_id}: {command[:80]}")
-
-            await process.wait()
-            return_code = process.returncode
-
-            raw_output = "".join(stdout_chunks)
-            raw_error = "".join(stderr_chunks)
-            
-            # Sanitize outputs to remove noise and truncate large outputs
-            sanitized_output = self._sanitize_output(raw_output)
-            sanitized_error = self._sanitize_output(raw_error)
-            self._update_target_fingerprint_from_output(
-                session, command, sanitized_output
-            )
-            target_error = self._target_response_error(command, sanitized_output)
-            command_success = return_code == 0 and target_error is None
-            if target_error and not sanitized_error:
-                sanitized_error = target_error
-            
-            # Log command execution
-            command_record = {
-                "command_id": command_id,
-                "job_id": job_id,
-                "command": command,
-                "output": sanitized_output,
-                "error": sanitized_error,
-                "return_code": return_code,
-                "timestamp": datetime.now().isoformat(),
-                "success": command_success
-            }
-            
-            session.commands_executed.append(command_record)
-            if job_id:
-                self._update_job(job_id, "completed", exit_code=return_code,
-                                 error=target_error or "")
-            self._record_event(session_id, "command_finished", {
-                "command_id": command_id, "job_id": job_id,
-                "success": command_success, "return_code": return_code,
-            })
-            
-            # Save sanitized output to database
-            self._save_command_result(
-                session_id, command_id, command, sanitized_output, sanitized_error,
-                return_code, success=command_success,
-            )
-
-            # Auto-extract any credentials found in this command's output.
-            self._extract_and_store_credentials(session_id, command, sanitized_output + "\n" + sanitized_error)
-
-            # Settle the test-state of any service this command touched.
-            self._settle_service_states(
-                session, command, sanitized_output, success=command_success
-            )
-
-            # Coverage engine: mark playbook steps this command attempted, and
-            # recompute coverage-derived progress. No-op unless COVERAGE_ENGINE on.
-            # Exploitation/post-ex steps only count as done when the command
-            # actually landed a confirmed exploit signal (a shell, dump, root, or
-            # crackmapexec Pwn3d) — not merely on exit code 0, which most exploit
-            # tools return even when they fail to compromise the target.
-            _combined_out = (sanitized_output + "\n" + sanitized_error).lower()
-            _exploit_success = command_success and bool(
-                _matched_compromise_signals(command, _combined_out)
-            )
-            self._ensure_coverage(session)
-            self._update_coverage_from_command(
-                session, command, success=command_success,
-                exploit_success=_exploit_success,
-            )
-            self._recompute_coverage_progress(session)
-
-            # Feed this command's result into the hybrid retrieval index so it can
-            # be surfaced later even after it falls out of the recent-history window.
-            if command_success and sanitized_output:
-                finding_text = (
-                    f"$ {command}\n{self._extract_command_summary(sanitized_output)}"
-                )
-                self._index_finding(session_id, finding_text, {
-                    "command": command[:200],
-                    "stage": session.current_stage,
-                    "timestamp": datetime.now().isoformat(),
-                })
-
-            # Clear the live-output buffer now that the command is done.
-            self._live_output.pop(session_id, None)
-
-            # Watchdog: a command completed → the loop is alive. Record progress
-            # and clear any accumulated nudge count for this session.
-            self._touch_activity(session_id)
-            self._watchdog_nudges.pop(session_id, None)
-
-            # Update session status
-            session.status = "ready"
-            
-            # Episode summary: every _EPISODE_SIZE commands compress old history
-            # so local Ollama models don't lose track of earlier findings.
-            self._maybe_create_episode_summary(session_id)
-
-            # Strategic reflection: every _PLANNER_INTERVAL commands the strategist
-            # steps back, updates the plan + objective progress, and may mark the
-            # objective complete. Runs BEFORE the tactical decision so the next
-            # command benefits from the fresh plan. If it declares the objective
-            # met, halt the loop and stop here (no further command is chosen).
             await self._maybe_run_strategist(session_id)
             # Coverage engine owns the progress number + completion when enabled,
             # overriding the strategist's estimate (prevents premature 100%).
@@ -3407,7 +3244,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 )
                 session.status = "completed"
                 self._save_session_status(session_id, session)
-                return command_record
+                return _record
 
             # If successful, analyze sanitized output with AI for next steps
             # If failed, analyze error with AI for correction (self-healing loop)
@@ -3415,10 +3252,10 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 await self._process_command_output(session_id, command, sanitized_output, None)
             else:
                 await self._process_command_output(session_id, command, sanitized_output, sanitized_error)
-            
-            logger.info(f"Command executed for {session_id}, return code: {return_code}")
-            
-            return command_record
+
+            logger.info(f"Command executed for {session_id}, return code: {_record.get('return_code')}")
+
+            return _record
             
         except Exception as e:
             logger.error(f"Command execution failed for {session_id}: {e}")
@@ -3436,6 +3273,261 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 "success": False
             }
     
+
+    async def _execute_prepared_command(
+        self, session_id: str, command: str, command_id: str,
+        job_id: str, execution_mode: str, session,
+    ) -> Dict:
+        """Run an already-prepared command (credential-injected, wordlist-
+        downsized, MSF-routed) through the final policy gate, execute it,
+        and record/stream its result. Split out so the credential-rotation
+        loop in execute_command can retry the same vector with a different
+        credential without duplicating the whole execution pipeline."""
+        final_gate_error = self._execution_gate(
+            session_id, command, execution_mode
+        )
+        if final_gate_error:
+            logger.warning(
+                f"Final command rejected for session {session_id}: "
+                f"{final_gate_error}"
+            )
+            session.status = "ready"
+            if job_id:
+                self._update_job(
+                    job_id, "failed", exit_code=-1, error=final_gate_error
+                )
+            return {
+                "command_id": command_id,
+                "command": command,
+                "output": "",
+                "error": final_gate_error,
+                "return_code": -1,
+                "timestamp": datetime.now().isoformat(),
+                "success": False,
+            }
+
+        # Per-command timeout: long directory/DNS brute-forcers are capped much
+        # tighter than the global timeout (they return useful partial output
+        # early), so one big scan can't burn 10 minutes.
+        _cmd_timeout = self._command_timeout(command)
+
+        # stdin=DEVNULL: close stdin so tools that prompt for a password
+        # (smbclient, mysql, ftp, etc.) receive EOF instead of blocking on
+        # terminal input. All credentials must be embedded in command flags.
+        # start_new_session=True puts the tool in its own process group so a
+        # timeout can kill the WHOLE tree. Without it, process.kill() would
+        # only kill the /bin/sh wrapper and leave the real tool (nmap, hydra,
+        # smbclient…) orphaned and running.
+        # limit=: raise the StreamReader line-buffer well above the 64 KB
+        # default so a single very long output line (ffuf/gobuster progress,
+        # minified JS) does not crash the reader with "Separator is not found,
+        # and chunk exceed the limit" — which silently failed whole commands.
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd="/tmp",  # Safe directory
+            start_new_session=True,
+            limit=10 * 1024 * 1024,  # 10 MB per line
+        )
+        try:
+            conn = self._db_connect()
+            conn.execute(
+                "UPDATE jobs SET pid=? WHERE job_id=?", (process.pid, job_id)
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+        # Stream stdout + stderr line-by-line, broadcasting each chunk to
+        # WebSocket clients if a broadcast_callback is registered (set by
+        # main.py). Falls back gracefully if no callback is set.
+        stdout_chunks: List[str] = []
+        stderr_chunks: List[str] = []
+
+        _LIVE_MAX = 8000  # rolling cap so buffer never grows unbounded
+
+        async def _read_stream(stream, chunks, stream_name):
+            """Read a subprocess stream line-by-line, but survive lines that
+            exceed the buffer limit (LimitOverrunError / ValueError) by draining
+            a raw chunk instead of letting the whole command fail."""
+            while True:
+                try:
+                    line = await stream.readline()
+                except (asyncio.LimitOverrunError, ValueError):
+                    try:
+                        line = await stream.read(65536)
+                    except Exception:
+                        break
+                except Exception:
+                    break
+                if not line:
+                    break
+                text = line.decode(errors="replace") if isinstance(line, (bytes, bytearray)) else line
+                chunks.append(text)
+                self._live_output[session_id] = (
+                    self._live_output.get(session_id, "") + text
+                )[-_LIVE_MAX:]
+                if self.broadcast_callback:
+                    try:
+                        await self.broadcast_callback("command_output_chunk", {
+                            "session_id": session_id,
+                            "command_id": command_id,
+                            "stream": stream_name,
+                            "chunk": text,
+                        })
+                    except Exception:
+                        pass
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _read_stream(process.stdout, stdout_chunks, "stdout"),
+                    _read_stream(process.stderr, stderr_chunks, "stderr"),
+                ),
+                timeout=_cmd_timeout
+            )
+        except asyncio.TimeoutError:
+            # Kill the whole process group so the real tool dies, not just
+            # the shell wrapper (which would leave an orphaned nmap/hydra).
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+            logger.warning(f"Command timed out after {_cmd_timeout}s for session {session_id}: {command[:80]}")
+
+        await process.wait()
+        return_code = process.returncode
+
+        raw_output = "".join(stdout_chunks)
+        raw_error = "".join(stderr_chunks)
+
+        # Sanitize outputs to remove noise and truncate large outputs
+        sanitized_output = self._sanitize_output(raw_output)
+        sanitized_error = self._sanitize_output(raw_error)
+        self._update_target_fingerprint_from_output(
+            session, command, sanitized_output
+        )
+        target_error = self._target_response_error(command, sanitized_output)
+        command_success = return_code == 0 and target_error is None
+        if target_error and not sanitized_error:
+            sanitized_error = target_error
+
+        # Log command execution
+        command_record = {
+            "command_id": command_id,
+            "job_id": job_id,
+            "command": command,
+            "output": sanitized_output,
+            "error": sanitized_error,
+            "return_code": return_code,
+            "timestamp": datetime.now().isoformat(),
+            "success": command_success
+        }
+
+        session.commands_executed.append(command_record)
+        if job_id:
+            self._update_job(job_id, "completed", exit_code=return_code,
+                             error=target_error or "")
+        self._record_event(session_id, "command_finished", {
+            "command_id": command_id, "job_id": job_id,
+            "success": command_success, "return_code": return_code,
+        })
+
+        # Save sanitized output to database
+        self._save_command_result(
+            session_id, command_id, command, sanitized_output, sanitized_error,
+            return_code, success=command_success,
+        )
+
+        # Auto-extract any credentials found in this command's output.
+        self._extract_and_store_credentials(session_id, command, sanitized_output + "\n" + sanitized_error)
+
+        # Settle the test-state of any service this command touched.
+        self._settle_service_states(
+            session, command, sanitized_output, success=command_success
+        )
+
+        # Coverage engine: mark playbook steps this command attempted, and
+        # recompute coverage-derived progress. No-op unless COVERAGE_ENGINE on.
+        # Exploitation/post-ex steps only count as done when the command
+        # actually landed a confirmed exploit signal (a shell, dump, root, or
+        # crackmapexec Pwn3d) — not merely on exit code 0, which most exploit
+        # tools return even when they fail to compromise the target.
+        _combined_out = (sanitized_output + "\n" + sanitized_error).lower()
+        _exploit_success = command_success and bool(
+            _matched_compromise_signals(command, _combined_out)
+        )
+        self._ensure_coverage(session)
+        self._update_coverage_from_command(
+            session, command, success=command_success,
+            exploit_success=_exploit_success,
+        )
+        self._recompute_coverage_progress(session)
+
+        # Feed this command's result into the hybrid retrieval index so it can
+        # be surfaced later even after it falls out of the recent-history window.
+        if command_success and sanitized_output:
+            finding_text = (
+                f"$ {command}\n{self._extract_command_summary(sanitized_output)}"
+            )
+            self._index_finding(session_id, finding_text, {
+                "command": command[:200],
+                "stage": session.current_stage,
+                "timestamp": datetime.now().isoformat(),
+            })
+
+        # Clear the live-output buffer now that the command is done.
+        self._live_output.pop(session_id, None)
+
+        # Watchdog: a command completed → the loop is alive. Record progress
+        # and clear any accumulated nudge count for this session.
+        self._touch_activity(session_id)
+        self._watchdog_nudges.pop(session_id, None)
+
+        # Update session status
+        session.status = "ready"
+
+        # Episode summary: every _EPISODE_SIZE commands compress old history
+        # so local Ollama models don't lose track of earlier findings.
+        self._maybe_create_episode_summary(session_id)
+
+        # Strategic reflection: every _PLANNER_INTERVAL commands the strategist
+        # steps back, updates the plan + objective progress, and may mark the
+        # objective complete. Runs BEFORE the tactical decision so the next
+        # command benefits from the fresh plan. If it declares the objective
+        # met, halt the loop and stop here (no further command is chosen).
+        await self._maybe_run_strategist(session_id)
+        # Coverage engine owns the progress number + completion when enabled,
+        # overriding the strategist's estimate (prevents premature 100%).
+        self._recompute_coverage_progress(session)
+        if session.objective_complete:
+            logger.info(
+                f"Session {session_id}: objective complete — halting agentic loop."
+            )
+            session.status = "completed"
+            self._save_session_status(session_id, session)
+            return command_record
+
+        # If successful, analyze sanitized output with AI for next steps
+        # If failed, analyze error with AI for correction (self-healing loop)
+        if command_success and sanitized_output:
+            await self._process_command_output(session_id, command, sanitized_output, None)
+        else:
+            await self._process_command_output(session_id, command, sanitized_output, sanitized_error)
+
+        logger.info(f"Command executed for {session_id}, return code: {return_code}")
+
+        return command_record
     async def _process_command_output(self, session_id: str, command: str, output: str, error: Optional[str] = None):
         """Process command output and decide next steps with Agentic Loop.
 

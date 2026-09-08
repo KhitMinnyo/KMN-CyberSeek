@@ -5,15 +5,15 @@
       "status": "done"
     },
     {
-      "text": "Implement multi-credential reuse (loop creds until one works, incl. pass-the-hash)",
+      "text": "Implement multi-credential rotation (loop creds until one works, incl. pass-the-hash) — wire _rotation_tried + _auth_failure_in_output",
       "status": "in_progress"
     },
     {
-      "text": "Trace post-shell flow (shell_manager / msf / compromise_evidence) and find where post-shell commands are delivered",
+      "text": "Trace post-shell flow and find where post-shell commands are delivered",
       "status": "done"
     },
     {
-      "text": "Implement post-shell command delivery (multi-stage msf -x / shell command runner)",
+      "text": "Implement post-shell auto-delivery (wire auto_post_shell + _post_shell_delivered in _persist_shell_session)",
       "status": "pending"
     },
     {
@@ -29,5 +29,5 @@
       "status": "pending"
     }
   ],
-  "updatedAt": 1788871755938
+  "updatedAt": 1788882700692
 }
