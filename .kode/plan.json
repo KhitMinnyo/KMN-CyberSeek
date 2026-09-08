@@ -1,47 +1,27 @@
 {
   "steps": [
     {
-      "text": "Codebase ကို အသေးစိတ်လေ့လာ (core, ai, version, prompts, config)",
-      "status": "done"
-    },
-    {
-      "text": "Multi-credential reuse + pass-the-hash loop ပြင်ဆင်",
-      "status": "done"
-    },
-    {
-      "text": "Import alias naming mismatch ၃ ခု ပြင် (_ad_module/_exfiltration/_llm_security)",
+      "text": "Read full _inject_credentials + its call site + credential data model",
       "status": "in_progress"
     },
     {
-      "text": "AD module (Kerberoast/DCSync/BloodHound/AD enumeration) wire-up စစ်",
+      "text": "Implement multi-credential reuse (loop creds until one works, incl. pass-the-hash)",
       "status": "pending"
     },
     {
-      "text": "Data exfiltration module wire-up စစ်",
+      "text": "Trace post-shell flow (shell_manager / msf / compromise_evidence) and find where post-shell commands are delivered",
       "status": "pending"
     },
     {
-      "text": "LLM security testing module wire-up စစ်",
+      "text": "Implement post-shell command delivery (multi-stage msf -x / shell command runner)",
       "status": "pending"
     },
     {
-      "text": "Post-shell command delivery wire-up စစ်",
+      "text": "Add/extend tests for both features",
       "status": "pending"
     },
     {
-      "text": "Local Ollama default model 8B → security-tuned",
-      "status": "pending"
-    },
-    {
-      "text": "Import + module load test run",
-      "status": "pending"
-    },
-    {
-      "text": "Tests run + pass",
-      "status": "pending"
-    },
-    {
-      "text": "Benchmark confirmed % တိုင်း",
+      "text": "Run test suite + compileall; fix regressions",
       "status": "pending"
     },
     {
@@ -49,5 +29,5 @@
       "status": "pending"
     }
   ],
-  "updatedAt": 1788869107580
+  "updatedAt": 1788871276728
 }
