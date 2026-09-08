@@ -6,7 +6,7 @@
     },
     {
       "text": "Implement multi-credential rotation (loop creds until one works, incl. pass-the-hash) — wire _rotation_tried + _auth_failure_in_output",
-      "status": "in_progress"
+      "status": "done"
     },
     {
       "text": "Trace post-shell flow and find where post-shell commands are delivered",
@@ -14,7 +14,7 @@
     },
     {
       "text": "Implement post-shell auto-delivery (wire auto_post_shell + _post_shell_delivered in _persist_shell_session)",
-      "status": "pending"
+      "status": "in_progress"
     },
     {
       "text": "Add/extend tests for both features",
@@ -29,5 +29,5 @@
       "status": "pending"
     }
   ],
-  "updatedAt": 1788882700692
+  "updatedAt": 1788884413956
 }
