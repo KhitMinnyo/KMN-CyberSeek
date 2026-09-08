@@ -1,16 +1,16 @@
 {
   "steps": [
     {
-      "text": "Read full _inject_credentials + its call site + credential data model",
-      "status": "in_progress"
+      "text": "Read full _inject_credentials + call site + credential data model",
+      "status": "done"
     },
     {
       "text": "Implement multi-credential reuse (loop creds until one works, incl. pass-the-hash)",
-      "status": "pending"
+      "status": "in_progress"
     },
     {
       "text": "Trace post-shell flow (shell_manager / msf / compromise_evidence) and find where post-shell commands are delivered",
-      "status": "pending"
+      "status": "done"
     },
     {
       "text": "Implement post-shell command delivery (multi-stage msf -x / shell command runner)",
@@ -29,5 +29,5 @@
       "status": "pending"
     }
   ],
-  "updatedAt": 1788871276728
+  "updatedAt": 1788871755938
 }
