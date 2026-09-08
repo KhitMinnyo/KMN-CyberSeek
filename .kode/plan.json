@@ -18,16 +18,15 @@
     },
     {
       "text": "Add/extend tests for post-shell auto-delivery",
-      "status": "in_progress"
+      "status": "done"
     },
     {
       "text": "Run test suite + compileall; fix regressions",
-      "status": "pending"
+      "status": "done"
     },
     {
       "text": "Version bump + changelog update",
-      "status": "pending"
+      "status": "done"
     }
-  ],
-  "updatedAt": 1788886219142
+  ]
 }
