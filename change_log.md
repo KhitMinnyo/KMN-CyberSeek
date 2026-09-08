@@ -4,6 +4,22 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.6.1] — 2026-09-08 — Automatic post-shell command delivery
+
+### Added
+- **Automatic post-exploitation batch delivery.** When a shell lands on the managed
+  handler, the canned recon/harvest batch (OS fingerprint, credential harvest, AD
+  recon) is now delivered immediately through the persistent handler instead of
+  waiting for the AI to issue commands one at a time. Guarded by the global
+  `AUTO_POST_SHELL` toggle and a per-session `auto_post_shell` opt-out, and
+  de-duplicated per `(handler, msf_id)` pair so reconnects never re-run the batch.
+
+### Changed
+- `Session` now carries an explicit `auto_post_shell` flag so a single engagement
+  can opt out of automatic post-shell work without changing the global default.
+
+---
+
 ## [2.6.0] — 2026-08-28 — Durable sessions, safer execution, and parallel analysis
 
 ### Added
