@@ -1,0 +1,66 @@
+229:def _detect_exhausted_target(cmds: List[str], stage: str) -> str:
+309:def _auth_failure_in_output(command: str, output: str, error: str = "") -> bool:
+501:        self.max_auto_depth = 15  # Maximum consecutive auto-executed commands before requiring human review
+570:        self._auto_pivot_count: int = 0
+571:        self._MAX_AUTO_PIVOTS: int = int(os.getenv("MAX_AUTO_PIVOTS", "12"))
+573:        # Finding-aware stagnation tracker. The loop is only "stuck" when it keeps
+581:        self._stagnation_counter: int = 0
+615:        self._rotation_tried: Dict[str, set] = {}
+1390:    def create_session(self, target_ip: str, target_domain: Optional[str] = None,
+1392:                      max_auto_depth: int = 25, authorization_confirmed: bool = False,
+1428:        session.max_auto_depth = max_auto_depth  # Allow customizing max auto depth
+1474:        logger.info(f"Created new session: {session_id} for target {target_ip} (auto_approve: {auto_approve}, max_auto_depth: {max_auto_depth})")
+2333:        is_high_risk = self.requires_approval(command)
+2385:        return a concrete non-empty command. Used by _handle_empty_command() to
+2546:                await self._handle_empty_command(session_id, "analyze_no_response")
+2595:                await self._handle_empty_command(session_id, "analyze")
+2604:            is_high_risk = self.requires_approval(_cmd) or _decision_risk == "high"
+2664:    def requires_approval(self, command: str) -> bool:
+2875:            "requires_approval": self.requires_approval(command),
+2877:                command, "high" if self.requires_approval(command) else "medium"
+2894:                  _command_risk_level(command, "high" if self.requires_approval(command) else "low"),
+2925:    def _pick_credential(self, session, tried: Optional[set] = None) -> Optional[Dict]:
+2954:    def _inject_credentials(self, command: str, session,
+3192:            _tried = self._rotation_tried.setdefault(_fp, set())
+3206:                if not _auth_failure_in_output(
+3509:    async def _process_command_output(self, session_id: str, command: str, output: str, error: Optional[str] = None):
+3632:- Auto-execution depth counter: {session.auto_depth_counter}/{session.max_auto_depth}
+3669:Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
+3684:                await self._handle_empty_command(session_id, "post_command_no_response")
+3729:            #   2. Stage stagnation counter — catches longer loops where the AI
+3757:            # Check 2: finding-aware stagnation — count consecutive decisions since
+3779:                    session._stagnation_counter = 0
+3782:                    session._stagnation_counter += 1
+3789:                if session._stagnation_counter >= _stag_threshold:
+3791:                        f"SYSTEM OVERRIDE: {session._stagnation_counter} consecutive AI "
+3796:                    session._stagnation_counter = 0
+3814:                # instead of halting. _auto_pivot() enforces a safety cap and falls
+3816:                await self._auto_pivot(session_id, _loop_reason)
+3817:                return  # _auto_pivot() re-schedules _analyze_with_ai internally
+3872:                    self.requires_approval(_suggested)
+3884:                # Note: requires_approval() keyword gate is NOT applied here when
+3906:                # approval after max_auto_depth consecutive non-critical commands.
+3908:                if should_auto_execute and session.auto_depth_counter >= session.max_auto_depth:
+3910:                        f"Session {session_id} reached max auto-execution depth ({session.max_auto_depth}). "
+3949:                await self._handle_empty_command(session_id, "post_command")
+3993:                    (self.requires_approval(ai_response.suggested_command)
+4044:                session._auto_pivot_count = 0
+4045:                session._stagnation_counter = 0
+4335:    async def _handle_empty_command(self, session_id: str, source: str) -> None:
+4383:    async def _auto_pivot(self, session_id: str, loop_reason: str) -> None:
+4389:             see it under "EXHAUSTED ATTACK VECTORS — DO NOT RETRY".
+4393:        A safety cap (_MAX_AUTO_PIVOTS) stops runaway pivoting if the AI
+4400:        if session._auto_pivot_count >= session._MAX_AUTO_PIVOTS:
+4407:                f"Session {session_id}: max auto-pivots ({session._MAX_AUTO_PIVOTS}) "
+4411:            session.auto_depth_counter = session.max_auto_depth
+4415:                    f"⛔ HALTED — NEEDS OPERATOR. {session._MAX_AUTO_PIVOTS} auto-pivots "
+4433:        session._auto_pivot_count += 1
+4442:                f"Session {session_id}: auto-pivot #{session._auto_pivot_count} — "
+4448:                f"Session {session_id}: auto-pivot #{session._auto_pivot_count} — "
+4456:                f"AUTO-PIVOT #{session._auto_pivot_count}: '{exhausted_label}' marked exhausted. "
+5967:        session._stagnation_counter = 0
+6506:                        "requires_approval": normalized_risk == "high",
+7292:            "\n=== EXHAUSTED ATTACK VECTORS — DO NOT RETRY ===\n"
+7332:            session._auto_pivot_count = 0
+7334:            session._stagnation_counter = 0
+7386:            f"EXHAUSTED VECTORS: {', '.join(session.exhausted_services) or 'none'}\n"
