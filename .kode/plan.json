@@ -1,0 +1,45 @@
+{
+  "steps": [
+    {
+      "text": "Codebase ကို အသေးစိတ်လေ့လာ (core, ai, version, prompts, config)",
+      "status": "in_progress"
+    },
+    {
+      "text": "Multi-credential reuse + pass-the-hash loop ပြင်ဆင်",
+      "status": "pending"
+    },
+    {
+      "text": "AD module (Kerberoast/DCSync/BloodHound/AD enumeration) ထည့်",
+      "status": "pending"
+    },
+    {
+      "text": "Data exfiltration (stealthy) module ထည့်",
+      "status": "pending"
+    },
+    {
+      "text": "LLM security testing (offensive prompt injection) module ထည့်",
+      "status": "pending"
+    },
+    {
+      "text": "Post-shell command delivery (multi-stage msf script) ထည့်",
+      "status": "pending"
+    },
+    {
+      "text": "Local Ollama default model ပြောင်း (8B → security-tuned)",
+      "status": "pending"
+    },
+    {
+      "text": "Tests run + pass ဖြစ်အောင်လုပ်",
+      "status": "pending"
+    },
+    {
+      "text": "Benchmark run ပြီး confirmed % တိုင်း",
+      "status": "pending"
+    },
+    {
+      "text": "Version bump + changelog update",
+      "status": "pending"
+    }
+  ],
+  "updatedAt": 1788863842681
+}
