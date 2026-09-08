@@ -1,0 +1,14 @@
+{
+  "entries": [
+    {
+      "key": "project-structure",
+      "value": "Files: KMN-CyberSeek-review.md, LICENSE, README.md, _version.py, backend.log, bump_version.py, change_log.md, docs_server.py, features.md, frontend.py, main.py, ollama_note.md, project_idea.txt, requirements.txt, start.sh, terminal_output.txt\nFolders: ai, benchmarks, core, docs, evals, tests\n\n--- KMN-CyberSeek-review.md ---\n# KMN-CyberSeek — Code Review & အကြံပြုချက်များ\n\n_ပြန်လည်သုံးသပ်သည့်ရက်: 2026-08-19 · Version 2.3.3_\n\n---\n\n## အနှစ်ချုပ် (TL;DR)\n\nCodebase က တကယ်ကို engineering ကောင်းပါတယ် — resume/dedup, prompt-injection fence, credential reuse, watchdog, coverage engine, benchmark harness စတဲ့ အခြေခံ architecture တွေ ခိုင်မာပါတယ်။\n\nဒါပေမဲ့ **\"အားမရဘူး\" ဆိုတဲ့ ခံစားချက်ရဲ့ တကယ့်အရင်းအမြစ်ကို သင့်ကိုယ်ပိုင် benchmark ကပဲ ပြထားတယ်** —\n\n> `benchmarks/README.md`: **touched 16/35 (45.7%)**, **confirmed 1/35 (2.9%)**\n> Coverage engine ထည့်ပြီးနောက်လည်း — touched 17/35, confirmed **1/35 အတိုင်း** မတိုးဘူး။\n\nဆိုလိုတာက — **engine က service တွေကို \"ထိတွေ့/စကင်\" လုပ်နိုင်ပေမဲ့ တကယ် exploit လုပ်ပြီး confirm မလုပ်နိုင်ဘူး**။ Enumeration မှာ ရပ်နေတယ်။ ဒါဟာ single-issue မဟုတ်ဘဲ design-level အကြောင်းရင်း ၅–၆ ချက် ပေါင်းစပ်နေတာပါ။ အောက်မှာ အဆင့်လိုက် ရှင်းပြထားပါတယ်။\n\n---\n\n## အဓိကပြဿနာ ၁ — Anti-loop / Auto-pivot guard တွေက exploit မလုပ်ရသေးခင် service ကို စွန့်ပစ်တယ် 🔴 (အမြင့်ဆုံး ဦးစားပေး)\n\n**နေရာ:** `core/orchestrator.py` — `_process_command_output` (line ~2386), `_auto_pivot` (2759), `_detect_exhausted_target` (150)\n\nLogic ဆက်စပ်ပုံ:\n\n1. Stage တစ်ခုတည်းမှာ AI decision **၈ ကြိမ်** ဆက်တိုက်ဖြစ်ရင် \"stuck\" လို့ သတ်မှတ်တယ် (line 2393)။\n2. `_auto_pivot` က အဲဒီ service တစ်ခုလုံးကို (ဥပမာ `smb`, `tomcat_8080`) **\"EXHAUSTED — DO NOT RETRY\"** အဖြစ် mark လုပ်ပြီး တခြား vector ကို ကူးတယ်။\n3. Pivot **၆ ကြိမ်** (`MAX_AUTO_PIVOTS=6`) ပြည့်ရင် session တစ်ခုလုံး ရပ်ပြီး manual စောင့်တယ်။\n\n**ဘာကြောင့် ဒါက confirmed rate ကို သတ်နေတာလဲ:** Exploitation ဆိုတာ သဘောသဘာဝအရ service **တစ်ခုတည်း**ပေါ်မှာ ကြိမ်ဖန်များစွာ (fingerprint → default creds → exploit → shell stabilize) လုပ်ရတာ။ ဒါပေမဲ့ stagnation counter က finding အသစ်ရ/မရ ဂရုမစိုက်ဘဲ \"stage တူတဲ့ decision အရေအတွက်\"ကိုပဲ ရေတယ်။ ဒါကြောင့် Tomcat ကို exploit လုပ်ဖို့ ကြိုးစားနေတုန်း ၈ ဆင့်ပြည့်သွားရင် — အဲဒီ Tomcat ကိုပဲ \"exhausted\" လုပ်ပြီး ထွက်ပြေးတယ်။ Exploit မအောင်မြင်ခင် စွန့်ပစ်လိုက်တာ။\n\n**အကြံပြုချက်:**\n\n- Stagnation guard ကို **finding-aware** ဖြစ်အောင်လုပ်ပါ — decision ၈ ဆင့်အတွင်း credential အသစ်၊ ser\n... (truncated)\n\nai/: __pycache__, connector.py, prompts.py\n\nbenchmarks/: README.md, __init__.py, __pycache__, labs, score.py\n\ncore/: __pycache__, ad_module.py, ai_action.py, bruteforce_worker.py, callback.py\n",
+      "tags": [
+        "project-analysis"
+      ],
+      "createdAt": 1788881746502,
+      "updatedAt": 1788881746502,
+      "vector": null
+    }
+  ]
+}
