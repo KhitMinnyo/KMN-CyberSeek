@@ -3302,7 +3302,7 @@ def show_settings():
         current_ds_key = env_vars.get("DEEPSEEK_API_KEY", "")
         current_ds_model = env_vars.get("DEEPSEEK_MODEL", "deepseek-chat")
         current_ollama_url = env_vars.get("OLLAMA_URL", "http://localhost:11434")
-        current_ollama_model = env_vars.get("OLLAMA_MODEL", "deepseek-r1:8b")
+        current_ollama_model = env_vars.get("OLLAMA_MODEL", "qwen2.5:14b")
 
         ai_provider = st.selectbox(
             "AI Provider",
@@ -3629,13 +3629,13 @@ def show_settings():
         )
         ctx_options = {
             "4 096  — small/fast (llama3.2:3b, deepseek-r1:7b)": 4096,
-            "8 192  — default (deepseek-r1:8b, llama3.1:8b) ★": 8192,
+            "8 192  — small (llama3.1:8b, deepseek-r1:8b)": 8192,
             "16 384 — mid (mistral, codellama:13b)": 16384,
-            "32 768 — large (qwen2.5:14b, deepseek-r1:14b)": 32768,
+            "32 768 — default (qwen2.5:14b, deepseek-r1:14b) ★": 32768,
             "65 536 — xlarge (qwen2.5:32b, deepseek-r1:32b)": 65536,
             "131 072 — huge (qwen2.5:72b, deepseek-r1:70b)": 131072,
         }
-        ctx_default_label = "8 192  — default (deepseek-r1:8b, llama3.1:8b) ★"
+        ctx_default_label = "32 768 — default (qwen2.5:14b, deepseek-r1:14b) ★"
         selected_ctx_label = st.selectbox(
             "Model context window (tokens)",
             list(ctx_options.keys()),

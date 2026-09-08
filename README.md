@@ -63,8 +63,8 @@ cd KMN-CyberSeek
 ```env
 AI_PROVIDER=local
 OLLAMA_URL=http://192.168.1.50:11434
-OLLAMA_MODEL=deepseek-r1:8b
-OLLAMA_CONTEXT_WINDOW=8192
+OLLAMA_MODEL=qwen2.5:14b
+OLLAMA_CONTEXT_WINDOW=32768
 ```
 
 Remote Ollama host: `OLLAMA_HOST=0.0.0.0 ollama serve`

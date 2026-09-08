@@ -87,7 +87,7 @@ class KMN_AI_Connector:
         Args:
             provider: "local" for Ollama, "api" for DeepSeek API. If None, auto-detects based on API key.
             api_key: API key for DeepSeek API (optional, will check env vars if not provided)
-            local_model: Ollama model tag to use, e.g. "deepseek-r1:8b" or a security-tuned
+            local_model: Ollama model tag to use, e.g. "qwen2.5:14b" or a security-tuned
                 model like "DeepHat/DeepHat-V1-7B". Falls back to OLLAMA_MODEL env var,
                 then a built-in default. Any model you've `ollama pull`ed works here.
             ollama_url: Base URL of the Ollama server, e.g. "http://localhost:11434".
@@ -149,7 +149,7 @@ class KMN_AI_Connector:
 
         # Default models - configurable so any Ollama model (e.g. a security-tuned model
         # like DeepHat/DeepHat-V1-7B) can be used without code changes.
-        self.local_model = local_model or os.getenv("OLLAMA_MODEL") or "deepseek-r1:8b"
+        self.local_model = local_model or os.getenv("OLLAMA_MODEL") or "qwen2.5:14b"
         self.api_model = api_model or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
         
         # ── Context-window budget ─────────────────────────────────────────────
