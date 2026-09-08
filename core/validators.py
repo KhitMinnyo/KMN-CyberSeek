@@ -521,8 +521,8 @@ def validate_root_privilege(output: str) -> bool:
         _re.IGNORECASE,
     )
     win_system = _re.compile(
-        r"(NT AUTHORITY\\\\SYSTEM|User Name.*SYSTEM"
-        r"|SeDebugPrivilege.*Enabled|BUILTIN\\\\Administrators)",
+        r"(NT AUTHORITY\\SYSTEM|User Name.*SYSTEM"
+        r"|SeDebugPrivilege.*Enabled|BUILTIN\\Administrators)",
         _re.IGNORECASE,
     )
     return bool(linux_root.search(out) or win_system.search(out))

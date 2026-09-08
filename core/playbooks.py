@@ -393,7 +393,7 @@ def classify_service(svc: dict) -> List[str]:
         add("jmx")
 
     if not keys:
-        add("unknown")
+        add("generic")
     return keys
 
 

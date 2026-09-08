@@ -109,7 +109,17 @@ def _normalise_action_type(raw: str) -> str:
     s = (raw or "").strip().lower()
     if s in ACTION_TYPES:
         return s
-    for at in ACTION_TYPES:
+    # Normalise space/hyphen separators to underscores first so "post
+    # exploitation" maps to "post_exploit" instead of matching the shorter
+    # "exploit" token first (substring-ordering bug).
+    s = re.sub(r"[\s-]+", "_", s)
+    if s in ACTION_TYPES:
+        return s
+    # Match the LONGEST known action type first. ACTION_TYPES contains both
+    # "exploit" and "post_exploit"; a bare substring scan would return "exploit"
+    # for "post_exploitation" because "exploit" is a prefix-suffix of it. Sorting
+    # by length so "post_exploit" wins fixes that ordering bug.
+    for at in sorted(ACTION_TYPES, key=len, reverse=True):
         if at in s:
             return at
     return "other"

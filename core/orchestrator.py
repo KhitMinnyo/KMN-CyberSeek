@@ -2580,7 +2580,9 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
             # Update status based on auto-approve setting and risk level.
             # FULL_AUTO_MODE overrides: execute everything regardless of risk.
-            if FULL_AUTO_MODE or (session.auto_approve and _decision_risk in ["low", "medium"]):
+            # auto_approve=True means the operator has accepted full autonomy,
+            # so it is treated identically to FULL_AUTO_MODE (all risk levels).
+            if FULL_AUTO_MODE or session.auto_approve:
                 session.status = "executing"
             else:
                 session.status = "ready"
@@ -2602,7 +2604,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # When auto_approve=True the session operator has accepted full autonomy —
             # treat it identically to FULL_AUTO_MODE (all risk levels auto-execute).
             is_high_risk = self.requires_approval(_cmd) or _decision_risk == "high"
-            if safe_only or FULL_AUTO_MODE or (session.auto_approve and not is_high_risk):
+            if safe_only or FULL_AUTO_MODE or session.auto_approve:
                 automated_error = self._execution_gate(
                     session_id, _cmd,
                     execution_mode=(

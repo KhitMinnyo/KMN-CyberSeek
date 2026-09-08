@@ -24,6 +24,12 @@ if str(ROOT) not in sys.path:
 from core.msf_rpc import MsfRpcClient, MsfRpcError, RpcSessionBridge
 
 
+def run(coro):
+    """Drive a coroutine on a fresh event loop per call, so ordering
+    relative to asyncio.run() in other test modules never matters."""
+    return asyncio.run(coro)
+
+
 class MockRpcClient(MsfRpcClient):
     def __init__(self):
         super().__init__("http://mock-msf:55553")
@@ -136,7 +142,7 @@ def test_structured_session_list_non_empty():
         2: {"type": "shell", "via_exploit": "exploit/unix/ftp/proftpd",
             "tunnel_peer": "10.10.10.6:43210"},
     }
-    result = asyncio.get_event_loop().run_until_complete(client.structured_session_list())
+    result = run(client.structured_session_list())
     assert len(result) == 2
     ids = {r["id"] for r in result}
     assert 1 in ids and 2 in ids
@@ -146,7 +152,7 @@ def test_structured_session_list_non_empty():
 def test_structured_session_list_empty():
     client = MockRpcClient()
     client.sessions = {}
-    result = asyncio.get_event_loop().run_until_complete(client.structured_session_list())
+    result = run(client.structured_session_list())
     assert result == []
 
 
@@ -154,7 +160,7 @@ def test_structured_session_list_empty():
 def test_stop_session_removes_entry():
     client = MockRpcClient()
     client.sessions = {3: {"type": "meterpreter", "tunnel_peer": "10.10.10.7:11111"}}
-    asyncio.get_event_loop().run_until_complete(client._call("session.stop", 3))
+    run(client._call("session.stop", 3))
     assert 3 not in client.sessions
 
 
@@ -163,7 +169,7 @@ def test_call_crash_then_recover():
     client = MockRpcClient()
     client.sessions = {1: {"type": "meterpreter", "tunnel_peer": "10.0.0.1:4444"}}
     client._crash_on_next_call = True
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
     with pytest.raises(MsfRpcError):
         loop.run_until_complete(client._call("session.list"))
     result = loop.run_until_complete(client._call("session.list"))
@@ -178,7 +184,7 @@ def test_run_meterpreter_happy_path():
     async def _run():
         return await client.run_meterpreter(1, "getuid", timeout=5.0)
 
-    output = asyncio.get_event_loop().run_until_complete(_run())
+    output = run(_run())
     assert isinstance(output, str)
 
 
@@ -186,7 +192,7 @@ def test_run_meterpreter_happy_path():
 def test_stop_job():
     client = MockRpcClient()
     client.jobs = {"0": {"name": "multi/handler"}, "1": {"name": "SOCKS"}}
-    asyncio.get_event_loop().run_until_complete(client._call("job.stop", "0"))
+    run(client._call("job.stop", "0"))
     assert "0" not in client.jobs
     assert "1" in client.jobs
 
@@ -195,7 +201,7 @@ def test_stop_job():
 def test_list_jobs():
     client = MockRpcClient()
     client.jobs = {"0": {"name": "multi/handler"}, "2": {"name": "socks_proxy"}}
-    result = asyncio.get_event_loop().run_until_complete(client._call("jobs.list"))
+    result = run(client._call("jobs.list"))
     assert "0" in result and "2" in result
 
 
@@ -208,14 +214,14 @@ def test_auth_failure_raises():
         return await client.connect()
 
     with pytest.raises(MsfRpcError, match="Invalid credentials"):
-        asyncio.get_event_loop().run_until_complete(_run())
+        run(_run())
 
 
 # 12. shell_write + shell_read round-trip
 def test_shell_write_read_roundtrip():
     client = MockRpcClient()
     client.sessions = {5: {"type": "shell", "tunnel_peer": "10.0.0.5:9999"}}
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
     write_resp = loop.run_until_complete(client._call("session.shell_write", 5, "id\n"))
     assert write_resp.get("result") == "success"
     read_resp = loop.run_until_complete(client._call("session.shell_read", 5))
