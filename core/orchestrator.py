@@ -3234,6 +3234,10 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             sanitized_output = _record.get("output", "")
             sanitized_error = _record.get("error", "")
 
+            # Episode summary: every _EPISODE_SIZE commands compress old history
+            # so local Ollama models don't lose track of earlier findings.
+            self._maybe_create_episode_summary(session_id)
+
             await self._maybe_run_strategist(session_id)
             # Coverage engine owns the progress number + completion when enabled,
             # overriding the strategist's estimate (prevents premature 100%).
@@ -3497,36 +3501,10 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         # Update session status
         session.status = "ready"
 
-        # Episode summary: every _EPISODE_SIZE commands compress old history
-        # so local Ollama models don't lose track of earlier findings.
-        self._maybe_create_episode_summary(session_id)
-
-        # Strategic reflection: every _PLANNER_INTERVAL commands the strategist
-        # steps back, updates the plan + objective progress, and may mark the
-        # objective complete. Runs BEFORE the tactical decision so the next
-        # command benefits from the fresh plan. If it declares the objective
-        # met, halt the loop and stop here (no further command is chosen).
-        await self._maybe_run_strategist(session_id)
-        # Coverage engine owns the progress number + completion when enabled,
-        # overriding the strategist's estimate (prevents premature 100%).
-        self._recompute_coverage_progress(session)
-        if session.objective_complete:
-            logger.info(
-                f"Session {session_id}: objective complete — halting agentic loop."
-            )
-            session.status = "completed"
-            self._save_session_status(session_id, session)
-            return command_record
-
-        # If successful, analyze sanitized output with AI for next steps
-        # If failed, analyze error with AI for correction (self-healing loop)
-        if command_success and sanitized_output:
-            await self._process_command_output(session_id, command, sanitized_output, None)
-        else:
-            await self._process_command_output(session_id, command, sanitized_output, sanitized_error)
-
-        logger.info(f"Command executed for {session_id}, return code: {return_code}")
-
+        # The AI-loop advancement (episode summary, strategist, next-command
+        # decision) is intentionally NOT run here — the caller (execute_command)
+        # runs it exactly once on the FINAL result after credential rotation
+        # settles, so a rejected credential cannot make the AI pivot away mid-rotation.
         return command_record
     async def _process_command_output(self, session_id: str, command: str, output: str, error: Optional[str] = None):
         """Process command output and decide next steps with Agentic Loop.
