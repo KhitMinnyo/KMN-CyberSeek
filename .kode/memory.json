@@ -7,7 +7,20 @@
         "project-analysis"
       ],
       "createdAt": 1788881746502,
-      "updatedAt": 1788888456419,
+      "updatedAt": 1788889139451,
+      "vector": null
+    },
+    {
+      "key": "push-blocker-readonly-pat",
+      "value": "KMN-CyberSeek git push to origin/main is BLOCKED: macOS keychain (osxkeychain) holds a fine-grained PAT (username=x-access-token) that is READ-ONLY — GitHub returns 403 because it lacks Contents:write. No SSH key in ~/.ssh, no GITHUB_TOKEN/GH_TOKEN env. Code work is fully done & committed locally (2 commits ahead: 1a9230d, a0088cd; v2.6.2). To unblock: regenerate PAT with Contents:Read/Write for repo KMN-CyberSeek (or add SSH key / paste write token), then `git credential reject` + `git push origin main`.",
+      "tags": [
+        "git",
+        "push",
+        "credentials",
+        "blocker"
+      ],
+      "createdAt": 1788889517933,
+      "updatedAt": 1788889517933,
       "vector": null
     }
   ]
