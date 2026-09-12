@@ -1,0 +1,83 @@
+=== orchestrator.py size/lines ===
+    8560 core/orchestrator.py
+=== grep stuck/pivot/exhaust/depth ===
+57:from core import pivot as _pivot
+229:def _detect_exhausted_target(cmds: List[str], stage: str) -> str:
+304:    return f"{stage}_exhausted"
+516:        self.pivot_routes: List[Dict] = []
+533:        self.max_auto_depth = 15  # Maximum consecutive auto-executed commands before requiring human review
+597:        # Auto-pivot: attack vectors that have been exhausted (looped out) and
+598:        # should be skipped. Persisted to DB so pivots survive backend restarts.
+599:        self.exhausted_services: List[str] = []
+600:        # Safety cap: after this many consecutive auto-pivots without advancing
+602:        self._auto_pivot_count: int = 0
+603:        self._MAX_AUTO_PIVOTS: int = int(os.getenv("MAX_AUTO_PIVOTS", "12"))
+605:        # Finding-aware stagnation tracker. The loop is only "stuck" when it keeps
+612:        # threshold before a pivot is forced.
+635:        # Surfaced to the AI so it pivots to post-exploitation instead of
+703:            "pivot_routes": self.pivot_routes,
+733:            "exhausted_services": self.exhausted_services,
+812:        # for long — a much shorter stall revives a stuck-at-ready session quickly.
+849:                     pivot_state TEXT DEFAULT '{}'
+873:                ("exhausted_services",     "TEXT DEFAULT '[]'"),
+887:                ("pivot_state", "TEXT DEFAULT '{}'"),
+1424:                      max_auto_depth: int = 25, authorization_confirmed: bool = False,
+1460:        session.max_auto_depth = max_auto_depth  # Allow customizing max auto depth
+1506:        logger.info(f"Created new session: {session_id} for target {target_ip} (auto_approve: {auto_approve}, max_auto_depth: {max_auto_depth})")
+1659:        _MAX_AUTO_TOPICS = 3
+1692:            if len(topics_to_research) >= _MAX_AUTO_TOPICS:
+2450:            _exhausted_ctx = self._operator_context_block(session)
+2453:            _exhausted_ctx += self._osint_context_block(session)
+2457:            _exhausted_ctx += self._coverage_context_block(session)
+2458:            _exhausted_ctx += self._exploit_hints_block(session)
+2460:            _exhausted_ctx += self._prioritized_cve_block(session)
+2463:            _exhausted_ctx += self._exhausted_context_block(session)
+2466:            # pivots to post-exploitation / privilege-escalation instead of
+2468:            _exhausted_ctx += self._compromise_context_block(session)
+2472:            _exhausted_ctx += self._handler_context_block(session)
+2476:            _exhausted_ctx += self._reachability_context_block(session)
+2477:            _exhausted_ctx += self._pivot_context_block(session)
+2480:            _exhausted_ctx += self._tools_context_block(session)
+2485:                _exhausted_ctx += (
+2494:                _exhausted_ctx += (
+2516:{_exhausted_ctx}
+2988:    def _inject_credentials(self, command: str, session,
+3231:                command = self._inject_credentials(
+3264:            # must NOT let the AI pivot between credential attempts, so the
+3541:        # settles, so a rejected credential cannot make the AI pivot away mid-rotation.
+3666:- Auto-execution depth counter: {session.auto_depth_counter}/{session.max_auto_depth}
+3703:Auto-execution depth: {session.auto_depth_counter}/{session.max_auto_depth}
+3704:{self._operator_context_block(session)}{self._osint_context_block(session)}{self._coverage_context_block(session)}{self._ad_context_block(session)}{self._exfil_context_block(session)}{self._llm_security_context_block(session)}{self._exploit_hints_block(session)}{self._prioritized_cve_block(session)}{self._exhausted_context_block(session)}{self._compromise_context_block(session)}{self._handler_context_block(session)}{self._post_shell_context_block(session)}{self._reachability_context_block(session)}{self._pivot_context_block(session)}{self._tools_context_block(session)}
+3828:                        "coverage progress). Likely stuck — pivoting to a different vector."
+3847:                # Auto-pivot: mark exhausted vector and re-run AI with fresh context
+3848:                # instead of halting. _auto_pivot() enforces a safety cap and falls
+3849:                # back to manual-wait mode if all viable paths are exhausted.
+3850:                await self._auto_pivot(session_id, _loop_reason)
+3851:                return  # _auto_pivot() re-schedules _analyze_with_ai internally
+3940:                # approval after max_auto_depth consecutive non-critical commands.
+3942:                if should_auto_execute and session.auto_depth_counter >= session.max_auto_depth:
+3944:                        f"Session {session_id} reached max auto-execution depth ({session.max_auto_depth}). "
+4035:            # stuck at status=ready with no pending command and no visible reason.
+4071:        # Also clears a needs_operator halt and its stuck-counters so the loop
+4078:                session._auto_pivot_count = 0
+4345:                "UPDATE sessions SET current_stage = ?, status = ?, exhausted_services = ?, "
+4346:                "scope_allowlist = ?, last_activity_at = ?, pause_reason = ?, pivot_state = ? "
+4349:                 json.dumps(session.exhausted_services), session.scope_allowlist,
+4352:                      "routes": session.pivot_routes,
+4417:    async def _auto_pivot(self, session_id: str, loop_reason: str) -> None:
+4418:        """Auto-pivot when the AI loops on a failing attack vector.
+4422:          2. Add that vector to session.exhausted_services so future AI calls
+4427:        A safety cap (_MAX_AUTO_PIVOTS) stops runaway pivoting if the AI
+4428:        somehow exhausts every option without advancing the stage.
+4434:        if session._auto_pivot_count >= session._MAX_AUTO_PIVOTS:
+4441:                f"Session {session_id}: max auto-pivots ({session._MAX_AUTO_PIVOTS}) "
+4445:            session.auto_depth_counter = session.max_auto_depth
+4449:                    f"⛔ HALTED — NEEDS OPERATOR. {session._MAX_AUTO_PIVOTS} auto-pivots "
+4451:                    f"{', '.join(session.exhausted_services) or 'various'}. "
+4467:        session._auto_pivot_count += 1
+4471:        exhausted_label = _detect_exhausted_target(recent_cmds, session.current_stage)
+4473:        if exhausted_label and exhausted_label not in session.exhausted_services:
+4474:            session.exhausted_services.append(exhausted_label)
+4476:                f"Session {session_id}: auto-pivot #{session._auto_pivot_count} — "
+4477:                f"marked exhausted: '{exhausted_label}'. "
+4478:                f"Total exhausted: {session.exhausted_services}"

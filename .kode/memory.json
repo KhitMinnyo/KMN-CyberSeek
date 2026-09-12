@@ -7,7 +7,7 @@
         "project-analysis"
       ],
       "createdAt": 1788881746502,
-      "updatedAt": 1789234871941,
+      "updatedAt": 1789240248640,
       "vector": null
     },
     {
@@ -21,6 +21,21 @@
       ],
       "createdAt": 1788889517933,
       "updatedAt": 1788889517933,
+      "vector": null
+    },
+    {
+      "key": "capability-expansion-complete",
+      "value": "The \"တိုးချဲ့\" (capability expansion) work from KMN-CyberSeek-review.md is fully implemented and verified (292 pytest pass). All 6 review problems addressed:\n\nP0(1) Stagnation/anti-loop guards: core/orchestrator.py — `_detect_exhausted_target` (line 229) now returns technique-scoped labels (e.g. \"smb:nxc_auth\", \"tomcat:ghostcat\") instead of whole-service. `_stagnation_counter`/`_last_progress_marker` (line 605) is finding-aware: resets when creds/services/footholds/subdomains/coverage-done grow; threshold 18 for exploit-family stages vs 8 for enum (line 3822). `MAX_AUTO_PIVOTS` default 12 (line 603).\n\nP0(2) Coverage: core/coverage.py — 3-state PENDING/ATTEMPTED/DONE; `match_and_mark` only marks exploit steps DONE on exploit_success; weights rebalanced to FOOTHOLD 0.40 / ENUM 0.22 / VULN 0.15 / POSTEX 0.15 / RECON 0.08; `is_service_covered` requires ratio 1.0; `is_objective_complete` needs foothold>=1 AND covered>=0.85 AND progress>=0.85.\n\nP1(3) ai/connector.py — default local model qwen2.5:14b (was deepseek-r1:8b); provider auto-detects api/local; `tactical_temperature` default 0.2 via TACTICAL_TEMPERATURE env.\n\nP1(4) ai/connector.py — `max_tokens` default 4096 via AI_MAX_TOKENS; `ask_ai_api` has 2-attempt loop (tactical temp then deterministic temp=0 JSON-repair) with finish_reason==\"length\" truncation detection.\n\nP1(5) Unattended defaults: orchestrator `max_auto_depth` 15 (attr, line 533) / 25 (create_session, line 1424); FULL_AUTO_MODE self-critique gate (line 3868); depth counter gate (line 3942).\n\nP2(6) Multi-credential reuse: `_pick_credential` (2959), `_inject_credentials` (2988) supports smbclient/enum4linux/crackmapexec/nxc/rpcclient/evil-winrm/mysql/impacket + pass-the-hash; `_AUTH_FAILURE_RE` (317) + rotation loop in execute_command (3220-3250) retries same command with next cred on auth failure.\n\nTest note: use `python3 -m pytest tests/` (292 pass), NOT `python3 tests/run_tests.py` (that custom runner wrongly reports 7 failures because it doesn't inject the `monkeypatch` fixture).",
+      "tags": [
+        "capability-expansion",
+        "orchestrator",
+        "coverage",
+        "connector",
+        "tests",
+        "project-analysis"
+      ],
+      "createdAt": 1789240383013,
+      "updatedAt": 1789240383013,
       "vector": null
     }
   ]
