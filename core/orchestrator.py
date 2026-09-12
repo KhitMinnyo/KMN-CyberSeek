@@ -227,47 +227,79 @@ def _advance_stage(current: str, proposed: str) -> str:
 
 
 def _detect_exhausted_target(cmds: List[str], stage: str) -> str:
-    """Heuristic: detect which service/attack-vector the AI was repeatedly attempting.
+    """Heuristic: detect which *technique* (not the whole service) the AI was
+    repeatedly attempting.
 
-    Scans the normalised text of recent commands and returns a short label that
-    is added to session.exhausted_services so the AI knows to skip it.
-    Falls back to a stage-scoped label if no specific tool is recognisable.
+    A looped-out technique is blacklisted without killing the rest of the
+    service's playbook: e.g. a looped ``smbclient`` enumeration yields
+    ``smb:smbclient_enum`` rather than ``smb``, so the same SMB service can still
+    be attacked later via crackmapexec, rpcclient, or an MSF exploit. Falls back
+    to a stage-scoped label when no specific technique is recognisable.
     """
     joined = " ".join(cmds).lower()
-    # SMB family
-    if any(t in joined for t in ["smbclient", "enum4linux", "smbmap", "rpcclient",
-                                  "crackmapexec smb", "nxc smb", "nmap -p 139,445",
-                                  "nmap -p445", "nmap -p 445"]):
-        return "smb"
-    # FTP
+
+    # ── SMB family (technique-scoped) ───────────────────────────────────────
+    if "crackmapexec" in joined or "nxc" in joined:
+        return "smb:nxc_auth"
+    if "smbclient" in joined:
+        return "smb:smbclient_enum"
+    if "enum4linux" in joined:
+        return "smb:enum4linux"
+    if "smbmap" in joined:
+        return "smb:smbmap"
+    if "rpcclient" in joined:
+        return "smb:rpcclient"
+    if any(t in joined for t in ["nmap -p 139,445", "nmap -p445", "nmap -p 445"]):
+        return "smb:nmap_enum"
+
+    # ── FTP (technique-scoped) ──────────────────────────────────────────────
     if "ftp" in joined and ("nmap" not in joined or "ftp" in joined.replace("nmap", "")):
-        return "ftp"
-    # Tomcat
+        if "stor " in joined or "curl -t" in joined or "ftp-put" in joined:
+            return "ftp:upload"
+        return "ftp:anon_enum"
+
+    # ── Tomcat (technique-scoped) ───────────────────────────────────────────
     if "8080" in joined or "tomcat" in joined or "manager/html" in joined:
+        if "ghostcat" in joined or "8009" in joined or "ajp" in joined:
+            return "tomcat:ghostcat"
+        if ".war" in joined or "deploy" in joined or "manager/text" in joined:
+            return "tomcat:war_deploy"
+        if "manager/html" in joined or "host-manager" in joined:
+            return "tomcat:manager_creds"
         return "tomcat_8080"
-    # GlassFish
+
+    # ── GlassFish (technique-scoped) ────────────────────────────────────────
     if any(p in joined for p in ["4848", "8181", "glassfish"]):
+        if "war/" in joined or "asadmin" in joined or "deploy" in joined:
+            return "glassfish:war_deploy"
+        if "j_security_check" in joined:
+            return "glassfish:creds"
         return "glassfish"
-    # SSH brute-force
-    if "hydra" in joined and "ssh" in joined:
+
+    # ── SSH brute-force ─────────────────────────────────────────────────────
+    if ("hydra" in joined and "ssh" in joined) or ("medusa" in joined and "ssh" in joined):
         return "ssh_bruteforce"
-    if "medusa" in joined and "ssh" in joined:
-        return "ssh_bruteforce"
-    # Web directory brute
+
+    # ── Web directory brute ─────────────────────────────────────────────────
     if any(t in joined for t in ["gobuster", "dirb", "ffuf", "dirbuster"]):
         return "web_dir_enum"
-    # Nikto
+
+    # ── Nikto ───────────────────────────────────────────────────────────────
     if "nikto" in joined:
         return "nikto_web"
-    # Metasploit exploit module
+
+    # ── Metasploit exploit module ───────────────────────────────────────────
     if "exploit/" in joined or "auxiliary/" in joined:
         return f"msf_{stage}"
-    # RDP
+
+    # ── RDP ─────────────────────────────────────────────────────────────────
     if "3389" in joined or "rdp" in joined:
         return "rdp"
-    # SNMP
+
+    # ── SNMP ────────────────────────────────────────────────────��───────────
     if "snmp" in joined or "161" in joined:
         return "snmp"
+
     # Fallback: label by stage
     return f"{stage}_exhausted"
 
@@ -7293,9 +7325,10 @@ Web apps: {webapps}
         return (
             "\n=== EXHAUSTED ATTACK VECTORS — DO NOT RETRY ===\n"
             + "\n".join(f"- {s}" for s in session.exhausted_services)
-            + "\nThese vectors have been looped on and abandoned. Choose a DIFFERENT "
-            "service, port, or technique. Do not suggest a command targeting an "
-            "exhausted vector.\n"
+            + "\nEach entry is a specific TECHNIQUE (e.g. smb:smbclient_enum), not "
+            "the whole service. Only avoid the exact technique named; you may still "
+            "attack the same service through a different technique/port/tool. Do not "
+            "suggest a command matching an exhausted entry.\n"
         )
 
     def add_operator_instruction(self, session_id: str, instruction: str) -> Dict:
@@ -7744,13 +7777,16 @@ Web apps: {webapps}
             if not cov:
                 continue
             pend = _coverage.pending_steps(cov)
-            if not pend:
+            attempted = _coverage.attempted_steps(cov)
+            if not pend and not attempted:
                 continue
             svc_name = svc.get("service", "?")
             ratio = int(_coverage.coverage_ratio(cov) * 100)
-            lines.append(f"- {svc_name} ({key}) [{ratio}% covered] pending:")
+            lines.append(f"- {svc_name} ({key}) [{ratio}% covered]")
             for st in pend[:6]:
-                lines.append(f"    · {st.intent}")
+                lines.append(f"    · [pending] {st.intent}")
+            for st in attempted[:4]:
+                lines.append(f"    · [tried, retry until success] {st.intent}")
             shown += 1
             if shown >= 8:
                 break

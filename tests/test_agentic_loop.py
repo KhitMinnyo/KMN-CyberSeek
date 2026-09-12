@@ -71,9 +71,11 @@ def test_detect_privilege_user_vs_none():
 
 
 def test_detect_exhausted_target_labels():
-    assert _detect_exhausted_target(["smbclient -L //10.0.0.5"], "enumeration") == "smb"
-    assert _detect_exhausted_target(["curl http://10.0.0.5:8080/manager/html"], "enumeration") == "tomcat_8080"
+    assert _detect_exhausted_target(["smbclient -L //10.0.0.5"], "enumeration") == "smb:smbclient_enum"
+    assert _detect_exhausted_target(["curl http://10.0.0.5:8080/manager/html"], "enumeration") == "tomcat:manager_creds"
     assert _detect_exhausted_target(["hydra -l root ssh://10.0.0.5"], "exploitation") == "ssh_bruteforce"
+    # a looped SMB enumeration no longer blacklists the whole service
+    assert _detect_exhausted_target(["crackmapexec smb 10.0.0.5 -u a -p b"], "enumeration") == "smb:nxc_auth"
     # falls back to a stage-scoped label when nothing recognised
     assert _detect_exhausted_target(["echo hi"], "enumeration") == "enumeration_exhausted"
 
@@ -117,7 +119,7 @@ def test_auto_pivot_marks_exhausted_and_continues():
     orch._analyze_with_ai = AsyncMock()
     with _no_sleep():  # skip the 3s pause
         _run(orch._auto_pivot(s.session_id, "loop detected"))
-    assert "smb" in s.exhausted_services
+    assert "smb:smbclient_enum" in s.exhausted_services
     assert s.ai_decisions[-1]["context"] == "auto_pivot"
     assert s.auto_depth_counter == 0
     orch._analyze_with_ai.assert_awaited()
