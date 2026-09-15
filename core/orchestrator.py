@@ -34,12 +34,39 @@ _CRED_PATTERNS: List[re.Pattern] = [
     re.compile(r"Discovered credentials.*?'([^']+)'\s+'([^']+)'", re.IGNORECASE),
     # crackmapexec: [+] IP\user:pass (Pwn3d!) or without domain
     re.compile(r'\[\+\]\s+[\w.\-]+\\(\w+):(\S+)', re.IGNORECASE),
-    # nmap NSE http-auth-finder / http-brute style: username: admin  password: secret
-    re.compile(r'username[:\s]+(\S+)[,\s]+password[:\s]+(\S+)', re.IGNORECASE),
-    # john/hashcat cracked: HASH (PASSWORD) — two groups: (hash, cracked_password)
-    re.compile(r'^(\S+)\s+\((.+?)\)\s*$', re.MULTILINE),  # john --show style
+    # nmap NSE http-auth-finder / http-brute style: "username: admin  password: secret".
+    # Requires an explicit ':' or '=' delimiter after each label so this can't
+    # match plain English prose that merely contains both words (e.g. a
+    # tomcat-users.xml comment "...the username and password are arbitrary...",
+    # which used to be captured as user="and" secret="are").
+    re.compile(r'\busername\s*[:=]\s*(\S+)[,;\s]+password\s*[:=]\s*(\S+)', re.IGNORECASE),
+    # john/hashcat cracked: HASH (PASSWORD) — two groups: (hash, cracked_password).
+    # The hash/username token is restricted to word chars/dot/hyphen (no ':',
+    # '\', '/') so a `findstr`-style "<filepath>: <matched line>" output line
+    # (e.g. "C:\xampp\passwords.txt:   Please ... (users and passwords).")
+    # can never be mistaken for "username (password)" — a raw path always
+    # contains ':' or '\' and would otherwise be captured as the username.
+    # The parenthetical is capped to a few words so a full prose sentence in
+    # parentheses isn't captured as a "password" either.
+    re.compile(r'^([\w.\-]{1,64})\s+\(([^()\s]+(?:\s[^()\s]+){0,2})\)\s*$', re.MULTILINE),  # john --show style
     re.compile(r'^([^:]+):([^:]+):\d+:\d+:::',  re.MULTILINE),  # /etc/shadow dump - user:hash
 ]
+
+# Operator "Steer" instructions are ordinarily just advisory text injected
+# into the AI's next prompt -- the AI can (and observably does) keep running
+# for many more turns before it "agrees" to stop, and if the session had
+# already halted for operator input, ANY reply (including one asking it to
+# stop) used to unconditionally re-arm the full auto-pivot/stagnation budget
+# and resume the loop. Recognise an explicit stop/end/halt request
+# deterministically so it hard-cancels the session immediately instead of
+# just being advice for later. Anything ambiguous still falls through to the
+# advisory path unchanged.
+_STOP_INTENT_RE = re.compile(
+    r'\b(?:stop|halt|abort|terminate|cancel|end)\b[^.\n]{0,40}\b'
+    r'(?:now|immediately|engagement|session|run|everything)\b'
+    r'|\bskip\b[^.\n]{0,20}\b(?:last|remaining|further|next)\b[^.\n]{0,20}\bstep',
+    re.IGNORECASE,
+)
 
 from ai.connector import KMN_AI_Connector, AIResponse
 from core.scanner import Scanner, classify_os
@@ -421,6 +448,15 @@ def _is_windows_rce_proof(command: str, output: str) -> bool:
         return False
     # Exclude pure-enumeration commands (they print the SYSTEM SID during listing).
     if any(t in c for t in _ENUM_ONLY_TOOLS):
+        return False
+    # Self-referential guard: if the COMMAND text itself already contains
+    # "nt authority" (e.g. an `echo`/`printf` halt banner the AI writes
+    # summarising its own prior finding, such as "OBJECTIVE ACHIEVED: SYSTEM
+    # (nt authority\system)"), this is the command's own literal text being
+    # echoed back, not evidence retrieved from the target. A real proof
+    # command (whoami, a webshell whoami call, etc.) never contains this
+    # string in the command itself — only in the output.
+    if "nt authority" in c:
         return False
     return True
 
@@ -2328,6 +2364,25 @@ class Orchestrator:
         # 1) KEV + EPSS enrichment (in place, network best-effort).
         await cve_lookup.enrich_findings(session.vulnerabilities)
         for finding in session.vulnerabilities:
+            # A finding whose source never emitted an nmap "State:" line (e.g.
+            # the `vulners` NSE script, which only lists CVE IDs/scores) is
+            # left at the "unknown" default risk_level even when KEV/EPSS
+            # enrichment just confirmed it's a known-exploited or
+            # high-probability CVE. That under-counts the report's high/
+            # medium/low tally for a genuinely serious finding. Only raise,
+            # never lower or invent, a risk_level — and stay within the
+            # existing low/medium/high/unknown vocabulary (no 'critical'
+            # tier elsewhere in this codebase).
+            if (finding.get("risk_level") or "unknown").lower() == "unknown":
+                if finding.get("kev"):
+                    finding["risk_level"] = "high"
+                else:
+                    try:
+                        _epss = float(finding.get("epss") or 0.0)
+                    except (TypeError, ValueError):
+                        _epss = 0.0
+                    if _epss >= 0.5:
+                        finding["risk_level"] = "high"
             finding["priority_score"] = _vuln_validate.priority_score(finding)
 
         # 2) Rank findings that carry a CVE: KEV first, then EPSS, then CVSS.
@@ -3183,9 +3238,18 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 command += f" -u {shlex.quote(user)} -p {shlex.quote(passwd)}"
 
         # ── mysql (empty-password shortcut) ──────────────────────────────────
-        elif re.search(r'\bmysql\b', command) and '-p' not in command and passwd:
+        # Match "mysql" only as a standalone CLI invocation (start of the
+        # command, or after whitespace/a shell operator, followed by
+        # whitespace/end/a flag) — never as a path component. Without this,
+        # a recon command that merely reads a file under a directory named
+        # "mysql" (e.g. Windows `type C:\xampp\mysql\bin\my.ini`) gets a
+        # bogus credential spliced into the middle of the path, e.g.
+        # `type C:\xampp\mysql -u admin -padmin\bin\my.ini`, which then
+        # fails to read the file at all.
+        elif (re.search(r'(?<![\\/\w.])mysql\b(?!\s*[\\/])', command)
+              and '-p' not in command and passwd):
             command = re.sub(
-                r'(\bmysql\b)',
+                r'(?<![\\/\w.])(mysql)\b(?!\s*[\\/])',
                 lambda m: f"{m.group(0)} -u {shlex.quote(user)} -p{shlex.quote(passwd)}",
                 command, count=1
             )
@@ -5589,6 +5653,18 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     secret = (match.group(2) or "").strip()
                     if not username or not secret or len(username) > 256 or len(secret) > 512:
                         continue
+                    # Defense in depth: a real username never contains a path
+                    # separator or trailing colon. This catches any future
+                    # pattern (or a tool output shape we haven't seen) that
+                    # confuses a `findstr`/`grep`-style "<path>: <match>" line
+                    # for "<username>: <password>" the same way the old,
+                    # looser patterns did.
+                    if any(ch in username for ch in ('\\', '/', ':')):
+                        logger.info(
+                            f"Skipping path-like 'username' for session {session_id}: "
+                            f"{username!r} — looks like a file path, not a credential."
+                        )
+                        continue
                     # Reject credentials the AI merely GUESSED from the target name
                     # (e.g. password "DrHmoneGyi" for target drhmonegyi.cc, echoed
                     # by a python/echo command rather than returned by an auth tool).
@@ -7585,6 +7661,25 @@ Web apps: {webapps}
         session.ai_decisions.append(_d)
         self._save_ai_decision(session_id, _d)
         logger.info(f"Session {session_id}: operator instruction added: {instruction[:120]}")
+
+        # An instruction that clearly asks to stop/end/halt the engagement is a
+        # hard stop, not advice for the next turn -- hard-cancel immediately
+        # rather than just injecting it into context (where the AI might not
+        # act on it for many more turns) or, worse, treating it like any other
+        # reply that resumes a halted session with a fresh auto-pivot budget.
+        if _STOP_INTENT_RE.search(instruction):
+            logger.info(
+                f"Session {session_id}: operator instruction read as a stop "
+                f"request ({instruction[:80]!r}) — cancelling the session "
+                "instead of resuming or merely advising it."
+            )
+            try:
+                self._track_task(session_id, self.cancel_session(session_id), "operator_stop")
+            except RuntimeError:
+                pass  # no running loop (e.g. called from a sync context/test)
+            return {"status": "success", "instruction": instruction,
+                    "active_count": len(session.operator_instructions),
+                    "stopping": True}
 
         # If the session had halted for operator input, this instruction is the
         # signal to resume: reset the stuck-counters and kick the loop back off.

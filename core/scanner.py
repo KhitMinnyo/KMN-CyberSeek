@@ -804,6 +804,28 @@ class Scanner:
             if current_vuln:
                 vulnerabilities.append(current_vuln)
 
+            # Not every NSE vuln script uses the "VULNERABLE:" block format this
+            # parser targets — the `vulners` script instead prints raw
+            # tab-separated table rows ("<cve-or-edb-id>\t<score>\t<url>\t
+            # [*EXPLOIT*]") with no such marker. When one of those rows ends up
+            # captured verbatim as a finding's "name" (e.g. it immediately
+            # follows a genuine VULNERABLE: line from another script sharing
+            # the same script-category output block), replace the raw row with
+            # something readable — preferring the CVE IDs already extracted
+            # from the same text — instead of showing scrape data as the name.
+            for v in vulnerabilities:
+                name = (v.get("name") or "").strip()
+                looks_like_raw_row = (
+                    "\t" in name
+                    or bool(re.search(r'https?://\S+', name))
+                    or not re.search(r'[A-Za-z]{4,}', name)
+                )
+                if looks_like_raw_row:
+                    if not v.get("description"):
+                        v["description"] = name
+                    v["name"] = ", ".join(v.get("cve_ids") or []) or \
+                        "Unnamed NSE vulnerability finding (see description)"
+
         except Exception as e:
             logger.error(f"Failed to parse vulnerability output: {e}")
 
