@@ -65,6 +65,7 @@ from core import post_shell as _post_shell
 from core.bruteforce_worker import BruteforceWorker
 from core.msf_rpc import MsfRpcClient
 from core.observations import prompt_observation, project_untrusted_output
+from core.command_runner import plan_command
 
 logger = logging.getLogger(__name__)
 
@@ -3358,6 +3359,25 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 "success": False,
             }
 
+        command_plan = plan_command(command, execution_mode)
+        if command_plan.error:
+            logger.warning(
+                f"Command runner rejected for session {session_id}: "
+                f"{command_plan.error}"
+            )
+            session.status = "ready"
+            if job_id:
+                self._update_job(job_id, "failed", exit_code=-1, error=command_plan.error)
+            return {
+                "command_id": command_id,
+                "command": command,
+                "output": "",
+                "error": command_plan.error,
+                "return_code": -1,
+                "timestamp": datetime.now().isoformat(),
+                "success": False,
+            }
+
         # Per-command timeout: long directory/DNS brute-forcers are capped much
         # tighter than the global timeout (they return useful partial output
         # early), so one big scan can't burn 10 minutes.
@@ -3374,15 +3394,22 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         # default so a single very long output line (ffuf/gobuster progress,
         # minified JS) does not crash the reader with "Separator is not found,
         # and chunk exceed the limit" — which silently failed whole commands.
-        process = await asyncio.create_subprocess_shell(
-            command,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd="/tmp",  # Safe directory
-            start_new_session=True,
-            limit=10 * 1024 * 1024,  # 10 MB per line
-        )
+        process_kwargs = {
+            "stdin": asyncio.subprocess.DEVNULL,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+            "cwd": "/tmp",
+            "start_new_session": True,
+            "limit": 10 * 1024 * 1024,
+        }
+        if command_plan.mode == "argv":
+            process = await asyncio.create_subprocess_exec(
+                *(command_plan.argv or []), **process_kwargs
+            )
+        else:
+            process = await asyncio.create_subprocess_shell(
+                command_plan.shell_command, **process_kwargs
+            )
         try:
             conn = self._db_connect()
             conn.execute(

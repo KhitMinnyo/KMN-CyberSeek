@@ -149,6 +149,10 @@ NMAP_OS_DETECTION=true
 VULN_SCAN_TIMEOUT=120
 VULN_SCAN_CONCURRENCY=4  # bounded parallel per-port NSE scans
 COMMAND_TIMEOUT=600
+# Autonomous execution is argv-first. Enable these only inside an isolated lab
+# if a workflow genuinely requires shell composition or an interpreter.
+AUTONOMOUS_SHELL_COMPOSITION=false
+AUTONOMOUS_RUNTIME_COMMANDS=false
 
 # Agentic-loop safety
 MAX_AUTO_PIVOTS=12       # auto-pivots before pausing for manual review
