@@ -19,6 +19,8 @@ claims that KMN-CyberSeek outperforms another security agent. See
 
 **Kali Linux** (all pentest tools pre-installed). Any Debian/Ubuntu-based distro with the standard security toolchain also works. macOS and plain Windows are not recommended.
 
+**RAM:** at least **8GB**, whether Kali is bare-metal or a VM. Below that, the backend/frontend/Metasploit/nmap combination — especially during a long-running autonomous session — can push the system into swap and make the UI (including clicking Approve) feel like it's hanging. If you're running a local Ollama model instead of a cloud API provider, budget several GB more on top of the 8GB baseline for the model itself (a 7B model needs roughly 6-8GB, 14B roughly 12-16GB).
+
 ---
 
 ## Architecture
