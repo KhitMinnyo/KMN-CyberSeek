@@ -526,7 +526,8 @@ class Session:
     """Represents a penetration testing session."""
 
     def __init__(self, session_id: str, target_ip: str, target_domain: Optional[str] = None,
-                 auto_approve: bool = False, authorization_confirmed: bool = False):
+                 auto_approve: bool = False, authorization_confirmed: bool = False,
+                 full_auto: bool = False):
         self.session_id = session_id
         self.target_ip = target_ip
         self.target_domain = target_domain
@@ -564,6 +565,13 @@ class Session:
         self._osint_turns: int = 0
         # Agentic loop settings
         self.auto_approve = auto_approve
+        # Per-session Fully Autonomous mode: identical to the global FULL_AUTO_MODE
+        # env flag (bypasses manual approval prompts entirely, including HIGH-risk
+        # commands -- the self-critique VERIFIER still gates those) but scoped to
+        # just this session, so an operator can run one engagement unattended in
+        # an isolated lab while other sessions still stop for approval. See every
+        # `FULL_AUTO_MODE or session.full_auto` check in this module.
+        self.full_auto: bool = full_auto
         self.max_auto_depth = 15  # Full-auto replans; convenience mode checkpoints for approval
         self.auto_depth_counter = 0  # Current count of consecutive auto-executed commands
         self.last_auto_success = False  # Track if last auto-execution found something critical
@@ -743,6 +751,8 @@ class Session:
             "evidence_count": len(self.evidence),
             "vulnerabilities_count": len(self.vulnerabilities),
             "authorization_confirmed": self.authorization_confirmed,
+            "auto_approve": self.auto_approve,
+            "full_auto": self.full_auto,
             "scope_allowlist": self.scope_allowlist,
             "last_activity_at": self.last_activity_at,
             "pause_reason": self.pause_reason,
@@ -880,13 +890,22 @@ class Orchestrator:
                     current_stage TEXT NOT NULL,
                     auto_approve BOOLEAN DEFAULT FALSE,
                      authorization_confirmed BOOLEAN DEFAULT FALSE,
-                     pivot_state TEXT DEFAULT '{}'
+                     pivot_state TEXT DEFAULT '{}',
+                     full_auto_mode BOOLEAN DEFAULT FALSE
                 )
             ''')
 
             # Add auto_approve column if it doesn't exist (for migration)
             try:
                 cursor.execute("ALTER TABLE sessions ADD COLUMN auto_approve BOOLEAN DEFAULT FALSE")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+            # Add full_auto_mode column if it doesn't exist (for migration) -- the
+            # per-session "Fully Autonomous" toggle (distinct from auto_approve,
+            # which only ever covers LOW/MEDIUM risk).
+            try:
+                cursor.execute("ALTER TABLE sessions ADD COLUMN full_auto_mode BOOLEAN DEFAULT FALSE")
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
@@ -1456,7 +1475,7 @@ class Orchestrator:
     def create_session(self, target_ip: str, target_domain: Optional[str] = None,
                       session_name: Optional[str] = None, auto_approve: bool = False,
                       max_auto_depth: int = 25, authorization_confirmed: bool = False,
-                      objective: Optional[str] = None) -> str:
+                      objective: Optional[str] = None, full_auto: bool = False) -> str:
         """Create a new penetration testing session.
 
         Raises:
@@ -1490,7 +1509,8 @@ class Orchestrator:
             _slug = _slug or "session"
             session_id = f"{_slug}_{session_id[:8]}"
 
-        session = Session(session_id, target_ip, target_domain, auto_approve, authorization_confirmed)
+        session = Session(session_id, target_ip, target_domain, auto_approve, authorization_confirmed,
+                           full_auto=full_auto)
         session.max_auto_depth = max_auto_depth  # Allow customizing max auto depth
         # Per-session engagement objective. Falls back to the Session default
         # ("highest privilege") when the operator doesn't specify one.
@@ -1507,13 +1527,13 @@ class Orchestrator:
                 INSERT INTO sessions (
                     session_id, target_ip, target_domain, created_at, status,
                     current_stage, auto_approve, authorization_confirmed,
-                    scope_allowlist, last_activity_at, pause_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    scope_allowlist, last_activity_at, pause_reason, full_auto_mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 session_id, target_ip, target_domain, session.created_at,
                 session.status, session.current_stage, auto_approve,
                 authorization_confirmed, session.scope_allowlist,
-                session.last_activity_at, session.pause_reason,
+                session.last_activity_at, session.pause_reason, full_auto,
             ))
             conn.commit()
             conn.close()
@@ -1537,8 +1557,30 @@ class Orchestrator:
             "authorization_confirmed": authorization_confirmed,
         })
 
-        logger.info(f"Created new session: {session_id} for target {target_ip} (auto_approve: {auto_approve}, max_auto_depth: {max_auto_depth})")
+        logger.info(f"Created new session: {session_id} for target {target_ip} (auto_approve: {auto_approve}, max_auto_depth: {max_auto_depth}, full_auto: {full_auto})")
         return session_id
+
+    def set_session_full_auto(self, session_id: str, enabled: bool) -> bool:
+        """Toggle per-session Fully Autonomous mode on an existing session (see
+        Session.full_auto). Returns False if the session doesn't exist."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return False
+        session.full_auto = bool(enabled)
+        try:
+            conn = self._db_connect()
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE sessions SET full_auto_mode = ? WHERE session_id = ?",
+                (session.full_auto, session_id),
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.error(f"Failed to persist full_auto for session {session_id}: {e}")
+        logger.info(f"Session {session_id}: Fully Autonomous mode set to {session.full_auto}")
+        self._record_event(session_id, "full_auto_toggled", {"enabled": session.full_auto})
+        return True
     
     def get_session(self, session_id: str) -> Optional[Dict]:
         """Get session details."""
@@ -2397,7 +2439,7 @@ class Orchestrator:
             return True
 
         is_high_risk = self.requires_approval(command)
-        if force_auto or FULL_AUTO_MODE or (session.auto_approve and not is_high_risk):
+        if force_auto or FULL_AUTO_MODE or session.full_auto or (session.auto_approve and not is_high_risk):
             policy_error = self._execution_gate(
                 session.session_id, command, "playbook"
             )
@@ -2649,9 +2691,10 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 await self._ensure_exploitation_handler(session_id)
 
             # Update status based on auto-approve setting and risk level.
-            # FULL_AUTO_MODE is the only mode that bypasses HIGH-risk approval.
-            # auto_approve is a LOW/MEDIUM convenience setting only.
-            if FULL_AUTO_MODE or (session.auto_approve and _decision_risk in {"low", "medium"}):
+            # FULL_AUTO_MODE (global) or session.full_auto (per-session) is the
+            # only mode that bypasses HIGH-risk approval. auto_approve is a
+            # LOW/MEDIUM convenience setting only.
+            if FULL_AUTO_MODE or session.full_auto or (session.auto_approve and _decision_risk in {"low", "medium"}):
                 session.status = "executing"
             else:
                 session.status = "ready"
@@ -2671,7 +2714,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
             # Kick off execution or queue for approval.
             is_high_risk = self.requires_approval(_cmd) or _decision_risk == "high"
-            if safe_only or FULL_AUTO_MODE or (session.auto_approve and not is_high_risk):
+            if safe_only or FULL_AUTO_MODE or session.full_auto or (session.auto_approve and not is_high_risk):
                 automated_error = self._execution_gate(
                     session_id, _cmd,
                     execution_mode=(
@@ -2980,19 +3023,52 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         return command_id
 
     def _queue_ai_response(self, session_id: str, response: AIResponse) -> str:
-        """Queue an AI action without losing its managed-shell routing metadata."""
+        """Queue an AI action without losing its managed-shell routing metadata.
+
+        If the command can't even be queued for manual approval -- the execution
+        gate rejects it under execution_mode="approved" too (e.g. it's an
+        interactive-only invocation, out of scope, or the session lost
+        authorization) -- approving it later would fail the identical way, so
+        there is nothing a human could do with it. queue_for_approval() raises
+        ValueError in that case; letting that propagate used to bubble all the
+        way up through _process_command_output()'s generic exception handler,
+        which pauses the whole session behind a fatal "Agentic loop error"
+        banner requiring a manual Resume click -- for a command that could never
+        have been approved anyway. Instead, record why and discard it; the
+        watchdog (or the next AI turn) picks the session back up on its own.
+        """
         channel = getattr(response, "execution_channel", "local") or "local"
-        if channel == "local" and not getattr(response, "handler_id", None) and getattr(response, "msf_id", None) is None:
-            # Keep the small two-argument seam usable by integrations/tests that
-            # replace queue_for_approval with a lightweight callback.
-            return self.queue_for_approval(session_id, response.suggested_command)
-        return self.queue_for_approval(
-            session_id,
-            response.suggested_command,
-            execution_channel=getattr(response, "execution_channel", "local"),
-            handler_id=getattr(response, "handler_id", None),
-            msf_id=getattr(response, "msf_id", None),
-        )
+        try:
+            if channel == "local" and not getattr(response, "handler_id", None) and getattr(response, "msf_id", None) is None:
+                # Keep the small two-argument seam usable by integrations/tests that
+                # replace queue_for_approval with a lightweight callback.
+                return self.queue_for_approval(session_id, response.suggested_command)
+            return self.queue_for_approval(
+                session_id,
+                response.suggested_command,
+                execution_channel=getattr(response, "execution_channel", "local"),
+                handler_id=getattr(response, "handler_id", None),
+                msf_id=getattr(response, "msf_id", None),
+            )
+        except ValueError as e:
+            logger.warning(
+                f"Session {session_id}: proposed command could not be queued for "
+                f"approval either ({e}) -- discarding it instead of pausing the "
+                "session, since approving it manually would fail the same way."
+            )
+            session = self.sessions.get(session_id)
+            if session is not None:
+                _d = {
+                    "timestamp": datetime.now().isoformat(),
+                    "reasoning": f"UNQUEUEABLE COMMAND discarded: {e}",
+                    "suggested_command": response.suggested_command,
+                    "risk_level": "high",
+                    "confidence": 1.0,
+                    "context": "command_gate_rejected",
+                }
+                session.ai_decisions.append(_d)
+                self._save_ai_decision(session_id, _d)
+            return ""
     
     @staticmethod
     def _command_fingerprint(command: str) -> str:
@@ -3926,9 +4002,10 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             # `elif not _queued_already` raised UnboundLocalError and failed the
             # whole loop turn (surfaced as the "Agentic loop error" banner).
             _queued_already = False
-            # FULL_AUTO_MODE skips approval prompts, but it must not skip the
-            # deterministic execution policy.
-            if FULL_AUTO_MODE:
+            # FULL_AUTO_MODE (global) or session.full_auto (per-session) skips
+            # approval prompts, but it must not skip the deterministic execution
+            # policy.
+            if FULL_AUTO_MODE or session.full_auto:
                 should_auto_execute = bool(ai_response.suggested_command)
                 # SELF-CRITIQUE GATE: in fully-autonomous mode there is no human
                 # to catch a bad high-risk move. Before executing a HIGH-risk
@@ -3976,8 +4053,9 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         )
                         ai_response.suggested_command = vet["command"]
                 if should_auto_execute:
+                    _auto_mode_label = "FULL_AUTO_MODE" if FULL_AUTO_MODE else "session full-auto"
                     logger.info(
-                        f"Session {session_id}: FULL_AUTO_MODE — auto-executing "
+                        f"Session {session_id}: {_auto_mode_label} — auto-executing "
                         f"[{_decision_risk}] command: {ai_response.suggested_command[:100]}"
                     )
             else:
@@ -4023,7 +4101,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             # discarding the stale proposal and forcing a fresh strategic turn;
             # convenience auto-approve pauses for explicit operator approval.
             if should_auto_execute and session.auto_depth_counter >= session.max_auto_depth:
-                if FULL_AUTO_MODE:
+                if FULL_AUTO_MODE or session.full_auto:
                     logger.info(
                         f"Session {session_id} reached auto-depth {session.max_auto_depth}; "
                         "forcing a fresh strategic re-plan."
@@ -5700,7 +5778,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             session.ai_decisions.append(_d)
             self._save_ai_decision(session_id, _d)
 
-            if FULL_AUTO_MODE:
+            if FULL_AUTO_MODE or session.full_auto:
                 try:
                     asyncio.get_event_loop().create_task(
                         self.execute_command(
@@ -5719,7 +5797,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             logger.info(
                 f"Session {session_id}: dispatched {dispatched} credential-reuse "
                 f"check(s) for user={cred.get('username')!r} "
-                f"({'auto' if FULL_AUTO_MODE else 'queued for approval'})."
+                f"({'auto' if (FULL_AUTO_MODE or session.full_auto) else 'queued for approval'})."
             )
 
     def _save_credential_db(self, session_id: str, record: Dict):
@@ -6191,7 +6269,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                        COUNT(DISTINCT v.id)  AS vuln_count,
                        COALESCE(s.last_activity_at, '') AS last_activity_at,
                        (SELECT COUNT(*) FROM session_events se WHERE se.session_id=s.session_id) AS event_count,
-                       (SELECT COUNT(*) FROM jobs j WHERE j.session_id=s.session_id) AS job_count
+                       (SELECT COUNT(*) FROM jobs j WHERE j.session_id=s.session_id) AS job_count,
+                       COALESCE(s.full_auto_mode, 0) AS full_auto_mode
                 FROM sessions s
                 LEFT JOIN scan_results sr ON sr.session_id = s.session_id
                 LEFT JOIN commands c       ON c.session_id  = s.session_id
@@ -6205,7 +6284,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             for row in rows:
                 (sid, target_ip, target_domain, created_at, status, current_stage,
                   auto_approve, authorization_confirmed, scan_count, command_count, vuln_count,
-                  last_activity_at, event_count, job_count) = row
+                  last_activity_at, event_count, job_count, full_auto_mode) = row
                 results.append({
                     "session_id": sid,
                     "target_ip": target_ip,
@@ -6214,6 +6293,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     "status": status,
                     "current_stage": current_stage,
                     "auto_approve": bool(auto_approve),
+                    "full_auto": bool(full_auto_mode),
                     "authorization_confirmed": bool(authorization_confirmed),
                     "scan_count": scan_count,
                     "command_count": command_count,
@@ -6366,7 +6446,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                        COALESCE(scope_allowlist, ''),
                        COALESCE(last_activity_at, ''),
                        COALESCE(pause_reason, ''),
-                       COALESCE(pivot_state, '{}')
+                       COALESCE(pivot_state, '{}'),
+                       COALESCE(full_auto_mode, 0)
                 FROM sessions
                 WHERE status NOT IN ('completed', 'failed')
                 ORDER BY created_at DESC
@@ -6380,10 +6461,11 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                  db_objective, db_plan_json, db_reflections_json,
                   db_progress, db_progress_note, db_complete,
                    db_exhausted_json, db_scope, db_last_activity,
-                   db_pause_reason, db_pivot_state) = session_row
+                   db_pause_reason, db_pivot_state, db_full_auto) = session_row
 
                 # Create session object
-                session = Session(session_id, target_ip, target_domain, auto_approve, bool(authorization_confirmed))
+                session = Session(session_id, target_ip, target_domain, auto_approve, bool(authorization_confirmed),
+                                   full_auto=bool(db_full_auto))
                 session.status = status
                 session.current_stage = current_stage
                 session.scope_allowlist = db_scope or session.scope_allowlist
@@ -6622,7 +6704,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     # (curl/MSF). Do not leave an already-authorized autonomous
                     # session blocked on a stale approval record after restart.
                     if (status == "pending" and normalized_risk == "medium"
-                            and (FULL_AUTO_MODE or bool(session.auto_approve))):
+                            and (FULL_AUTO_MODE or session.full_auto or bool(session.auto_approve))):
                         status = "approved"
                         self._commands_to_auto_resume.append(
                             (session_id, command_id, command_text)

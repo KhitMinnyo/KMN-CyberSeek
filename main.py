@@ -195,6 +195,13 @@ class TargetRequest(BaseModel):
                     "'find and confirm SQL injection'). Drives the strategist's plan and "
                     "'objective complete' detection. Defaults to reaching highest privilege.",
     )
+    full_auto: bool = Field(
+        False,
+        description="Fully Autonomous mode for THIS session only: never pause for manual "
+                    "command approval, including HIGH-risk commands (the self-critique "
+                    "VERIFIER safety check still runs and still blocks a command it cannot "
+                    "vet). Intended for isolated lab targets only.",
+    )
     authorization_confirmed: bool = Field(
         ..., description="Must be true: operator confirms they own this target or have explicit permission to test it"
     )
@@ -224,6 +231,10 @@ class ApprovalRequest(BaseModel):
     session_id: str = Field(..., description="Session identifier")
     command_id: str = Field(..., description="Command identifier")
     approve: bool = Field(True, description="Approve or deny the command")
+
+class FullAutoRequest(BaseModel):
+    """Toggle per-session Fully Autonomous mode on an existing session."""
+    enabled: bool = Field(..., description="True: never pause this session for manual approval (HIGH-risk still passes through the self-critique VERIFIER). False: restore normal approval gating.")
 
 class SteerRequest(BaseModel):
     """Free-text operator steering instruction, injected into the AI's next decision."""
@@ -357,6 +368,7 @@ async def start_session(target_request: TargetRequest):
             max_auto_depth=target_request.max_auto_depth,
             authorization_confirmed=target_request.authorization_confirmed,
             objective=target_request.objective,
+            full_auto=target_request.full_auto,
         )
 
         # Start initial reconnaissance
@@ -404,6 +416,21 @@ async def get_session(session_id: str):
     except ValueError:
         raise HTTPException(status_code=404, detail="Session not found")
     return session_report
+
+
+@app.post("/api/sessions/{session_id}/full_auto")
+async def set_session_full_auto(session_id: str, request: FullAutoRequest):
+    """Turn per-session Fully Autonomous mode on/off for an existing session.
+
+    ON: this session never pauses for manual command approval, including
+    HIGH-risk commands -- the self-critique VERIFIER still runs and still
+    blocks (routes to manual approval) a command it cannot vet, since that is
+    a safety invariant, not a convenience setting. Intended for isolated lab
+    targets only.
+    """
+    if not orchestrator.set_session_full_auto(session_id, request.enabled):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"session_id": session_id, "full_auto": request.enabled}
 
 
 @app.get("/api/sessions/{session_id}/events")

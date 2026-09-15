@@ -643,6 +643,92 @@ def test_full_auto_depth_forces_replan_without_manual_approval():
     orch._analyze_with_ai.assert_awaited_once()
 
 
+def test_session_full_auto_bypasses_approval_without_global_flag():
+    """Per-session Fully Autonomous mode (session.full_auto) must behave exactly
+    like the global FULL_AUTO_MODE for that one session, without the operator
+    having to flip the global env-driven flag for every other session too.
+    Mirrors test_full_auto_depth_forces_replan_without_manual_approval but
+    drives the same auto-depth-replan path from session.full_auto instead."""
+    import core.orchestrator as orch_mod
+    orch = _loop_orch()
+    s = make_session(authorization_confirmed=True, full_auto=True)
+    s.status = "executing"
+    s.max_auto_depth = 1
+    s.auto_depth_counter = 1
+    orch.sessions[s.session_id] = s
+    response = AIResponse(
+        reasoning="routine next step", suggested_command="nmap -sV 10.0.0.5",
+        risk_level="low", confidence=0.9, attack_phase="enumeration",
+    )
+    orch.ai_connector.ask_ai_async = AsyncMock(return_value=response)
+    orch._vet_command = AsyncMock()
+    orch._analyze_with_ai = AsyncMock()
+    orch._track_task = lambda sid, coro, label: asyncio.create_task(coro)
+    original = orch_mod.FULL_AUTO_MODE
+    orch_mod.FULL_AUTO_MODE = False  # global flag stays OFF — only the session opted in
+    try:
+        async def scenario():
+            await orch._process_command_output(s.session_id, "previous", "clean output")
+            await asyncio.sleep(0)
+        _run(scenario())
+    finally:
+        orch_mod.FULL_AUTO_MODE = original
+    assert s.ai_decisions[-1]["context"] == "auto_depth_replan"
+    assert s.auto_depth_counter == 0
+    orch._analyze_with_ai.assert_awaited_once()
+
+
+def test_set_session_full_auto_toggles_and_persists():
+    """set_session_full_auto() is the API-facing per-session toggle for an
+    already-running session (unlike auto_approve, full_auto must be flippable
+    mid-engagement, not only at session creation)."""
+    orch = make_orch()
+    s = make_session()
+    orch.sessions[s.session_id] = s
+    assert s.full_auto is False
+
+    fake_cursor = MagicMock()
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value = fake_cursor
+    orch._db_connect = MagicMock(return_value=fake_conn)
+
+    ok = orch.set_session_full_auto(s.session_id, True)
+    assert ok is True
+    assert s.full_auto is True
+    fake_cursor.execute.assert_called_once()
+    assert "full_auto_mode" in fake_cursor.execute.call_args[0][0]
+
+    assert orch.set_session_full_auto("no-such-session", True) is False
+
+
+def test_queue_ai_response_discards_unqueueable_command_without_crashing():
+    """ROBUSTNESS regression: when a proposed command fails the execution gate
+    even under execution_mode="approved" (e.g. it's an interactive-only
+    invocation), queue_for_approval() raises ValueError. _queue_ai_response()
+    must swallow that instead of letting it propagate — otherwise it bubbles up
+    through _process_command_output()'s generic exception handler and pauses
+    the WHOLE session behind a fatal 'Agentic loop error' banner requiring a
+    manual Resume click, for a command that could never have been approved
+    anyway (approving it would hit the identical gate rejection)."""
+    orch = make_orch()
+    s = make_session()
+    orch.sessions[s.session_id] = s
+
+    def _raise(*a, **k):
+        raise ValueError('Command rejected: You must use non-interactive mode (e.g., python -c "...")')
+    orch.queue_for_approval = _raise
+
+    response = AIResponse(
+        reasoning="bad", suggested_command="python3 /tmp/x.py",
+        risk_level="medium", confidence=0.5, attack_phase="exploitation",
+    )
+    result = orch._queue_ai_response(s.session_id, response)
+
+    assert result == ""
+    assert s.ai_decisions[-1]["context"] == "command_gate_rejected"
+    assert "python3 /tmp/x.py" in s.ai_decisions[-1]["suggested_command"]
+
+
 def test_operator_instruction_injected_into_context():
     orch = _loop_orch()
     s = make_session()

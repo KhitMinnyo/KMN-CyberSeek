@@ -181,7 +181,7 @@ def get_sessions():
 
 def start_session(target_ip: str, target_domain: str = "", session_name: str = "",
                  auto_approve: bool = False, max_auto_depth: int = 25,
-                 authorization_confirmed: bool = False):
+                 authorization_confirmed: bool = False, full_auto: bool = False):
     """Start a new session. Returns the parsed response on success, or a dict
     with an "error" key (never raises) so callers can surface the real reason
     a session was rejected (e.g. invalid target, scope, missing authorization)."""
@@ -192,7 +192,8 @@ def start_session(target_ip: str, target_domain: str = "", session_name: str = "
             "session_name": session_name if session_name else None,
             "auto_approve": auto_approve,
             "max_auto_depth": max_auto_depth,
-            "authorization_confirmed": authorization_confirmed
+            "authorization_confirmed": authorization_confirmed,
+            "full_auto": full_auto
         }
         response = api_session.post(f"{API_BASE}/start", json=payload, timeout=30)
         if response.status_code == 200:
@@ -236,6 +237,19 @@ def get_session_details(session_id: str):
     except Exception as e:
         logger.error(f"Failed to get session details: {e}")
     return None
+
+
+def set_session_full_auto(session_id: str, enabled: bool):
+    """Toggle per-session Fully Autonomous mode on an existing session."""
+    try:
+        response = api_session.post(
+            f"{API_BASE}/sessions/{session_id}/full_auto",
+            json={"enabled": enabled}, timeout=10
+        )
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Failed to set full_auto for session {session_id}: {e}")
+        return False
 
 
 def get_pending_commands(session_id: str):
@@ -849,6 +863,15 @@ def show_new_session():
                     value=True,
                     help="Automatically execute routine reconnaissance and enumeration commands. HIGH-risk actions still wait for approval."
                 )
+
+                full_auto_checkbox = st.checkbox(
+                    "⚡ Fully Autonomous (lab mode)",
+                    value=False,
+                    help="Never pause THIS session for manual approval, including HIGH-risk "
+                         "commands (the self-critique safety check still runs and can still "
+                         "block a command it cannot vet). Use only against targets you own or "
+                         "are explicitly authorized to test, such as an isolated lab."
+                )
                 
                 parallel_scans = st.checkbox(
                     "Enable parallel scanning",
@@ -901,7 +924,8 @@ def show_new_session():
                 result = start_session(
                     target_ip, target_domain, session_name,
                     auto_approve=auto_approval,
-                    authorization_confirmed=authorization_confirmed
+                    authorization_confirmed=authorization_confirmed,
+                    full_auto=full_auto_checkbox
                 )
 
                 if result and result.get("error"):
@@ -1399,6 +1423,31 @@ def show_session_overview(session_details: Dict):
                         st.code(live_data["live_output"], language="text")
             except Exception:
                 pass
+
+    # ── Fully Autonomous toggle — per-session, lab-only ────────────────────────
+    _full_auto_on = bool(session_details.get("full_auto", False))
+    fa_col1, fa_col2 = st.columns([3, 1])
+    with fa_col1:
+        if _full_auto_on:
+            st.success(
+                "⚡ **Fully Autonomous** is ON — commands execute without approval "
+                "prompts (HIGH-risk still passes the self-critique safety check). "
+                "Use only for authorized lab targets."
+            )
+        else:
+            st.caption(
+                "⚡ Fully Autonomous is OFF — HIGH-risk and policy-blocked commands "
+                "wait for your approval."
+            )
+    with fa_col2:
+        _fa_label = "Turn Off" if _full_auto_on else "Turn On"
+        if st.button(f"⚡ {_fa_label}", key=f"toggle_full_auto_{session_id}",
+                     use_container_width=True):
+            if set_session_full_auto(session_id, not _full_auto_on):
+                time.sleep(0.3)
+                st.rerun()
+            else:
+                st.error("Failed to update Fully Autonomous mode.")
 
     # ── Session control buttons — all four always visible ─────────────────────
     # Resume/Start: shown always, disabled while in_progress (prevents duplicate
@@ -3130,6 +3179,7 @@ def show_history():
                     <strong>Commands:</strong> {s.get('command_count', 0)} &nbsp;
                     <strong>Vulnerabilities:</strong> {s.get('vuln_count', 0)}<br>
                     <strong>Auto-approve:</strong> {'Yes' if s.get('auto_approve') else 'No'} &nbsp;
+                    <strong>Fully Autonomous:</strong> {'⚡ Yes' if s.get('full_auto') else 'No'} &nbsp;
                     <strong>Auth confirmed:</strong> {'Yes' if s.get('authorization_confirmed') else 'No'}
                 </div>
                 """, unsafe_allow_html=True)
