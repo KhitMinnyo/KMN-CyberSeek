@@ -224,7 +224,8 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
     high_v   = sum(1 for v in vulnerabilities if v.get("risk_level") == "high")
     medium_v = sum(1 for v in vulnerabilities if v.get("risk_level") == "medium")
     low_v    = sum(1 for v in vulnerabilities if v.get("risk_level") == "low")
-    unverif  = sum(1 for v in vulnerabilities if v.get("status") == "unverified")
+    unverif  = sum(1 for v in vulnerabilities if v.get("status") == "potential")
+    hosts_compromised_n = len({c.get("host") for c in compromises if c.get("host")})
 
     summary_text = (
         f"This report summarises the results of an AI-directed penetration test session "
@@ -233,9 +234,13 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
         f"{len(discovered_services)} service(s). "
         f"A total of {len(vulnerabilities)} vulnerability finding(s) were recorded: "
         f"{high_v} high, {medium_v} medium, {low_v} low severity "
-        f"(plus {unverif} unverified leads from web research). "
+        f"({unverif} of which are potential/unconfirmed leads from a keyword or "
+        f"version-database match, not yet validated against this live target). "
         f"{len(credentials)} credential(s) were captured. "
-        f"{len(commands)} command(s) were executed during the session."
+        f"{len(commands)} command(s) were executed during the session. "
+        f"{hosts_compromised_n} of {len(discovered_hosts)} discovered host(s) had a confirmed "
+        f"compromise, recorded across {len(compromises)} piece(s) of exploitation evidence "
+        f"(entry count is not the same as host count)."
     )
     p = doc.add_paragraph(summary_text)
     p.style.font.size = Pt(10)
@@ -335,7 +340,7 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
                 host_port,
                 cves[:60],
                 (vuln.get("source_tool") or "")[:20],
-                (vuln.get("status") or "confirmed")[:15],
+                (vuln.get("status") or "potential")[:15],
             ]
             for j, (cell, val, w) in enumerate(zip(row.cells, vals, vwidths)):
                 cell.width = w
@@ -360,6 +365,7 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
 
             for label, key in [
                 ("Description", "description"), ("Affected Software", "service_version"),
+                ("Source Command", "source_command"),
             ]:
                 val = vuln.get(key) or ""
                 if val:
@@ -397,10 +403,10 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
     _add_section_heading(doc, "4. Credentials Captured")
 
     if credentials:
-        cheaders = ["Username", "Secret", "Type", "Service", "Discovered"]
-        cwidths  = [int(total_w * p) for p in [0.18, 0.30, 0.10, 0.12, 0.20]]
+        cheaders = ["Username", "Secret", "Type", "Service", "Host", "Validated", "Discovered"]
+        cwidths  = [int(total_w * p) for p in [0.15, 0.24, 0.08, 0.11, 0.14, 0.10, 0.18]]
         cwidths[-1] = total_w - sum(cwidths[:-1])
-        ct = doc.add_table(rows=1 + len(credentials), cols=5)
+        ct = doc.add_table(rows=1 + len(credentials), cols=7)
         ct.style = "Table Grid"
         _add_table_header_row(ct, cheaders, cwidths)
         for i, cred in enumerate(credentials):
@@ -410,12 +416,23 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
                 _display_secret(cred),
                 cred.get("secret_type") or "password",
                 cred.get("service") or "",
+                cred.get("host") or "",
+                "Yes" if cred.get("validated") else "No",
                 (cred.get("discovered_at") or "")[:19],
             ]
             for cell, val, w in zip(row.cells, vals, cwidths):
                 cell.width = w
                 run = cell.paragraphs[0].add_run(val)
                 run.font.size = Pt(9)
+        note = doc.add_paragraph()
+        nr = note.add_run(
+            "“Validated” = Yes only when this credential was later used in an "
+            "executed command that produced no auth-failure signal. “No” means it "
+            "was extracted from tool output but its own validity was never re-tested — "
+            "treat as unconfirmed until checked."
+        )
+        nr.font.size = Pt(7)
+        nr.italic = True
     else:
         doc.add_paragraph("No credentials were captured during this session.")
 
@@ -426,20 +443,33 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
     # ============================================================
     _add_section_heading(doc, "4.1  Confirmed Compromises")
     if compromises:
-        cmp_headers = ["#", "Service:Port", "Host", "Privilege", "Via Command", "Signal"]
-        cmp_widths  = [int(total_w * p) for p in [0.05, 0.16, 0.15, 0.14, 0.34, 0.16]]
+        _hosts_pwned = sorted({str(c.get("host")) for c in compromises if c.get("host")})
+        note = doc.add_paragraph()
+        nr = note.add_run(
+            f"{len(compromises)} piece(s) of exploitation evidence, across "
+            f"{len(_hosts_pwned)} distinct host(s): {', '.join(_hosts_pwned)}. "
+            "Evidence-entry count is NOT the same as host count — a single host "
+            "compromised through several services produces several entries here."
+        )
+        nr.font.size = Pt(8)
+        nr.italic = True
+        cmp_headers = ["#", "Service:Port", "Host", "Privilege", "Via Command", "Access Path", "Signal"]
+        cmp_widths  = [int(total_w * p) for p in [0.04, 0.14, 0.13, 0.11, 0.28, 0.16, 0.14]]
         cmp_widths[-1] = total_w - sum(cmp_widths[:-1])
-        ctab = doc.add_table(rows=1 + len(compromises), cols=6)
+        ctab = doc.add_table(rows=1 + len(compromises), cols=7)
         ctab.style = "Table Grid"
         _add_table_header_row(ctab, cmp_headers, cmp_widths)
         for i, comp in enumerate(compromises):
             row = ctab.rows[i + 1]
+            pivot = comp.get("pivoted_from")
+            access_path = f"via {pivot.get('host')}" if pivot else "direct"
             vals = [
                 str(i + 1),
                 f"{comp.get('service','?')}:{comp.get('port','?')}",
                 str(comp.get("host") or ""),
                 str(comp.get("privilege") or "?"),
                 (comp.get("command") or "")[:60],
+                access_path,
                 (comp.get("signal") or "")[:20],
             ]
             for j, (cell, val, w) in enumerate(zip(row.cells, vals, cmp_widths)):
@@ -510,8 +540,9 @@ def generate_report(session_report: Dict, output_path: Optional[str] = None) -> 
 
             ts = (cmd.get("timestamp") or "")[:19]
             ok = "✓" if cmd.get("success") else "✗"
+            cid = (cmd.get("command_id") or "")[:8] or "—"
             meta = doc.add_paragraph()
-            mr = meta.add_run(f"     {ok}  {ts}")
+            mr = meta.add_run(f"     {ok}  {ts}  id:{cid}")
             mr.font.size = Pt(8)
             mr.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
 
@@ -637,6 +668,8 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
     operator_instructions = session.get("operator_instructions", []) or []
     reflections = session.get("reflections", []) or []
     exhausted = session.get("exhausted_services", []) or []
+    summary_meta = session_report.get("summary", {}) or {}
+    hosts_compromised_n = len({c.get("host") for c in compromises if c.get("host")})
 
     high = sum(1 for v in vulns if v.get("risk_level") == "high")
     med = sum(1 for v in vulns if v.get("risk_level") == "medium")
@@ -669,7 +702,9 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
       + f"**{len(vulns)} vulnerability finding(s)** were recorded "
       + f"({high} high, {med} medium, {low} low), "
       + f"**{len(creds)} credential(s)** captured, "
-      + f"**{len(compromises)} confirmed compromise(s)**, "
+      + f"**{len(compromises)} piece(s) of exploitation evidence** across "
+      + f"**{hosts_compromised_n} distinct host(s) compromised** "
+      + "(evidence-entry count is not the same as host count), "
       + f"across **{len(commands)} executed command(s)** and "
       + f"**{len(decisions)} AI decision(s)**.")
     a("")
@@ -698,6 +733,30 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
     a(f"- Assessment Goal: {'**SUFFICIENT**' if objective_complete else 'IN PROGRESS'}"
       f" (coverage/objective progress: {progress_pct})")
     a(f"- Engagement: **{_engagement_label}**")
+    a("")
+
+    # Closure checklist -- an honest self-audit of whether this engagement is
+    # actually wrapped up, not just "the loop stopped". Unknowns are marked
+    # ⚠️ rather than guessed at, since a human operator action (e.g. actually
+    # reviewing exhausted vectors) can't be verified from session data alone.
+    a("**Engagement Closure Checklist:**")
+    _pending_n = int(summary_meta.get("pending_approval_count") or 0)
+    _close_items = [
+        ("Privilege goal achieved (compromise evidence present)", privilege_achieved),
+        ("Assessment/objective coverage sufficient", objective_complete),
+        (f"No commands blocked awaiting operator approval ({_pending_n} pending)", _pending_n == 0),
+        (f"Exhausted vectors reviewed by operator ({len(exhausted)} logged below)", None),
+        (f"Engagement reached a terminal state (status={status})",
+         status in ("completed", "cancelled", "failed")),
+    ]
+    for label, ok in _close_items:
+        mark = "✅" if ok is True else ("⚠️" if ok is None else "❌")
+        a(f"- {mark} {label}")
+    _ready = all(ok is not False for _, ok in _close_items)
+    a("")
+    a(f"**Closure readiness: {'READY TO CLOSE' if _ready else 'NOT YET READY — see unchecked items above'}**"
+      + (" _(⚠️ items need a human check, not just data — not counted against readiness)_"
+         if any(ok is None for _, ok in _close_items) else ""))
     a("")
 
     # 2. Services
@@ -746,7 +805,7 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
             mod_s = esc(mods[0]) if mods else "—"
             a(f"| {i} | {esc((v.get('risk_level') or 'unknown').upper())} | {kev} | {epss} | "
               f"{cvss_s} | {esc(v.get('name'))} | {hp} | {esc(', '.join(cids) or '—')} | "
-              f"{mod_s} | {esc(v.get('source_tool'))} | {esc(v.get('status') or 'confirmed')} |")
+              f"{mod_s} | {esc(v.get('source_tool'))} | {esc(v.get('status') or 'potential')} |")
         a("")
         # Details for high/medium
         detail = [v for v in ordered if v.get("risk_level") in ("high", "medium")]
@@ -760,6 +819,8 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
                     a(f"- Description: {esc(v.get('description'))[:600]}")
                 if v.get("service_version"):
                     a(f"- Affected: {esc(v.get('service_version'))}")
+                if v.get("source_command"):
+                    a(f"- Source command: `{esc(v.get('source_command'))[:200]}`")
                 cids = v.get("cve_ids") or []
                 if cids:
                     a(f"- CVE(s): {esc(', '.join(cids if isinstance(cids, list) else [cids]))}")
@@ -775,12 +836,18 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
     a("## 4. Credentials Captured")
     a("")
     if creds:
-        a("| Username | Secret | Type | Service | Discovered |")
-        a("|----------|--------|------|---------|------------|")
+        a("| Username | Secret | Type | Service | Host | Validated | Source Command | Discovered |")
+        a("|----------|--------|------|---------|------|-----------|-----------------|------------|")
         for c in creds:
+            validated = "Yes" if c.get("validated") else "No"
             a(f"| {esc(c.get('username'))} | {esc(_display_secret(c))} | "
               f"{esc(c.get('secret_type') or 'password')} | {esc(c.get('service'))} | "
+              f"{esc(c.get('host'))} | {validated} | {esc((c.get('source_command') or '')[:60])} | "
               f"{esc((c.get('discovered_at') or '')[:19])} |")
+        a("")
+        a("_“Validated” = Yes only when this credential was later used in an executed "
+          "command that produced no auth-failure signal. “No” means it was extracted "
+          "from tool output but never re-confirmed — treat as unverified until checked._")
     else:
         a("_No credentials captured._")
     a("")
@@ -789,12 +856,24 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
     a("## 4.1 Confirmed Compromises")
     a("")
     if compromises:
-        a("| # | Service:Port | Host | Privilege | Via | Signal |")
-        a("|---|--------------|------|-----------|-----|--------|")
+        _hosts_pwned_list = sorted({str(c.get("host")) for c in compromises if c.get("host")})
+        a(f"{len(compromises)} piece(s) of exploitation evidence, across "
+          f"**{hosts_compromised_n} distinct host(s)**: {esc(', '.join(_hosts_pwned_list))}. "
+          "Evidence-entry count is not the same as host count — a single host compromised "
+          "through several services produces several rows below.")
+        a("")
+        a("| # | Service:Port | Host | Privilege | Access Path | Via | Signal | Command ID |")
+        a("|---|--------------|------|-----------|--------------|-----|--------|------------|")
         for i, c in enumerate(compromises, 1):
+            pivot = c.get("pivoted_from")
+            access_path = f"via {esc(pivot.get('host'))}" if pivot else "direct"
+            cmd_id = (c.get("command_id") or "")[:8] or "—"
             a(f"| {i} | {esc(c.get('service'))}:{esc(c.get('port'))} | {esc(c.get('host'))} | "
-              f"**{esc(c.get('privilege'))}** | {esc((c.get('command') or '')[:70])} | "
-              f"{esc(c.get('signal'))} |")
+              f"**{esc(c.get('privilege'))}** | {access_path} | {esc((c.get('command') or '')[:60])} | "
+              f"{esc(c.get('signal'))} | `{cmd_id}` |")
+        a("")
+        a("_Command ID cross-references the matching entry in the Executed Commands Log (§5) "
+          "— match the first 8 characters against the `id:` shown on each log entry there._")
         a("")
         for i, c in enumerate(compromises, 1):
             if c.get("proof"):
@@ -838,7 +917,8 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
         for i, cmd in enumerate(commands, 1):
             ok = "✓" if cmd.get("success") else "✗"
             ts = (cmd.get("timestamp") or "")[:19].replace("T", " ")
-            a(f"**[{i}] {ok} `{esc(cmd.get('command'))}`**  \n_{ts}_")
+            cid = (cmd.get("command_id") or "")[:8] or "—"
+            a(f"**[{i}] {ok} `{esc(cmd.get('command'))}`**  \n_{ts} · id: `{cid}`_")
             out = (cmd.get("output") or "").strip()
             if out:
                 a("```")
@@ -1080,27 +1160,38 @@ def generate_pdf_report(session_report: Dict, output_path: Optional[str] = None)
     # ── Credentials ───────────────────────────────────────────────────────
     if credentials:
         _h1(f"Captured Credentials ({len(credentials)})")
+        _cred_cols = [35, 48, 18, 24, 24, 21]
         pdf.set_font("Helvetica", "B", 8)
-        for w, h in zip([40, 60, 25, 30, 25], ["Username", "Secret", "Type", "Service", "Host"]):
+        for w, h in zip(_cred_cols, ["Username", "Secret", "Type", "Service", "Host", "Validated"]):
             pdf.cell(w, 6, h, border=1)
         pdf.ln()
         pdf.set_font("Helvetica", "", 8)
         for c in credentials:
             secret = _display_secret(c)
-            for w, val in zip([40, 60, 25, 30, 25], [
-                str(c.get("username", ""))[:22],
+            for w, val in zip(_cred_cols, [
+                str(c.get("username", ""))[:20],
                 secret,
-                str(c.get("secret_type", ""))[:10],
-                str(c.get("service", ""))[:14],
-                str(c.get("host", ""))[:14],
+                str(c.get("secret_type", ""))[:8],
+                str(c.get("service", ""))[:12],
+                str(c.get("host", ""))[:12],
+                "Yes" if c.get("validated") else "No",
             ]):
                 pdf.cell(w, 5, val, border=1)
             pdf.ln()
+        pdf.set_font("Helvetica", "I", 7)
+        pdf.multi_cell(0, 4, "\"Validated\" = Yes only when later used successfully without an "
+                             "auth-failure signal; \"No\" = extracted but never re-confirmed.")
         pdf.ln(2)
 
     # ── Confirmed compromises ─────────────────────────────────────────────
     if compromises:
+        _hosts_pwned = sorted({str(c.get("host")) for c in compromises if c.get("host")})
         _h1(f"Confirmed Compromises ({len(compromises)})")
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.multi_cell(0, 5, f"{len(compromises)} piece(s) of exploitation evidence across "
+                             f"{len(_hosts_pwned)} distinct host(s): {', '.join(_hosts_pwned)}. "
+                             "Entry count is not the same as host count.")
+        pdf.ln(1)
         for i, comp in enumerate(compromises, start=1):
             priv = str(comp.get("privilege", "?"))
             rc = (211, 47, 47) if ("root" in priv.lower() or "system" in priv.lower()
@@ -1111,6 +1202,10 @@ def generate_pdf_report(session_report: Dict, output_path: Optional[str] = None)
                            f"on {comp.get('host','?')} - {priv}", ln=True)
             pdf.set_text_color(0, 0, 0)
             pdf.set_font("Helvetica", "", 8)
+            pivot = comp.get("pivoted_from")
+            access = f"pivoted from {pivot.get('host')}" if pivot else "direct access"
+            cid = (comp.get("command_id") or "")[:8] or "—"
+            pdf.multi_cell(0, 5, f"access: {access}  |  cmd id: {cid}")
             pdf.multi_cell(0, 5, f"via: {str(comp.get('command',''))[:160]}")
             proof = str(comp.get("proof") or "").strip()
             if proof:
@@ -1131,9 +1226,10 @@ def generate_pdf_report(session_report: Dict, output_path: Optional[str] = None)
         _h1(f"Commands Log ({len(commands)})")
         for i, cmd in enumerate(commands, start=1):
             ok = cmd.get("success", False)
+            cid = (cmd.get("command_id") or "")[:8] or "—"
             pdf.set_font("Helvetica", "B", 8)
             pdf.set_text_color(30, 100, 30) if ok else pdf.set_text_color(180, 30, 30)
-            pdf.cell(0, 5, f"{i}. {'✓' if ok else '✗'}  {str(cmd.get('command', ''))[:100]}", ln=True)
+            pdf.cell(0, 5, f"{i}. {'✓' if ok else '✗'}  [{cid}]  {str(cmd.get('command', ''))[:90]}", ln=True)
             pdf.set_text_color(0, 0, 0)
             pdf.set_font("Helvetica", "", 7)
             out = str(cmd.get("output") or "").strip()[:400]

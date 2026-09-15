@@ -682,6 +682,7 @@ class Scanner:
                 "target": target, "port": port,
                 "success": True, "raw_output": raw,
                 "vulnerabilities": vulns,
+                "command": cmd,
             }
         except Exception as e:
             logger.warning(f"Per-port vuln scan error {target}:{port}: {e}")

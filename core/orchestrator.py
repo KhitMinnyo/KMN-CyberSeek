@@ -669,6 +669,31 @@ def _primary_exploited_service(command: str, referenced: List[Dict]) -> List[Dic
     return referenced[:1]
 
 
+def _detect_pivot_source(session: "Session", command: str,
+                          evidence_host: Optional[str]) -> Optional[Dict]:
+    """Best-effort access-path detection: if `command` embeds a credential's
+    secret that was originally captured on a DIFFERENT host than the one just
+    compromised, this compromise was very likely reached by pivoting through
+    that other host (e.g. a domain-admin hash dumped on Host A used to pass-
+    the-hash into Host B). Returns {"host", "service"} or None. Purely a
+    same-secret text match -- a heuristic, not proof -- so callers should
+    treat the result as a lead to verify, not a certainty. Never raises."""
+    try:
+        cmd = command or ""
+        for cred in session.credentials or []:
+            secret = (cred.get("secret") or "").strip()
+            cred_host = cred.get("host")
+            if not secret or len(secret) < 4:
+                continue
+            if not cred_host or cred_host == evidence_host:
+                continue
+            if secret in cmd:
+                return {"host": cred_host, "service": cred.get("service") or "unknown"}
+    except Exception:
+        pass
+    return None
+
+
 def _detect_privilege_level(output: str) -> Optional[str]:
     """Infer the privilege level proven by a command's output, or None if the
     output doesn't clearly show a shell / code-execution context.
@@ -1253,6 +1278,14 @@ class Orchestrator:
                     FOREIGN KEY (session_id) REFERENCES sessions (session_id)
                 )
             ''')
+
+            # Credential provenance migration: was this credential actually
+            # confirmed to work (used in a command that produced no auth-failure
+            # signal), or only ever scraped from tool output and never re-tested?
+            try:
+                cursor.execute("ALTER TABLE credentials ADD COLUMN validated BOOLEAN DEFAULT FALSE")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
             # Create scheduled_scans table - recurring scan configurations.
             # The background scheduler (see core/scheduler.py, wired via main.py)
@@ -2355,6 +2388,7 @@ class Orchestrator:
                         "cve_ids": finding.get("cve_ids", []),
                         "reference_urls": finding.get("references", []),
                         "source_tool": "nmap-vuln-script",
+                        "source_command": result.get("command"),
                     })
         else:
             logger.info(f"[{session_id}] No open ports — skipping NSE vuln scan")
@@ -3602,6 +3636,16 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                     command, _record.get("output", ""),
                     _record.get("error", ""),
                 ):
+                    # This credential was actually used and produced no
+                    # auth-failure signal -- the same success criterion the
+                    # rotation logic itself trusts. Mark it validated so the
+                    # report can distinguish "scraped, never re-tested" from
+                    # "confirmed working" credentials.
+                    if _cred is not None and _record.get("success"):
+                        try:
+                            self._mark_credential_validated(session_id, _cred)
+                        except Exception as _e:
+                            logger.warning(f"Credential validation mark failed (non-fatal): {_e}")
                     break
                 if _cred is None:
                     break
@@ -3881,7 +3925,8 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
         # Settle the test-state of any service this command touched.
         self._settle_service_states(
-            session, command, sanitized_output, success=command_success
+            session, command, sanitized_output, success=command_success,
+            command_id=command_id,
         )
 
         # Coverage engine: mark playbook steps this command attempted, and
@@ -4985,7 +5030,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         Expected keys in vuln_data (all optional except 'name' and 'source_tool'):
         host, port, service, service_version, name, description, risk_level,
         cve_ids (list[str]), cvss_score (float), reference_urls (list[str]),
-        source_tool, status.
+        source_tool, status, source_command (the raw command that produced
+        this finding, when the caller has one).
 
         De-duplicates against findings already recorded for this session with the
         same (host, port, name) so repeated scans don't spam duplicate rows.
@@ -5016,7 +5062,18 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             "cvss_score": vuln_data.get("cvss_score"),
             "reference_urls": vuln_data.get("reference_urls") or [],
             "source_tool": vuln_data.get("source_tool", "unknown"),
-            "status": vuln_data.get("status", "confirmed"),
+            # Leave unset when the caller doesn't know -- _vuln_validate.validate()
+            # below decides confirmed vs potential from source_tool (an nmap NSE
+            # on-host probe is confirmed; an NVD/Vulners keyword/version match is
+            # only "potential" until something actually exploits it). Defaulting
+            # to "confirmed" here would pre-empt that check and overstate every
+            # database-lookup finding's certainty.
+            "status": vuln_data.get("status"),
+            # Raw command that produced this finding, when the caller has one
+            # (e.g. the exact nmap NSE invocation) -- lets the report trace a
+            # finding back to the scan that found it, not just a fuzzy
+            # host/port/source_tool match.
+            "source_command": vuln_data.get("source_command"),
             "discovered_at": datetime.now().isoformat()
         }
 
@@ -5877,6 +5934,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         "source_command": command[:300],
                         "discovered_at": datetime.now().isoformat(),
                         "reused": False,   # set True once reuse checks are dispatched
+                        "validated": False,  # True once actually used with no auth-failure signal
                     }
                     session.credentials.append(record)
                     self._save_credential_db(session_id, record)
@@ -6062,17 +6120,36 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             cursor.execute('''
                 INSERT INTO credentials (
                     session_id, username, secret, secret_type, service, host, port,
-                    source_command, discovered_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_command, discovered_at, validated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 session_id, record["username"], record["secret"], record.get("secret_type", "password"),
                 record.get("service"), record.get("host"), record.get("port"),
-                record.get("source_command"), record.get("discovered_at")
+                record.get("source_command"), record.get("discovered_at"),
+                bool(record.get("validated", False))
             ))
             conn.commit()
             conn.close()
         except sqlite3.Error as e:
             logger.error(f"Failed to save credential to database: {e}")
+
+    def _mark_credential_validated(self, session_id: str, cred: Dict) -> None:
+        """Flip a credential's `validated` flag once it has actually been used
+        in an executed command that produced no auth-failure signal -- the same
+        deterministic signal the rotation logic itself trusts. Best-effort,
+        never raises into the command loop."""
+        cred["validated"] = True
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE credentials SET validated = 1
+                WHERE session_id = ? AND username = ? AND secret = ?
+            ''', (session_id, cred.get("username"), cred.get("secret")))
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to persist credential validation for session {session_id}: {e}")
 
     def get_credentials(self, session_id: str) -> List[Dict]:
         """Return in-memory credential list for a session (fast path)."""
@@ -6105,6 +6182,10 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             "service": cred.get("service"), "host": cred.get("host"),
             "port": cred.get("port"), "source_command": cred.get("source_command", "bruteforce"),
             "discovered_at": datetime.now().isoformat(), "reused": False,
+            # A brute-force worker hit IS a confirmed successful auth (it only
+            # ever reports parsed success lines), unlike credentials scraped
+            # from arbitrary tool output -- so this one is validated by construction.
+            "validated": bool(cred.get("validated", True)),
         }
         session.credentials.append(record)
         self._save_credential_db(session_id, record)
@@ -6880,17 +6961,19 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 # Load credentials found in this session
                 cursor.execute('''
                     SELECT username, secret, secret_type, service, host, port,
-                           source_command, discovered_at
+                           source_command, discovered_at, validated
                     FROM credentials
                     WHERE session_id = ?
                     ORDER BY discovered_at
                 ''', (session_id,))
                 for cred_row in cursor.fetchall():
-                    username, secret, secret_type, service, host, port, source_command, discovered_at = cred_row
+                    (username, secret, secret_type, service, host, port, source_command,
+                     discovered_at, validated) = cred_row
                     session.credentials.append({
                         "username": username, "secret": secret, "secret_type": secret_type,
                         "service": service, "host": host, "port": port,
-                        "source_command": source_command, "discovered_at": discovered_at
+                        "source_command": source_command, "discovered_at": discovered_at,
+                        "validated": bool(validated),
                     })
 
                 # Load AI decisions for this session
@@ -7721,7 +7804,7 @@ Web apps: {webapps}
             self._promote_service(svc, "in_progress")
 
     def _settle_service_states(self, session: "Session", command: str,
-                               output: str, success: bool):
+                               output: str, success: bool, command_id: str = ""):
         """After a command completes, settle the state of any service it touched:
         promote to 'exploited' when the output shows compromise, otherwise
         'tested'. Deterministic — replaces the old substring 'tested' heuristic.
@@ -7761,16 +7844,20 @@ Web apps: {webapps}
             self._promote_service(svc, settle_state)
         if exploited:
             self._capture_exploitation_evidence(
-                session, command, output, referenced, _matched
+                session, command, output, referenced, _matched,
+                command_id=command_id,
             )
 
     def _capture_exploitation_evidence(self, session: "Session", command: str,
                                        output: str, services: List[Dict],
-                                       matched_signals: List[str]) -> None:
+                                       matched_signals: List[str],
+                                       command_id: str = "") -> None:
         """Record proof of a confirmed compromise: privilege level, the proof
-        snippet, and which service it landed on. Deduped per (service, privilege)
-        so repeated confirmations don't spam the evidence log. Best-effort — never
-        raises into the command loop."""
+        snippet, and which service it landed on. Deduped per (host, service,
+        privilege) so repeated confirmations don't spam the evidence log, and so
+        two DIFFERENT hosts compromised via the same service/port/privilege
+        combo are never collapsed into a single entry (host is part of the
+        dedup fingerprint). Best-effort — never raises into the command loop."""
         try:
             privilege = _detect_privilege_level(output) or "unknown"
             # Trimmed proof snippet centred on the first matched signal.
@@ -7788,28 +7875,35 @@ Web apps: {webapps}
             host = target_svc.get("host", session.target_ip)
             port = target_svc.get("port", "")
 
-            # Dedup: same service + privilege already captured → skip.
-            fp = f"{svc_name}:{port}:{privilege}"
+            # Dedup: same HOST + service + privilege already captured → skip.
+            fp = f"{host}:{svc_name}:{port}:{privilege}"
             if any(
-                f"{e.get('service')}:{e.get('port')}:{e.get('privilege')}" == fp
+                f"{e.get('host')}:{e.get('service')}:{e.get('port')}:{e.get('privilege')}" == fp
                 for e in session.compromise_evidence
             ):
                 return
+
+            # Best-effort access-path lead: was this landed using a credential
+            # captured on a DIFFERENT host? (See _detect_pivot_source().)
+            pivoted_from = _detect_pivot_source(session, command, host)
 
             entry = {
                 "service": svc_name,
                 "host": host,
                 "port": port,
                 "command": command[:300],
+                "command_id": command_id or None,
                 "privilege": privilege,
                 "signal": ", ".join(matched_signals[:4]),
                 "proof": proof,
+                "pivoted_from": pivoted_from,
                 "timestamp": datetime.now().isoformat(),
             }
             session.compromise_evidence.append(entry)
             logger.warning(
                 f"COMPROMISE CONFIRMED on {svc_name}:{port} ({host}) — "
                 f"privilege={privilege}, signal='{entry['signal']}'"
+                + (f", pivoted from {pivoted_from['host']}" if pivoted_from else "")
             )
             # Persist to the evidence table for the report.
             self.add_evidence(session.session_id, "exploitation", entry)
@@ -8948,6 +9042,13 @@ Web apps: {webapps}
                 "objective_progress": session.objective_progress,
                 "objective_complete": session.objective_complete,
                 "privilege_achieved": bool(session.compromise_evidence),
+                "hosts_compromised": len({
+                    c.get("host") for c in session.compromise_evidence if c.get("host")
+                }),
+                "pending_approval_count": sum(
+                    1 for c in self.pending_commands.values()
+                    if c.get("session_id") == session_id and c.get("status") == "pending"
+                ),
             }
         }
         # Last-line QA pass -- see _validate_report_findings() -- so every
