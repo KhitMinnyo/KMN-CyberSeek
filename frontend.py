@@ -593,11 +593,16 @@ def main():
         if backend_healthy:
             _ev = dotenv_values(".env")
             _provider   = _ev.get("AI_PROVIDER", "").strip()
-            _api_key    = _ev.get("DEEPSEEK_API_KEY", "").strip()
+            _key_names = {
+                "deepseek": "DEEPSEEK_API_KEY", "api": "DEEPSEEK_API_KEY",
+                "openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
+                "openrouter": "OPENROUTER_API_KEY",
+            }
+            _api_key    = _ev.get(_key_names.get(_provider, ""), "").strip()
             _ollama_mdl = _ev.get("OLLAMA_MODEL", "").strip()
             _bad = ("your_deepseek", "your-api-key", "sk-xxx", "placeholder",
                     "example", "changeme", "insert_key")
-            _api_ok   = (_provider == "api" and _api_key and len(_api_key) > 10
+            _api_ok   = (_provider in _key_names and _api_key and len(_api_key) > 10
                          and not any(p in _api_key.lower() for p in _bad))
             _local_ok = (_provider == "local" and bool(_ollama_mdl))
             _ai_ready = _api_ok or _local_ok
@@ -3245,7 +3250,7 @@ def show_settings():
             _cov = st.toggle("🧭 Coverage Engine", value=_flags.get("coverage_engine", True),
                              help="Methodology-driven per-service playbooks + coverage progress")
         with fc2:
-            _bf = st.toggle("🔓 Brute-force worker", value=_flags.get("bruteforce_enabled", True),
+            _bf = st.toggle("🔓 Brute-force worker", value=_flags.get("bruteforce_enabled", False),
                             help="Background credential brute-force on auth services")
         with fc3:
             _fa = st.toggle("⚡ Full-Auto mode", value=_flags.get("full_auto_mode", False),
@@ -3299,16 +3304,26 @@ def show_settings():
         env_vars = dotenv_values(env_path) if os.path.exists(env_path) else {}
 
         current_provider = env_vars.get("AI_PROVIDER", "local")
-        current_ds_key = env_vars.get("DEEPSEEK_API_KEY", "")
-        current_ds_model = env_vars.get("DEEPSEEK_MODEL", "deepseek-chat")
+        provider_labels = {
+            "local": "Local (Ollama)", "deepseek": "DeepSeek API", "api": "DeepSeek API",
+            "openai": "OpenAI / ChatGPT API", "anthropic": "Anthropic Claude API",
+            "openrouter": "OpenRouter API",
+        }
+        provider_env = {
+            "DeepSeek API": ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "deepseek-chat"),
+            "OpenAI / ChatGPT API": ("OPENAI_API_KEY", "OPENAI_MODEL", "gpt-4o-mini"),
+            "Anthropic Claude API": ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
+            "OpenRouter API": ("OPENROUTER_API_KEY", "OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+        }
         current_ollama_url = env_vars.get("OLLAMA_URL", "http://localhost:11434")
         current_ollama_model = env_vars.get("OLLAMA_MODEL", "qwen2.5:14b")
+        current_label = provider_labels.get(current_provider, "Local (Ollama)")
 
         ai_provider = st.selectbox(
             "AI Provider",
-            ["Local (Ollama)", "DeepSeek API"],
-            index=1 if current_provider == "api" else 0,
-            help="Local (Ollama) keeps everything on your machine. DeepSeek API is faster but sends data to DeepSeek's servers."
+            ["Local (Ollama)", "DeepSeek API", "OpenAI / ChatGPT API", "Anthropic Claude API", "OpenRouter API"],
+            index=["Local (Ollama)", "DeepSeek API", "OpenAI / ChatGPT API", "Anthropic Claude API", "OpenRouter API"].index(current_label),
+            help="Choose a local Ollama model or a compatible cloud provider. Cloud providers send prompt data to that provider."
         )
 
         if ai_provider == "Local (Ollama)":
@@ -3431,18 +3446,30 @@ def show_settings():
             with col2:
                 max_tokens = st.number_input("Max Tokens", 100, 10000, 2000)
 
-        else:  # DeepSeek API
-            # Automatically populate the key if it exists in .env
-            api_key = st.text_input("API Key", value=current_ds_key, type="password")
-            model_name = st.text_input(
-                "Model",
-                value=current_ds_model,
-                help="e.g. deepseek-chat or deepseek-coder"
+        else:  # Cloud API provider
+            key_env, model_env, default_model = provider_env[ai_provider]
+            api_key = st.text_input("API Key", value=env_vars.get(key_env, ""), type="password")
+            cloud_models = {
+                "DeepSeek API": ["deepseek-chat", "deepseek-reasoner"],
+                "OpenAI / ChatGPT API": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "o3-mini"],
+                "Anthropic Claude API": ["claude-3-5-sonnet-latest", "claude-3-7-sonnet-latest", "claude-3-5-haiku-latest"],
+                "OpenRouter API": ["openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet", "google/gemini-2.0-flash-001", "deepseek/deepseek-chat"],
+            }[ai_provider]
+            configured_model = env_vars.get(model_env, default_model)
+            model_options = cloud_models + ([configured_model] if configured_model not in cloud_models else []) + ["Custom model..."]
+            model_choice = st.selectbox(
+                "Model", model_options,
+                index=model_options.index(configured_model) if configured_model in model_options else 0,
+                key=f"cloud_model_{ai_provider}",
+            )
+            model_name = (
+                st.text_input("Custom model identifier", value=configured_model)
+                if model_choice == "Custom model..." else model_choice
             )
             ollama_url = ""              # not applicable for this provider
             ollama_context_window = None # not applicable
 
-            st.info("DeepSeek API provides high-performance AI with specialized security knowledge.")
+            st.info(f"{ai_provider} uses the model identifier entered above.")
 
         # AI behavior settings
         st.markdown("### 🧠 AI Behavior")
@@ -3477,7 +3504,7 @@ def show_settings():
                 with st.spinner("Saving configuration..."):
                     payload = {
                         "provider": ai_provider,
-                        "api_key": api_key if ai_provider == "DeepSeek API" else "",
+                        "api_key": api_key if ai_provider != "Local (Ollama)" else "",
                         "model_name": model_name,
                         "ollama_url": ollama_url if ai_provider == "Local (Ollama)" else "",
                         "ollama_context_window": ollama_context_window if ai_provider == "Local (Ollama)" else None,

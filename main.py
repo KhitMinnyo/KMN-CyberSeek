@@ -279,7 +279,7 @@ _KNOWN_CTX: dict = {
 
 class AISettings(BaseModel):
     """AI settings update model."""
-    provider: str  # "Local (Ollama)" or "DeepSeek API"
+    provider: str  # Local (Ollama), DeepSeek, OpenAI, Anthropic, OpenRouter
     api_key: str = ""
     model_name: str = ""  # Ollama model tag OR DeepSeek model name, depending on provider
     ollama_url: str = ""
@@ -1284,29 +1284,41 @@ async def get_ollama_model_info(model: str):
 
 @app.post("/api/settings/ai")
 async def update_ai_settings(settings: AISettings):
-    """Update AI settings (persisted to .env, works even if .env starts empty) and
-    reload the connector. Supports exactly two providers: DeepSeek API and local
-    Ollama (any model you've pulled, e.g. deepseek-r1:8b or a security-tuned model
-    like DeepHat/DeepHat-V1-7B)."""
+    """Update AI settings, persist them, and reload the connector.
+    Supports Ollama, DeepSeek, OpenAI/ChatGPT, Anthropic Claude, and OpenRouter."""
     env_path = os.path.join(os.getcwd(), '.env')
     if not os.path.exists(env_path):
         open(env_path, 'w').close()
 
-    # Map the UI provider string to backend provider code
-    provider_code = "api" if "DeepSeek" in settings.provider else "local"
+    provider_map = {
+        "Local (Ollama)": "local", "DeepSeek API": "deepseek",
+        "OpenAI / ChatGPT API": "openai", "Anthropic Claude API": "anthropic",
+        "OpenRouter API": "openrouter",
+    }
+    provider_code = provider_map.get(settings.provider, settings.provider.strip().lower())
+    if provider_code not in {"local", "deepseek", "openai", "anthropic", "openrouter", "none"}:
+        raise HTTPException(status_code=400, detail="Unsupported AI provider")
     set_key(env_path, "AI_PROVIDER", provider_code)
 
     local_model = None
     ollama_url = None
     api_model = None
 
-    if provider_code == "api":
+    if provider_code in {"deepseek", "openai", "anthropic", "openrouter"}:
+        key_name = {
+            "deepseek": "DEEPSEEK_API_KEY", "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY",
+        }[provider_code]
+        model_name = {
+            "deepseek": "DEEPSEEK_MODEL", "openai": "OPENAI_MODEL",
+            "anthropic": "ANTHROPIC_MODEL", "openrouter": "OPENROUTER_MODEL",
+        }[provider_code]
         if settings.api_key:
-            set_key(env_path, "DEEPSEEK_API_KEY", settings.api_key)
+            set_key(env_path, key_name, settings.api_key)
         if settings.model_name:
-            set_key(env_path, "DEEPSEEK_MODEL", settings.model_name)
+            set_key(env_path, model_name, settings.model_name)
             api_model = settings.model_name
-    else:
+    elif provider_code == "local":
         if settings.model_name:
             set_key(env_path, "OLLAMA_MODEL", settings.model_name)
             local_model = settings.model_name

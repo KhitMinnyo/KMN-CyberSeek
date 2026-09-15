@@ -710,6 +710,16 @@ def test_feature_flags_default_coverage_on_and_bruteforce_opt_in():
         orch_mod.set_feature_flag("coverage_engine", _covled)
 
 
+def test_full_auto_feature_flag_is_runtime_toggleable():
+    import core.orchestrator as orch_mod
+    original = orch_mod.FULL_AUTO_MODE
+    try:
+        assert orch_mod.set_feature_flag("full_auto_mode", not original) == "FULL_AUTO_MODE"
+        assert orch_mod.get_feature_flags()["full_auto_mode"] == (not original)
+    finally:
+        orch_mod.set_feature_flag("full_auto_mode", original)
+
+
 def test_coverage_engine_off_is_noop():
     import core.orchestrator as orch_mod
     orch = _loop_orch()

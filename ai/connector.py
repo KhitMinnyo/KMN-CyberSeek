@@ -1,6 +1,7 @@
-"""
-KMN-CyberSeek AI Connector Module
-Supports both local Ollama (DeepSeek models) and DeepSeek API
+"""KMN-CyberSeek AI Connector Module.
+
+Supports local Ollama plus DeepSeek, OpenAI/ChatGPT, Anthropic Claude, and
+OpenRouter cloud APIs through one normalized response schema.
 """
 
 import json
@@ -18,6 +19,12 @@ import requests
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+API_PROVIDERS = {"deepseek", "openai", "anthropic", "openrouter"}
+PROVIDER_ALIASES = {
+    "api": "deepseek", "chatgpt": "openai", "claude": "anthropic",
+    "open-router": "openrouter", "ollama": "local",
+}
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -82,7 +89,7 @@ class AIResponse(BaseModel):
 
 
 class KMN_AI_Connector:
-    """Hybrid AI connector supporting local Ollama and DeepSeek API."""
+    """AI connector supporting Ollama and multiple cloud API providers."""
     
     def __init__(self, provider: str = None, api_key: Optional[str] = None,
                  local_model: Optional[str] = None, ollama_url: Optional[str] = None,
@@ -105,8 +112,23 @@ class KMN_AI_Connector:
         load_dotenv(override=True)
         
         # Check for API key from parameter or environment variables
-        # Check both DEEPSEEK_API_KEY and OPENAI_API_KEY as mentioned in feedback
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
+        requested_provider = (provider or os.getenv("AI_PROVIDER", "") or "").strip().lower()
+        requested_provider = PROVIDER_ALIASES.get(requested_provider, requested_provider)
+        if requested_provider not in API_PROVIDERS and requested_provider not in {"local", "none"}:
+            requested_provider = ""
+
+        key_env = {
+            "deepseek": "DEEPSEEK_API_KEY", "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY",
+        }
+        if not requested_provider:
+            for candidate, env_name in key_env.items():
+                if os.getenv(env_name):
+                    requested_provider = candidate
+                    break
+            requested_provider = requested_provider or "local"
+        # Check the provider-specific key; explicit api_key wins.
+        self.api_key = api_key or os.getenv(key_env.get(requested_provider, ""), "")
         
         # Clean and validate API key
         if self.api_key:
@@ -133,12 +155,9 @@ class KMN_AI_Connector:
             not any(pattern in self.api_key.lower() for pattern in placeholder_patterns)
         )
 
-        requested_provider = (provider or os.getenv("AI_PROVIDER", "") or "").strip().lower()
-        if requested_provider not in {"api", "local", "none"}:
-            requested_provider = "api" if is_valid_api_key else "local"
-        if requested_provider == "api" and not is_valid_api_key:
+        if requested_provider in API_PROVIDERS and not is_valid_api_key:
             logger.warning(
-                "AI_PROVIDER is 'api' but no valid API key was found; falling back to local."
+                f"AI_PROVIDER is '{requested_provider}' but no valid API key was found; falling back to local."
             )
             requested_provider = "local"
         self.provider = requested_provider
@@ -151,12 +170,26 @@ class KMN_AI_Connector:
         if ollama_base.endswith("/api/generate"):
             ollama_base = ollama_base[: -len("/api/generate")].rstrip("/")
         self.ollama_url = f"{ollama_base}/api/generate"
-        self.deepseek_api_url = "https://api.deepseek.com/chat/completions"
+        self.api_urls = {
+            "deepseek": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/chat/completions"),
+            "openai": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions"),
+            "openrouter": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"),
+            "anthropic": os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1/messages"),
+        }
+        self.deepseek_api_url = self.api_urls["deepseek"]
 
         # Default models - configurable so any Ollama model (e.g. a security-tuned model
         # like DeepHat/DeepHat-V1-7B) can be used without code changes.
         self.local_model = local_model or os.getenv("OLLAMA_MODEL") or "qwen2.5:14b"
-        self.api_model = api_model or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
+        model_env = {
+            "deepseek": "DEEPSEEK_MODEL", "openai": "OPENAI_MODEL",
+            "anthropic": "ANTHROPIC_MODEL", "openrouter": "OPENROUTER_MODEL",
+        }
+        defaults = {
+            "deepseek": "deepseek-chat", "openai": "gpt-4o-mini",
+            "anthropic": "claude-3-5-sonnet-latest", "openrouter": "openai/gpt-4o-mini",
+        }
+        self.api_model = api_model or os.getenv(model_env.get(requested_provider, ""), "") or defaults.get(requested_provider, "")
         
         # ── Context-window budget ─────────────────────────────────────────────
         # Read from env; user should set this to their Ollama model's num_ctx.
@@ -238,7 +271,7 @@ class KMN_AI_Connector:
         if custom:
             return custom
         from .prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_COMPACT
-        if self.provider == "api":
+        if self.provider in API_PROVIDERS:
             # API provider has a large context — always use full prompt
             return SYSTEM_PROMPT
         return SYSTEM_PROMPT_COMPACT if self.context_window < 8_000 else SYSTEM_PROMPT
@@ -343,13 +376,9 @@ class KMN_AI_Connector:
             raise ConnectionError(f"Failed to connect to local Ollama: {e}")
     
     async def ask_ai_api(self, prompt: str, session_id: Optional[str] = None, memory: Optional[str] = None) -> AIResponse:
-        """Query DeepSeek API.
-
-        System prompt goes in the `system` role (not buried in the user message)
-        so the model gives it maximum weight. Memory + context go in `user`.
-        """
+        """Query a configured cloud provider using its native API shape."""
         if not self.api_key:
-            raise ValueError("DeepSeek API key is required for API provider")
+            raise ValueError(f"API key is required for {self.provider}")
 
         try:
             from .prompts import SYSTEM_PROMPT
@@ -369,15 +398,32 @@ class KMN_AI_Connector:
                 f"\n\nRespond with valid raw JSON only — no markdown, no extra text."
             )
 
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-
-            base_messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_content}
-            ]
+            if self.provider == "anthropic":
+                headers = {
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                }
+                base_payload = {
+                    "model": self.api_model,
+                    "system": SYSTEM_PROMPT,
+                    "messages": [{"role": "user", "content": user_content}],
+                    "max_tokens": self.max_tokens,
+                }
+            else:
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                }
+                if self.provider == "openrouter":
+                    headers.update({
+                        "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost"),
+                        "X-Title": os.getenv("OPENROUTER_APP_NAME", "KMN-CyberSeek"),
+                    })
+                base_messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content}
+                ]
 
             # Up to two attempts: the first at the configured tactical temperature,
             # and — if the reply is truncated or unparseable — a deterministic
@@ -386,40 +432,50 @@ class KMN_AI_Connector:
             # loop stalling on a phantom "empty command") into a self-heal.
             async with httpx.AsyncClient(timeout=90.0) as client:
                 for attempt in range(2):
-                    messages = list(base_messages)
                     temperature = self.tactical_temperature
+                    repair = ""
                     if attempt == 1:
                         temperature = 0.0
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "Your previous reply was truncated or was not valid JSON. "
-                                "Reply again with ONLY a single compact JSON object matching "
-                                "the required schema (reasoning, suggested_command, risk_level, "
-                                "confidence, attack_phase, target_info). Keep the reasoning "
-                                "under 400 characters. No markdown, no text outside the JSON."
-                            ),
-                        })
+                        repair = (
+                            "Your previous reply was invalid. Reply with ONLY one compact "
+                            "JSON object matching the required schema. No markdown."
+                        )
+                    if self.provider == "anthropic":
+                        payload = dict(base_payload)
+                        payload["temperature"] = temperature
+                        if repair:
+                            payload["messages"] = [{"role": "user", "content": user_content + "\n\n" + repair}]
+                    else:
+                        messages = list(base_messages)
+                        if repair:
+                            messages.append({"role": "user", "content": repair})
+                        payload = {
+                            "model": self.api_model, "messages": messages,
+                            "temperature": temperature, "max_tokens": self.max_tokens,
+                        }
+                        if self.provider in {"deepseek", "openai"}:
+                            payload["response_format"] = {"type": "json_object"}
 
-                    payload = {
-                        "model": self.api_model,
-                        "messages": messages,
-                        "temperature": temperature,
-                        "max_tokens": self.max_tokens,
-                        "response_format": {"type": "json_object"}
-                    }
-
-                    response = await client.post(self.deepseek_api_url, json=payload, headers=headers)
+                    response = await client.post(
+                        self.api_urls[self.provider], json=payload, headers=headers
+                    )
                     response.raise_for_status()
 
                     result = response.json()
-                    choice = result['choices'][0]
-                    response_text = choice['message']['content']
-                    finish_reason = choice.get('finish_reason')
+                    if self.provider == "anthropic":
+                        response_text = "".join(
+                            block.get("text", "") for block in result.get("content", [])
+                            if block.get("type") == "text"
+                        )
+                        finish_reason = result.get("stop_reason")
+                    else:
+                        choice = result['choices'][0]
+                        response_text = choice['message']['content']
+                        finish_reason = choice.get('finish_reason')
 
                     # Parse JSON response — robust extractor handles fences/preamble.
                     ai_data = _extract_json(response_text)
-                    truncated = finish_reason == "length"
+                    truncated = finish_reason in ("length", "max_tokens")
 
                     if ai_data is not None and not truncated:
                         try:
@@ -456,7 +512,7 @@ class KMN_AI_Connector:
         """
         if self.provider == "none":
             return None
-        if self.provider == "api":
+        if self.provider in API_PROVIDERS:
             import asyncio
             try:
                 asyncio.get_running_loop()
@@ -478,7 +534,7 @@ class KMN_AI_Connector:
         """
         if self.provider == "none":
             return None
-        if self.provider == "api":
+        if self.provider in API_PROVIDERS:
             return await self.ask_ai_api(prompt, session_id, memory)
         else:
             # Run local query in thread pool to avoid blocking
@@ -506,7 +562,7 @@ class KMN_AI_Connector:
         try:
             if self.provider == "none":
                 return None
-            if self.provider == "api":
+            if self.provider in API_PROVIDERS:
                 return await self._ask_raw_api(system_prompt, user_prompt)
             else:
                 import asyncio
@@ -525,26 +581,50 @@ class KMN_AI_Connector:
         if not self.api_key:
             return None
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-        payload = {
-            "model": self.api_model,
-            "messages": messages,
-            "temperature": 0.3,
-            "max_tokens": self.max_tokens,
-        }
+        if self.provider == "anthropic":
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": self.api_model, "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}],
+                "temperature": 0.3, "max_tokens": self.max_tokens,
+            }
+        else:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            if self.provider == "openrouter":
+                headers.update({
+                    "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost"),
+                    "X-Title": os.getenv("OPENROUTER_APP_NAME", "KMN-CyberSeek"),
+                })
+            payload = {
+                "model": self.api_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": self.max_tokens,
+            }
 
         async with httpx.AsyncClient(timeout=90.0) as client:
-            response = await client.post(self.deepseek_api_url, json=payload, headers=headers)
+            response = await client.post(
+                self.api_urls[self.provider], json=payload, headers=headers
+            )
             response.raise_for_status()
             result = response.json()
-            text = result['choices'][0]['message']['content']
+            if self.provider == "anthropic":
+                text = "".join(
+                    block.get("text", "") for block in result.get("content", [])
+                    if block.get("type") == "text"
+                )
+            else:
+                text = result['choices'][0]['message']['content']
             return self._extract_json(text)
 
     def _ask_raw_local(self, system_prompt: str, user_prompt: str) -> Optional[Any]:

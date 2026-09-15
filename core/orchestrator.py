@@ -535,7 +535,7 @@ class Session:
         self._osint_turns: int = 0
         # Agentic loop settings
         self.auto_approve = auto_approve
-        self.max_auto_depth = 15  # Maximum consecutive auto-executed commands before requiring human review
+        self.max_auto_depth = 15  # Full-auto replans; convenience mode checkpoints for approval
         self.auto_depth_counter = 0  # Current count of consecutive auto-executed commands
         self.last_auto_success = False  # Track if last auto-execution found something critical
         # Audit trail: operator confirmed authorization to test this target

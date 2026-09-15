@@ -37,7 +37,7 @@ FastAPI Backend     (port 6000)
 
 ## Installation
 
-**Prerequisites:** Python 3.8+, Nmap (`sudo apt install nmap`), Ollama or DeepSeek API key.
+**Prerequisites:** Python 3.8+, Nmap (`sudo apt install nmap`), Ollama, or an API key for DeepSeek, OpenAI/ChatGPT, Anthropic Claude, or OpenRouter.
 
 ```bash
 git clone https://github.com/KhitMinnyo/KMN-CyberSeek.git
@@ -80,6 +80,30 @@ Remote Ollama host: `OLLAMA_HOST=0.0.0.0 ollama serve`
 AI_PROVIDER=api
 DEEPSEEK_API_KEY=sk-...
 DEEPSEEK_MODEL=deepseek-chat
+```
+
+### AI — OpenAI / ChatGPT API
+
+```env
+AI_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+```
+
+### AI — Anthropic Claude API
+
+```env
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-3-5-sonnet-latest
+```
+
+### AI — OpenRouter
+
+```env
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_MODEL=openai/gpt-4o-mini
 ```
 
 Set `AI_PROVIDER=none` to run without an LLM. In that mode deterministic scan,
