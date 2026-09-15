@@ -279,3 +279,154 @@ def test_steer_ordinary_tactical_instruction_is_not_treated_as_a_stop():
     assert "stopping" not in result
     orch.cancel_session.assert_not_called()
     assert s.operator_instructions[-1] == "focus on port 8080 next"
+
+
+# ── Second pass: issues flagged by an independent review of the same report ─
+# (a) service "exploited" state cascading to every service a summary/closing
+#     echo command's own text happens to mention, not just the one it tested
+# (b) "objective achieved" (a foothold) vs "engagement complete" (assessment
+#     coverage finished) were tracked internally but never surfaced in the
+#     report, reading as if the AI were looping pointlessly after SYSTEM
+
+def test_settle_service_states_exploit_only_promotes_the_service_actually_tested():
+    """A 'final summary' echo command that recites every discovered port in
+    its own text (e.g. '... & echo ftp:21 ssh:22 http:80 & whoami') must not
+    get every one of those services marked 'exploited' off a single webshell
+    whoami call that only actually touched one of them."""
+    from tests._helpers import svc as _svc
+    orch = make_orch()
+    s = make_session(services=[_svc(21, "ftp"), _svc(22, "ssh"), _svc(80, "http")])
+    orch.sessions[s.session_id] = s
+    orch.add_evidence = lambda *a, **k: None
+
+    command = (
+        "curl -s -G 'http://10.0.0.5/cmd.php' --data-urlencode "
+        "'cmd=echo ===SERVICES_CONFIRMED=== & echo ftp:21 ssh:22 http:80 & whoami'"
+    )
+    output = "===SERVICES_CONFIRMED===\nftp:21 ssh:22 http:80\nnt authority\\system"
+
+    orch._settle_service_states(s, command, output, success=True)
+
+    exploited = [sv for sv in s.discovered_services if sv.get("test_state") == "exploited"]
+    assert len(exploited) == 1, f"expected exactly 1 service exploited, got {exploited}"
+    # Only one compromise entry, not one per referenced service.
+    assert len(s.compromise_evidence) == 1
+
+
+def test_settle_service_states_normal_multi_service_scan_is_unaffected():
+    """Sanity check: a normal (non-exploit) multi-service scan must still
+    settle every service it touches to 'tested' - the fix only narrows the
+    'exploited' case."""
+    from tests._helpers import svc as _svc
+    orch = make_orch()
+    s = make_session(services=[_svc(21, "ftp"), _svc(22, "ssh"), _svc(80, "http")])
+    orch.sessions[s.session_id] = s
+
+    orch._settle_service_states(s, "nmap -p 21,22,80 -sV 10.0.0.5", "21/tcp open ftp\n22/tcp open ssh\n80/tcp open http", success=True)
+
+    tested = [sv for sv in s.discovered_services if sv.get("test_state") == "tested"]
+    assert len(tested) == 3
+
+
+# ── "Objective achieved" vs "engagement complete" surfaced in the report ──
+
+def test_validate_report_findings_is_identity_safe_on_clean_data():
+    """Sanity check: a report with only genuine findings must pass through
+    _validate_report_findings() unchanged."""
+    import core.orchestrator as orch_mod
+    report = {
+        "session": {"session_id": "s1", "compromise_evidence": [
+            {"service": "http", "port": 80, "command": "curl .../cmd.php?cmd=whoami",
+             "proof": "nt authority\\system", "privilege": "root/SYSTEM"},
+        ]},
+        "credentials": [{"username": "admin", "secret": "hunter2"}],
+        "vulnerabilities": [{"name": "Apache Struts RCE", "cve_ids": ["CVE-2017-5638"]}],
+    }
+    out = orch_mod._validate_report_findings(report)
+    assert out["credentials"] == report["credentials"]
+    assert out["vulnerabilities"][0]["name"] == "Apache Struts RCE"
+    assert len(out["session"]["compromise_evidence"]) == 1
+
+
+def test_validate_report_findings_drops_junk_and_self_referential_entries():
+    import core.orchestrator as orch_mod
+    report = {
+        "session": {"session_id": "s1", "compromise_evidence": [
+            {"service": "http", "port": 80, "command": "curl .../cmd.php?cmd=whoami",
+             "proof": "nt authority\\system", "privilege": "root/SYSTEM"},
+            {"service": "unknown", "port": "",
+             "command": "echo '[KMN] OBJECTIVE ACHIEVED: SYSTEM (nt authority\\system)'",
+             "proof": "[KMN] OBJECTIVE ACHIEVED: SYSTEM (nt authority\\system)",
+             "privilege": "root/SYSTEM"},
+        ]},
+        "credentials": [
+            {"username": "admin", "secret": "hunter2"},
+            {"username": "and", "secret": "are"},
+            {"username": "C:\\xampp\\passwords.txt:", "secret": "means no password!"},
+        ],
+        "vulnerabilities": [
+            {"name": "1254\t7.5\thttps://vulners.com/vulnerlab/1254\t*EXPLOIT*",
+             "cve_ids": ["CVE-2014-0160"]},
+        ],
+    }
+    out = orch_mod._validate_report_findings(report)
+    assert [c["username"] for c in out["credentials"]] == ["admin"]
+    assert len(out["session"]["compromise_evidence"]) == 1
+    assert out["vulnerabilities"][0]["name"] == "CVE-2014-0160"
+
+
+def test_markdown_report_surfaces_engagement_status_after_privilege_achieved():
+    """A foothold (SYSTEM/root) does not by itself mean the engagement is
+    done - the report must say so explicitly instead of just listing a
+    compromise count that could otherwise read as contradicting a still-
+    running session."""
+    from core.report_generator import generate_markdown_report
+    session_report = {
+        "session": {
+            "session_id": "s1", "target_ip": "10.0.0.5", "target_domain": "",
+            "created_at": "2026-09-15T02:25:17", "status": "needs_operator",
+            "current_stage": "credential_reuse",
+            "compromise_evidence": [{"service": "http", "port": 80, "host": "10.0.0.5",
+                                      "privilege": "root/SYSTEM", "command": "whoami",
+                                      "signal": "windows-rce", "proof": "nt authority\\system"}],
+            "strategic_plan": [], "operator_instructions": [], "reflections": [],
+            "exhausted_services": [],
+            "objective_complete": False,
+            "objective_progress": 0.74,
+        },
+        "discovered_services": [], "discovered_hosts": [],
+        "vulnerabilities": [], "commands_executed": [], "credentials": [],
+        "ai_decisions": [],
+    }
+    out_path = generate_markdown_report(session_report)
+    md = open(out_path, encoding="utf-8").read()
+    assert "Engagement Status" in md
+    assert "Privilege Goal: **ACHIEVED**" in md
+    assert "Assessment Goal: IN PROGRESS" in md
+    assert "74%" in md
+    assert "NEEDS OPERATOR INPUT" in md
+
+
+def test_markdown_report_engagement_status_when_fully_complete():
+    from core.report_generator import generate_markdown_report
+    session_report = {
+        "session": {
+            "session_id": "s1", "target_ip": "10.0.0.5", "target_domain": "",
+            "created_at": "2026-09-15T02:25:17", "status": "completed",
+            "current_stage": "done",
+            "compromise_evidence": [{"service": "http", "port": 80, "host": "10.0.0.5",
+                                      "privilege": "root/SYSTEM", "command": "whoami",
+                                      "signal": "windows-rce", "proof": "nt authority\\system"}],
+            "strategic_plan": [], "operator_instructions": [], "reflections": [],
+            "exhausted_services": [],
+            "objective_complete": True,
+            "objective_progress": 1.0,
+        },
+        "discovered_services": [], "discovered_hosts": [],
+        "vulnerabilities": [], "commands_executed": [], "credentials": [],
+        "ai_decisions": [],
+    }
+    out_path = generate_markdown_report(session_report)
+    md = open(out_path, encoding="utf-8").read()
+    assert "Assessment Goal: **SUFFICIENT**" in md
+    assert "Engagement: **COMPLETE**" in md

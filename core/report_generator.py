@@ -674,6 +674,32 @@ def generate_markdown_report(session_report: Dict, output_path: Optional[str] = 
       + f"**{len(decisions)} AI decision(s)**.")
     a("")
 
+    # Getting a foothold (privilege) and finishing the assessment (breadth of
+    # coverage) are different goals -- an engagement legitimately keeps
+    # running after SYSTEM/root is confirmed, to test the other discovered
+    # services, attempt credential reuse, and look for additional paths.
+    # Spell that out explicitly so "still running after root" doesn't read
+    # as the AI looping pointlessly.
+    privilege_achieved = bool(compromises)
+    objective_complete = bool(session.get("objective_complete"))
+    objective_progress = session.get("objective_progress")
+    try:
+        progress_pct = f"{float(objective_progress or 0.0) * 100:.0f}%"
+    except (TypeError, ValueError):
+        progress_pct = "—"
+    _engagement_label = {
+        "completed": "COMPLETE",
+        "cancelled": "CANCELLED (operator-stopped)",
+        "failed": "FAILED",
+        "needs_operator": "NEEDS OPERATOR INPUT",
+    }.get(status, "ACTIVE")
+    a("**Engagement Status:**")
+    a(f"- Privilege Goal: {'**ACHIEVED**' if privilege_achieved else 'NOT YET ACHIEVED'}")
+    a(f"- Assessment Goal: {'**SUFFICIENT**' if objective_complete else 'IN PROGRESS'}"
+      f" (coverage/objective progress: {progress_pct})")
+    a(f"- Engagement: **{_engagement_label}**")
+    a("")
+
     # 2. Services
     a("## 2. Discovered Services")
     a("")

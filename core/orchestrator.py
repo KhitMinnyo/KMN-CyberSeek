@@ -461,6 +461,120 @@ def _is_windows_rce_proof(command: str, output: str) -> bool:
     return True
 
 
+# A short list of common English words that a loose credential-extraction
+# regex has, in practice, mistaken for a username/password when it merely
+# matched two labels ("username"/"password") appearing near each other in
+# ordinary prose (e.g. a comment reading "...the username and password are
+# arbitrary..." captured as user='and' secret='are'). Not exhaustive by
+# design -- this is a last-line report-time filter, not the primary
+# defense (that lives in _extract_and_store_credentials()'s own guards).
+_ENGLISH_STOPWORDS_NOT_CREDENTIALS = frozenset({
+    "and", "are", "the", "for", "not", "was", "were", "this", "that",
+    "with", "from", "your", "you", "have", "has", "will", "can", "may",
+    "must", "such", "when", "then", "than", "into", "onto", "also", "if",
+    "but", "all", "any", "who", "how", "why", "yes", "its", "our",
+})
+
+
+def _looks_like_real_credential(username: Optional[str], secret: Optional[str]) -> bool:
+    """True unless (username, secret) is almost certainly a regex
+    false-positive rather than a genuinely captured credential -- a file
+    path (contains '\\', '/', or ':') or a bare English stopword on either
+    side. Used as a report-time QA filter, independent of the extraction-time
+    guards in _extract_and_store_credentials()."""
+    u = (username or "").strip()
+    s = (secret or "").strip()
+    if not u or not s:
+        return False
+    if any(ch in u for ch in ('\\', '/', ':')):
+        return False
+    if u.lower() in _ENGLISH_STOPWORDS_NOT_CREDENTIALS:
+        return False
+    if s.lower() in _ENGLISH_STOPWORDS_NOT_CREDENTIALS:
+        return False
+    return True
+
+
+def _looks_like_raw_scrape_name(name: Optional[str]) -> bool:
+    """True when a vulnerability 'name' looks like raw scrape/table data
+    (a bare URL, a tab-separated row, or no real word) rather than a
+    readable finding name. Mirrors Scanner._parse_vulnerability_output()'s
+    own sanitizer so a bad name from any source gets caught before it
+    reaches a human reader."""
+    name = (name or "").strip()
+    if not name:
+        return True
+    return (
+        "\t" in name
+        or bool(re.search(r'https?://\S+', name))
+        or not re.search(r'[A-Za-z]{4,}', name)
+    )
+
+
+def _looks_self_referential_proof(command: Optional[str], proof: Optional[str]) -> bool:
+    """True when a 'confirmed compromise' proof snippet is just the
+    command's own literal text echoed back (e.g. an echo/printf halt
+    banner quoting a prior finding) rather than something retrieved from
+    the target. Generalises the _is_windows_rce_proof() guard above to the
+    report-time QA pass, so any detector that skips that guard is still
+    caught here."""
+    c = (command or "").strip()
+    p = (proof or "").strip()
+    if not c or not p or len(p) < 12:
+        return False
+    return p.lower() in c.lower()
+
+
+def _validate_report_findings(report: Dict) -> Dict:
+    """Last-line QA pass over a session report, applied once right before
+    it's handed to any renderer (docx/markdown/pdf) so all three stay
+    consistent. Independent of, and in addition to, the extraction/
+    detection-time guards elsewhere in this file -- this exists so (a) a
+    session whose data predates those guards still gets a clean report,
+    and (b) any future bug in a detection path can't put an obviously-wrong
+    finding (a file path as a "credential", a raw URL as a vulnerability
+    "name", the AI's own echoed text as "confirmed compromise" evidence)
+    in front of a human reader. Filters silently (with a log line) rather
+    than raising -- a report must still generate even if some findings
+    turn out to be junk."""
+    session_id = (report.get("session") or {}).get("session_id", "unknown")
+
+    good_creds = []
+    for c in report.get("credentials") or []:
+        if _looks_like_real_credential(c.get("username"), c.get("secret")):
+            good_creds.append(c)
+        else:
+            logger.warning(
+                f"Report QA [{session_id}]: dropping implausible credential "
+                f"{c.get('username')!r} from the report (looks like a "
+                "regex false-positive, not a real capture)."
+            )
+    report["credentials"] = good_creds
+
+    for v in report.get("vulnerabilities") or []:
+        if _looks_like_raw_scrape_name(v.get("name")):
+            cve_ids = v.get("cve_ids") or []
+            if isinstance(cve_ids, str):
+                cve_ids = [cve_ids]
+            v["name"] = ", ".join(cve_ids) or "Unnamed vulnerability finding"
+
+    session = report.get("session") or {}
+    good_compromises = []
+    for c in session.get("compromise_evidence") or []:
+        if _looks_self_referential_proof(c.get("command"), c.get("proof")):
+            logger.warning(
+                f"Report QA [{session_id}]: dropping self-referential "
+                f"'confirmed compromise' entry (service={c.get('service')!r}) "
+                "-- its proof is just the command's own echoed text."
+            )
+            continue
+        good_compromises.append(c)
+    if "compromise_evidence" in session:
+        session["compromise_evidence"] = good_compromises
+
+    return report
+
+
 def _matched_compromise_signals(command: str, output: str) -> List[str]:
     """Return only positive, command-aware compromise proof signals.
 
@@ -7561,6 +7675,21 @@ Web apps: {webapps}
         exploited = bool(_matched)
         settle_state = "exploited" if exploited else "tested"
         referenced = self._services_referenced(session, command)
+        if exploited and len(referenced) > 1:
+            # A compromise signal proves code execution via the ONE service
+            # the command actually interacted with -- not every service
+            # whose port number happens to appear in the command's own
+            # text. A "final summary" echo/closing command that recites
+            # every discovered port (e.g. "echo ===SERVICES_CONFIRMED=== &
+            # echo ftp:21 ssh:22 http:80 msrpc:135 ...") matches ALL of
+            # those services via the port-substring heuristic in
+            # _services_referenced(), which would otherwise mark every one
+            # of them "exploited" off a single webshell whoami call that
+            # only actually touched one of them. Keep only the primary
+            # (first-matched) service, matching what
+            # _capture_exploitation_evidence() records as the compromise's
+            # service, so service state and compromise evidence agree.
+            referenced = referenced[:1]
         for svc in referenced:
             self._promote_service(svc, settle_state)
         if exploited:
@@ -8728,8 +8857,8 @@ Web apps: {webapps}
         session = self.sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
-        
-        return {
+
+        report = {
             "session": session.to_dict(),
             "scan_results": session.scan_results,
             "discovered_hosts": session.discovered_hosts,
@@ -8748,9 +8877,16 @@ Web apps: {webapps}
                 "successful_commands": len([c for c in session.commands_executed if c.get("success", False)]),
                 "ai_decisions_count": len(session.ai_decisions),
                 "evidence_count": len(session.evidence),
-                "total_vulnerabilities": len(session.vulnerabilities)
+                "total_vulnerabilities": len(session.vulnerabilities),
+                "objective_progress": session.objective_progress,
+                "objective_complete": session.objective_complete,
+                "privilege_achieved": bool(session.compromise_evidence),
             }
         }
+        # Last-line QA pass -- see _validate_report_findings() -- so every
+        # renderer (docx/markdown/pdf) sees the same cleaned-up data instead
+        # of each needing its own defensive filtering.
+        return _validate_report_findings(report)
 
     def delete_session(self, session_id: str) -> Dict:
         """Delete a specific session and all its associated data from database and memory."""
