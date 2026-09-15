@@ -121,7 +121,9 @@ import ipaddress as _ipaddress
 
 
 _ROUTE_RE = _pre.compile(
-    r"(?:^|\s)(\d{1,3}(?:\.\d{1,3}){3})"
+    # `(` boundary lets ARP/`ip neigh` output like "? (10.10.10.5) at ..." be
+    # parsed — those neighbours are parenthesized, not whitespace-delimited.
+    r"(?:^|\s|\()(\d{1,3}(?:\.\d{1,3}){3})"
     r"(?:\s+(\d{1,3}(?:\.\d{1,3}){3}))?",   # optional netmask
     _pre.MULTILINE,
 )
@@ -160,10 +162,11 @@ def discover_internal_subnets(shell_output: str,
             if mask:
                 net = _ipaddress.ip_network(f"{ip_str}/{mask}", strict=False)
             else:
-                # Guess prefix: RFC 1918 class heuristic
-                first = int(ip_str.split(".")[0])
-                prefix = 8 if first == 10 else (16 if first == 172 else 24)
-                net = _ipaddress.ip_network(f"{ip_str}/{prefix}", strict=False)
+                # Bare private IP with no mask (ARP neighbour / ifconfig line).
+                # Assume a /24 internal link. The old RFC1918 class heuristic
+                # (/8 for 10.x) collapsed a 10.10.10.5 neighbour into the whole
+                # 10.0.0.0/8, which is useless for autoroute.
+                net = _ipaddress.ip_network(f"{ip_str}/24", strict=False)
             if not net.is_loopback and not net.is_link_local:
                 found.add(str(net))
         except ValueError:

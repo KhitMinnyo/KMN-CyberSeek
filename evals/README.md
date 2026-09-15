@@ -12,6 +12,10 @@ credentials*, *use the hostname (not the raw IP) for virtual-host routing*, and
 scenario can be run several times and the harness reports the **mean score and
 variance**.
 
+The result is model-dependent. Always record the provider, exact model, context
+window, temperature, run count, and application revision. Do not compare a local
+8B model run with an API model run as if they were the same system.
+
 ## Running
 
 ```bash
@@ -19,6 +23,9 @@ variance**.
 # Uses the same KMN_AI_Connector the live loop uses, so it exercises the real
 # prompt + parsing path.
 python3 evals/run_evals.py --runs 3
+
+# Write reproducible provider/model metadata and per-scenario results
+python3 evals/run_evals.py --runs 5 --json-out /tmp/kmn-eval.json
 
 # Validate the scoring rules themselves — no model or network needed.
 python3 evals/run_evals.py --selfcheck

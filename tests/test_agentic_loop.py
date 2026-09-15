@@ -71,9 +71,11 @@ def test_detect_privilege_user_vs_none():
 
 
 def test_detect_exhausted_target_labels():
-    assert _detect_exhausted_target(["smbclient -L //10.0.0.5"], "enumeration") == "smb"
-    assert _detect_exhausted_target(["curl http://10.0.0.5:8080/manager/html"], "enumeration") == "tomcat_8080"
+    assert _detect_exhausted_target(["smbclient -L //10.0.0.5"], "enumeration") == "smb:smbclient_enum"
+    assert _detect_exhausted_target(["curl http://10.0.0.5:8080/manager/html"], "enumeration") == "tomcat:manager_creds"
     assert _detect_exhausted_target(["hydra -l root ssh://10.0.0.5"], "exploitation") == "ssh_bruteforce"
+    # a looped SMB enumeration no longer blacklists the whole service
+    assert _detect_exhausted_target(["crackmapexec smb 10.0.0.5 -u a -p b"], "enumeration") == "smb:nxc_auth"
     # falls back to a stage-scoped label when nothing recognised
     assert _detect_exhausted_target(["echo hi"], "enumeration") == "enumeration_exhausted"
 
@@ -117,7 +119,7 @@ def test_auto_pivot_marks_exhausted_and_continues():
     orch._analyze_with_ai = AsyncMock()
     with _no_sleep():  # skip the 3s pause
         _run(orch._auto_pivot(s.session_id, "loop detected"))
-    assert "smb" in s.exhausted_services
+    assert "smb:smbclient_enum" in s.exhausted_services
     assert s.ai_decisions[-1]["context"] == "auto_pivot"
     assert s.auto_depth_counter == 0
     orch._analyze_with_ai.assert_awaited()
@@ -541,7 +543,7 @@ def test_full_auto_critique_reject_no_unbound_error():
     orch.sessions[s.session_id] = s
     s.status = "executing"
 
-    hi = AIResponse(reasoning="risky", suggested_command="msfvenom -p x LHOST=1",
+    hi = AIResponse(reasoning="risky", suggested_command="hydra -l admin -P /usr/share/wordlists/rockyou.txt ssh://10.0.0.5",
                     risk_level="high", confidence=0.9, attack_phase="exploitation")
     orch.ai_connector.ask_ai_async = AsyncMock(return_value=hi)
     orch._build_ai_memory = MagicMock(return_value="")
@@ -560,8 +562,75 @@ def test_full_auto_critique_reject_no_unbound_error():
         orch_mod.FULL_AUTO_MODE = _orig
 
     # No exception, and the rejected command was routed to approval exactly once.
-    assert queued == ["msfvenom -p x LHOST=1"]
+    assert queued == ["hydra -l admin -P /usr/share/wordlists/rockyou.txt ssh://10.0.0.5"]
     assert not any(d.get("context") == "loop_error" for d in s.ai_decisions)
+
+
+def test_full_auto_critique_unavailable_routes_to_manual_approval():
+    """SECURITY regression: if the verifier is unavailable (critic outage,
+    timeout, malformed result) for a HIGH-risk command in FULL_AUTO_MODE, the
+    command must be routed to manual approval — exactly like an explicit
+    reject — and must NEVER auto-execute."""
+    import core.orchestrator as orch_mod
+    orch = _loop_orch()
+    s = make_session(services=[svc(80, "http")])
+    orch.sessions[s.session_id] = s
+    s.status = "executing"
+
+    hi = AIResponse(reasoning="risky", suggested_command="hydra -l admin -P /usr/share/wordlists/rockyou.txt ssh://10.0.0.5",
+                    risk_level="high", confidence=0.9, attack_phase="exploitation")
+    orch.ai_connector.ask_ai_async = AsyncMock(return_value=hi)
+    orch._build_ai_memory = MagicMock(return_value="")
+    orch._plan_context_block = MagicMock(return_value="")
+    orch._get_relevant_threat_intel_context = MagicMock(return_value="")
+    orch._auto_parse_tool_output = MagicMock()
+    orch._vet_command = AsyncMock(return_value={
+        "verdict": "unavailable", "command": "hydra -l admin -P /usr/share/wordlists/rockyou.txt ssh://10.0.0.5",
+        "reason": "critique error: timeout",
+    })
+    queued = []
+    orch.queue_for_approval = lambda sid, cmd: queued.append(cmd)
+
+    _orig = orch_mod.FULL_AUTO_MODE
+    orch_mod.FULL_AUTO_MODE = True
+    try:
+        _run(orch._process_command_output(s.session_id, "prev cmd", "some output", None))
+    finally:
+        orch_mod.FULL_AUTO_MODE = _orig
+
+    # Never auto-executed: routed to manual approval exactly once instead.
+    assert queued == ["hydra -l admin -P /usr/share/wordlists/rockyou.txt ssh://10.0.0.5"]
+    assert any(d.get("context") == "self_critique_unavailable" for d in s.ai_decisions)
+
+
+def test_full_auto_depth_forces_replan_without_manual_approval():
+    import core.orchestrator as orch_mod
+    orch = _loop_orch()
+    s = make_session(authorization_confirmed=True)
+    s.status = "executing"
+    s.max_auto_depth = 1
+    s.auto_depth_counter = 1
+    orch.sessions[s.session_id] = s
+    response = AIResponse(
+        reasoning="routine next step", suggested_command="nmap -sV 10.0.0.5",
+        risk_level="low", confidence=0.9, attack_phase="enumeration",
+    )
+    orch.ai_connector.ask_ai_async = AsyncMock(return_value=response)
+    orch._vet_command = AsyncMock()
+    orch._analyze_with_ai = AsyncMock()
+    orch._track_task = lambda sid, coro, label: asyncio.create_task(coro)
+    original = orch_mod.FULL_AUTO_MODE
+    orch_mod.FULL_AUTO_MODE = True
+    try:
+        async def scenario():
+            await orch._process_command_output(s.session_id, "previous", "clean output")
+            await asyncio.sleep(0)
+        _run(scenario())
+    finally:
+        orch_mod.FULL_AUTO_MODE = original
+    assert s.ai_decisions[-1]["context"] == "auto_depth_replan"
+    assert s.auto_depth_counter == 0
+    orch._analyze_with_ai.assert_awaited_once()
 
 
 def test_operator_instruction_injected_into_context():
@@ -676,6 +745,16 @@ def test_feature_flags_default_coverage_on_and_bruteforce_opt_in():
         assert orch_mod.set_feature_flag("bogus", True) is None
     finally:
         orch_mod.set_feature_flag("coverage_engine", _covled)
+
+
+def test_full_auto_feature_flag_is_runtime_toggleable():
+    import core.orchestrator as orch_mod
+    original = orch_mod.FULL_AUTO_MODE
+    try:
+        assert orch_mod.set_feature_flag("full_auto_mode", not original) == "FULL_AUTO_MODE"
+        assert orch_mod.get_feature_flags()["full_auto_mode"] == (not original)
+    finally:
+        orch_mod.set_feature_flag("full_auto_mode", original)
 
 
 def test_coverage_engine_off_is_noop():

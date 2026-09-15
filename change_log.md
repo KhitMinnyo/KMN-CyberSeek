@@ -4,6 +4,48 @@ All notable changes are documented here. Follows [Keep a Changelog](https://keep
 
 ---
 
+## [2.6.2] — 2026-09-08 — Logic-bug fixes & full-autonomy approval parity
+
+### Fixed
+- **`parse_structured_action` ordering bug.** `post_exploitation` (and other
+  compound action types) no longer collapses to the shorter `exploit` token;
+  separators are normalised to underscores and the longest action type wins.
+- **`discover_internal_subnets` parsing.** ARP/`ip neigh` entries like
+  `? (10.10.10.5) at ...` are now recognised (parenthesised neighbours), and a
+  bare private IP without a netmask is treated as a `/24` link instead of being
+  collapsed into an over-broad RFC1918 `/8`.
+- **`classify_service` fallback.** Services with no recognised key now classify as
+  `generic` instead of `unknown`, so they still receive a playbook.
+- **`validate_root_privilege` Windows regex.** Over-escaped `\\` sequences were
+  corrected so `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators` match reliably.
+- **asyncio "no current event loop" failures.** Test helpers now drive coroutines
+  on a fresh `asyncio.new_event_loop()` per call instead of relying on
+  `get_event_loop()`, fixing cross-module loop-ordering failures.
+
+### Changed
+- **`auto_approve=True` now equals `FULL_AUTO_MODE`.** A session opened with
+  auto-approve enabled now auto-executes commands of *every* risk level (including
+  exploit/high-risk), matching the documented intent. Previously the execution and
+  status gates still blocked high-risk commands behind manual approval.
+
+---
+
+## [2.6.1] — 2026-09-08 — Automatic post-shell command delivery
+
+### Added
+- **Automatic post-exploitation batch delivery.** When a shell lands on the managed
+  handler, the canned recon/harvest batch (OS fingerprint, credential harvest, AD
+  recon) is now delivered immediately through the persistent handler instead of
+  waiting for the AI to issue commands one at a time. Guarded by the global
+  `AUTO_POST_SHELL` toggle and a per-session `auto_post_shell` opt-out, and
+  de-duplicated per `(handler, msf_id)` pair so reconnects never re-run the batch.
+
+### Changed
+- `Session` now carries an explicit `auto_post_shell` flag so a single engagement
+  can opt out of automatic post-shell work without changing the global default.
+
+---
+
 ## [2.6.0] — 2026-08-28 — Durable sessions, safer execution, and parallel analysis
 
 ### Added

@@ -277,6 +277,30 @@ _DOWNLOAD_EXEC_RE = re.compile(
 
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+_AUTOMATION_DENY_PATTERNS = (
+    (re.compile(r"\brm\s+-[a-z]*f", re.I), "recursive forced deletion"),
+    (re.compile(r"\bdd\s+if=", re.I), "raw disk overwrite"),
+    (re.compile(r"\b(?:mkfs|fdisk|parted)\b", re.I), "disk formatting/partitioning"),
+    (re.compile(r"\b(?:shutdown|reboot|poweroff|halt)\b", re.I), "host shutdown"),
+    (re.compile(r":\(\)\s*\{", re.I), "fork bomb"),
+    (re.compile(r"\b(?:drop|truncate)\s+(?:table|database)", re.I), "database destruction"),
+    (re.compile(r"\bdelete\s+from\b", re.I), "bulk database deletion"),
+    (re.compile(r"\b(?:curl|wget)\b[^;&|\n]*\|\s*(?:bash|sh|python3?|perl|ruby)\b", re.I),
+     "download-and-execute"),
+)
+
+
+def automation_capability_error(command: str) -> Optional[str]:
+    """Return a capability-policy denial for destructive autonomous commands.
+
+    Operator-approved commands retain the reviewed escape hatch; automated
+    execution must not turn FULL_AUTO_MODE into unrestricted host control.
+    """
+    for pattern, label in _AUTOMATION_DENY_PATTERNS:
+        if pattern.search(command or ""):
+            return f"Automation capability denied: {label}"
+    return None
+
 
 def _split_shell_segments(command: str):
     """Split top-level shell operators without splitting quoted arguments."""
@@ -521,8 +545,8 @@ def validate_root_privilege(output: str) -> bool:
         _re.IGNORECASE,
     )
     win_system = _re.compile(
-        r"(NT AUTHORITY\\\\SYSTEM|User Name.*SYSTEM"
-        r"|SeDebugPrivilege.*Enabled|BUILTIN\\\\Administrators)",
+        r"(NT AUTHORITY\\SYSTEM|User Name.*SYSTEM"
+        r"|SeDebugPrivilege.*Enabled|BUILTIN\\Administrators)",
         _re.IGNORECASE,
     )
     return bool(linux_root.search(out) or win_system.search(out))

@@ -140,7 +140,18 @@ start_reconnaissance()
 
 ### Prompt-Injection Defence
 
-All tool output is passed to the AI inside a `<<<TOOL_OUTPUT_START>>>` fence. The system prompt instructs the model to never follow instructions found inside tool output. The VERIFIER pass adds an independent second check.
+Target/tool output is projected through `core/observations.py` before it enters
+the model context. Control characters and prompt-shaped instruction lines are
+redacted, delimiter escapes are neutralised, and the result is labeled as an
+`UNTRUSTED_OBSERVATION`. The original raw output remains audit data but is never
+an instruction channel. The system prompt also treats memory, vulnerability
+descriptions, banners, documents, and target-derived credentials as untrusted
+data. The VERIFIER pass adds an independent second check, while capability
+denials prevent destructive autonomous commands even in full-auto mode.
+
+This is a defense-in-depth boundary, not a formal proof of prompt-injection
+immunity. New data sources must use the observation projection before being
+added to an AI prompt.
 
 ---
 

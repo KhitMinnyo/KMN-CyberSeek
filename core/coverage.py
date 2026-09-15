@@ -22,7 +22,8 @@ from core import playbooks as pb
 
 # Step statuses
 PENDING = "pending"
-DONE = "done"
+ATTEMPTED = "attempted"      # command ran but did not (yet) succeed
+DONE = "done"                # command ran AND produced the step's success signal
 SKIPPED = "skipped"          # tool missing / not applicable
 
 # Service states (monotonic ladder)
@@ -73,38 +74,55 @@ def _steps_for(cov: dict) -> List:
 
 def match_and_mark(cov: dict, command: str, success: bool = True,
                    exploit_success: Optional[bool] = None) -> List[str]:
-    """Mark any PENDING step this executed command attempts (tool name or signal
-    match) as DONE. Returns the list of newly-completed step ids. Best-effort —
-    coverage tracking is a guide, not an oracle.
+    """Record an executed command against any step it attempts (tool name or
+    signal match). Returns the list of newly-DONE step ids.
 
-    ``success`` distinguishes *attempting* a step from *achieving* it. Running a
-    tool is enough to complete an ENUMERATION or VULNERABILITY step (the recon
-    value is in the output either way), but an EXPLOITATION step only counts as
-    DONE when the command actually achieved a confirmed exploit. A
-    POST-EXPLOITATION inventory step only requires successful command execution.
-    Otherwise a failed exploit attempt would falsely mark the service "covered"
-    and the loop would abandon it before it is compromised.
-    The default (True) preserves the recon/enumeration behaviour.
+    Three-state semantics (pending → attempted → done):
+
+    - On a *successful* command, ENUMERATION / VULNERABILITY / POST-EXPLOITATION
+      steps become DONE (the recon value is in the output).
+    - An EXPLOITATION step becomes DONE only when ``exploit_success`` is true
+      (a confirmed compromise signal), because a zero exit code does not mean the
+      target was compromised.
+    - On a *failed* command (or a failed exploit attempt), the matched step is
+      marked ATTEMPTED — so it is visible as "tried but not achieved" — but never
+      DONE. ATTEMPTED steps do not count toward ``coverage_ratio`` /
+      ``is_service_covered``, so a service is never abandoned as "covered" just
+      because its exploit was attempted and failed.
+
+    Best-effort — coverage tracking is a guide, not an oracle.
     """
     done_now: List[str] = []
     for st in _steps_for(cov):
-        if cov["steps"].get(st.id) == PENDING and st.matches_command(command):
-            phase_success = (
-                (exploit_success if exploit_success is not None else success)
-                if st.phase == pb.PHASE_EXPLOIT else success
-            )
-            if st.phase == pb.PHASE_EXPLOIT and not phase_success:
-                # Attempted but not confirmed — leave PENDING so the loop keeps
-                # working this vector instead of marking it complete.
-                continue
-            cov["steps"][st.id] = DONE
-            done_now.append(st.id)
+        if not st.matches_command(command):
+            continue
+        cur = cov["steps"].get(st.id)
+        if cur == DONE:
+            continue
+        phase_success = (
+            (exploit_success if exploit_success is not None else success)
+            if st.phase == pb.PHASE_EXPLOIT else success
+        )
+        if not phase_success:
+            # Tried but not achieved. Mark ATTEMPTED (never DONE) so the step is
+            # visible as "attempted" but still keeps the service incomplete.
+            if cur != ATTEMPTED:
+                cov["steps"][st.id] = ATTEMPTED
+            continue
+        cov["steps"][st.id] = DONE
+        done_now.append(st.id)
     return done_now
 
 
 def pending_steps(cov: dict) -> List:
-    """PlaybookStep objects for this service's still-pending steps, in order."""
+    """PlaybookStep objects still PENDING (never attempted), in order."""
     return [st for st in _steps_for(cov) if cov["steps"].get(st.id) == PENDING]
+
+
+def attempted_steps(cov: dict) -> List:
+    """PlaybookStep objects marked ATTEMPTED (tried but not yet achieved), in
+    order. These still need to succeed before the service counts as covered."""
+    return [st for st in _steps_for(cov) if cov["steps"].get(st.id) == ATTEMPTED]
 
 
 def _phases_with_done(cov: dict) -> set:
@@ -142,7 +160,9 @@ def coverage_ratio(cov: dict) -> float:
 
 
 def is_service_covered(cov: dict) -> bool:
-    """A service is covered when every applicable step has been attempted."""
+    """A service is covered only when every applicable step is DONE (attempted
+    but failed steps do not count, so a service is never abandoned as "covered"
+    before its exploit actually succeeded)."""
     return coverage_ratio(cov) >= 1.0
 
 

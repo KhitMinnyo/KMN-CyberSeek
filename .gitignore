@@ -26,3 +26,6 @@ KMN-CyberSeek-review.md
 *.review.md
 /notes/
 /private/
+
+# Kode agent internal state (memory + scan scratch) — never commit to repo
+.kode/

@@ -1,10 +1,15 @@
 # KMN-CyberSeek
 
-![Version](https://img.shields.io/badge/Version-2.6.0-brightgreen)
+![Version](https://img.shields.io/badge/Version-2.6.2-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-AI-driven autonomous penetration testing framework. Executes a full offensive engagement pipeline — OSINT → exploitation — using an LLM (DeepSeek API or local Ollama) with human-in-the-loop approval for high-risk actions.
+AI-driven autonomous penetration testing framework with policy-constrained full-auto execution and optional human oversight. Executes a full offensive engagement pipeline — OSINT → exploitation — using an LLM (DeepSeek API or local Ollama).
+
+Benchmark and evaluation results in this repository are self-scored engineering
+measurements. They are not independent third-party validation and do not support
+claims that KMN-CyberSeek outperforms another security agent. See
+`benchmarks/manifest.json` for the comparison policy.
 
 **Repository:** [https://github.com/KhitMinnyo/KMN-CyberSeek](https://github.com/KhitMinnyo/KMN-CyberSeek)
 
@@ -32,7 +37,7 @@ FastAPI Backend     (port 6000)
 
 ## Installation
 
-**Prerequisites:** Python 3.8+, Nmap (`sudo apt install nmap`), Ollama or DeepSeek API key.
+**Prerequisites:** Python 3.8+, Nmap (`sudo apt install nmap`), Ollama, or an API key for DeepSeek, OpenAI/ChatGPT, Anthropic Claude, or OpenRouter.
 
 ```bash
 git clone https://github.com/KhitMinnyo/KMN-CyberSeek.git
@@ -76,6 +81,35 @@ AI_PROVIDER=api
 DEEPSEEK_API_KEY=sk-...
 DEEPSEEK_MODEL=deepseek-chat
 ```
+
+### AI — OpenAI / ChatGPT API
+
+```env
+AI_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+```
+
+### AI — Anthropic Claude API
+
+```env
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-3-5-sonnet-latest
+```
+
+### AI — OpenRouter
+
+```env
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_MODEL=openai/gpt-4o-mini
+```
+
+Set `AI_PROVIDER=none` to run without an LLM. In that mode deterministic scan,
+playbook, policy, verification, and reporting paths remain available; LLM-only
+creative exploit selection is explicitly reported as unavailable rather than
+silently guessed.
 
 ### Ports
 
@@ -139,6 +173,10 @@ NMAP_OS_DETECTION=true
 VULN_SCAN_TIMEOUT=120
 VULN_SCAN_CONCURRENCY=4  # bounded parallel per-port NSE scans
 COMMAND_TIMEOUT=600
+# Autonomous execution is argv-first. Enable these only inside an isolated lab
+# if a workflow genuinely requires shell composition or an interpreter.
+AUTONOMOUS_SHELL_COMPOSITION=false
+AUTONOMOUS_RUNTIME_COMMANDS=false
 
 # Agentic-loop safety
 MAX_AUTO_PIVOTS=12       # auto-pivots before pausing for manual review

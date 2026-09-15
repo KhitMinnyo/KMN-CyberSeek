@@ -1,0 +1,38 @@
+{
+  "format": "kmn-agent-capability-matrix",
+  "version": 1,
+  "assessment_policy": "A system is marked implemented only when the capability is represented in code and covered by a deterministic regression test. Live effectiveness remains unassessed until a reproducible lab run is attached.",
+  "capabilities": [
+    {"id": "structured_actions", "category": "decision", "description": "Structured routing, target, action, and verification metadata"},
+    {"id": "policy_constrained_autonomy", "category": "execution", "description": "Capability-denied autonomous execution with optional oversight"},
+    {"id": "scope_enforcement", "category": "safety", "description": "Session and command-level destination scope checks"},
+    {"id": "prompt_injection_boundary", "category": "safety", "description": "Untrusted observation projection before LLM context"},
+    {"id": "verified_exploit_state", "category": "evidence", "description": "Exploit lifecycle and tool-specific verification states"},
+    {"id": "managed_shell_transport", "category": "post_exploitation", "description": "Serialized handler/RPC shell command transport"},
+    {"id": "pivot_transport", "category": "lateral_movement", "description": "Autoroute, port forward, and SOCKS pivot state"},
+    {"id": "multi_host_attribution", "category": "coverage", "description": "Per-host/service/port state and finding attribution"},
+    {"id": "model_metadata_evals", "category": "evaluation", "description": "Provider/model/run metadata with repeatable reasoning evals"},
+    {"id": "sandbox_guidance", "category": "deployment", "description": "Capability policy and isolated lab deployment guidance"}
+  ],
+  "systems": {
+    "KMN-CyberSeek": {
+      "source": "repository",
+      "assessment": "code_and_regression_tests",
+      "capabilities": {
+        "structured_actions": "implemented",
+        "policy_constrained_autonomy": "implemented",
+        "scope_enforcement": "implemented",
+        "prompt_injection_boundary": "implemented",
+        "verified_exploit_state": "implemented",
+        "managed_shell_transport": "implemented",
+        "pivot_transport": "implemented",
+        "multi_host_attribution": "implemented",
+        "model_metadata_evals": "implemented",
+        "sandbox_guidance": "implemented"
+      }
+    },
+    "PentestGPT": {"source": "not_evaluated", "assessment": "unassessed", "capabilities": {}},
+    "CAI": {"source": "not_evaluated", "assessment": "unassessed", "capabilities": {}},
+    "XBOW": {"source": "not_evaluated", "assessment": "unassessed", "capabilities": {}}
+  }
+}

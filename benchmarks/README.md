@@ -5,6 +5,11 @@ vulnerability set; `score.py` compares an engagement report against it and repor
 coverage. This is the yardstick for every coverage-engine milestone (see
 `docs/coverage-engine-buildplan.md`).
 
+This is currently a **self-scored project benchmark**, not an independent or
+third-party benchmark. It must not be used to claim that KMN-CyberSeek is better
+than PentestGPT, CAI, XBOW, or any other system. See `benchmarks/manifest.json` for
+the reproducibility and comparison policy.
+
 ## Usage
 
 ```bash
@@ -13,6 +18,9 @@ python benchmarks/score.py /path/to/kmn_report_<id>.md
 
 # Choose a lab explicitly / machine-readable output
 python benchmarks/score.py report.md --lab benchmarks/labs/kmn_training_win.json --json
+
+# Print the explicit code-level capability inventory (not a leaderboard)
+python benchmarks/compare_capabilities.py
 ```
 
 **Metrics**
@@ -41,7 +49,7 @@ By category (touched / total):
 | remote_admin_db | 5 / 9 | MySQL root **confirmed**; no brute-force (SSH/RDP/WinRM) |
 | windows_system | 0 / 6 | no post-exploitation → no internal findings |
 
-**Targets after the coverage engine:** raise *touched* toward ~90% (playbooks
-guarantee every service is worked) and *confirmed* substantially (validation +
-exploit mapping + post-ex). Re-run `score.py` after each milestone and record the
-delta in that milestone's changelog note.
+These numbers are a historical baseline only. They are not an independent
+validation result and they do not prove successful VM compromise. Re-run
+`score.py` after each milestone and record the exact run metadata and delta in the
+changelog.

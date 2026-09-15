@@ -98,9 +98,35 @@ def test_critique_revise_swaps_command():
     assert r["verdict"] == "revise" and "--batch" in r["command"]
 
 
-def test_critique_fails_open_on_error():
+def test_critique_fails_closed_on_error():
+    """SECURITY: if the verifier call itself raises (timeout, connection error,
+    provider outage), the verdict must be 'unavailable', never 'approve'. A
+    HIGH-risk command must never auto-execute just because the critic broke."""
     orch = make_orch()
     s = _sess(); orch.sessions[s.session_id] = s
     orch.ai_connector.ask_raw_async = AsyncMock(side_effect=RuntimeError("boom"))
     r = _run(orch._vet_command(s.session_id, "nmap 10.0.0.5", "recon"))
-    assert r["verdict"] == "approve"  # fail-open
+    assert r["verdict"] == "unavailable"
+
+
+def test_critique_fails_closed_on_malformed_result():
+    """SECURITY: a non-dict / empty critic response must fail closed, not be
+    coerced into an implicit approve."""
+    orch = make_orch()
+    s = _sess(); orch.sessions[s.session_id] = s
+    orch.ai_connector.ask_raw_async = AsyncMock(return_value=None)
+    r = _run(orch._vet_command(s.session_id, "nmap 10.0.0.5", "recon"))
+    assert r["verdict"] == "unavailable"
+
+
+def test_critique_fails_closed_on_unrecognised_verdict():
+    """SECURITY: a critic response with a verdict string outside
+    approve/revise/reject must fail closed rather than silently default to
+    'approve'."""
+    orch = make_orch()
+    s = _sess(); orch.sessions[s.session_id] = s
+    orch.ai_connector.ask_raw_async = AsyncMock(return_value={
+        "verdict": "maybe", "reason": "not sure", "revised_command": "",
+    })
+    r = _run(orch._vet_command(s.session_id, "nmap 10.0.0.5", "recon"))
+    assert r["verdict"] == "unavailable"

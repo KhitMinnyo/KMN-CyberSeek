@@ -24,9 +24,11 @@ parsing path the live loop uses.
 
 import argparse
 import asyncio
+import json
 import os
 import statistics
 import sys
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,7 +66,7 @@ async def _decide(connector, scenario):
     }
 
 
-async def run_provider(runs):
+async def run_provider(runs, json_out=None):
     try:
         from ai.connector import KMN_AI_Connector
     except Exception as e:
@@ -77,8 +79,21 @@ async def run_provider(runs):
               "Set DEEPSEEK_API_KEY or configure local Ollama, then re-run.")
         return 2
 
-    print(f"Provider: {connector.provider} | runs per scenario: {runs}\n")
+    model = connector.api_model if connector.provider == "api" else connector.local_model
+    metadata = {
+        "format": "kmn-reasoning-eval",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "provider": connector.provider,
+        "model": model,
+        "context_window": connector.context_window,
+        "temperature": connector.tactical_temperature,
+        "runs": runs,
+        "scenario_count": len(SCENARIOS),
+        "independent_validation": False,
+    }
+    print(f"Provider: {connector.provider} | model: {model} | runs per scenario: {runs}\n")
     scenario_means = []
+    scenario_results = []
     for sc in SCENARIOS:
         run_scores, all_failed = [], []
         for _ in range(runs):
@@ -94,6 +109,10 @@ async def run_provider(runs):
         mean = statistics.mean(run_scores) if run_scores else 0.0
         var = statistics.pvariance(run_scores) if len(run_scores) > 1 else 0.0
         scenario_means.append(mean)
+        scenario_results.append({
+            "scenario": sc["name"], "mean": mean, "variance": var,
+            "failed_checks": sorted(set(all_failed)),
+        })
         flag = "OK " if mean >= 0.99 else ("~  " if mean >= 0.5 else "XX ")
         detail = ""
         if all_failed:
@@ -105,6 +124,10 @@ async def run_provider(runs):
     overall = statistics.mean(scenario_means) if scenario_means else 0.0
     print(f"\n{'=' * 64}\nOVERALL REASONING SCORE: {overall:.2%}  "
           f"({len(SCENARIOS)} scenarios x {runs} runs)")
+    if json_out:
+        with open(json_out, "w", encoding="utf-8") as fh:
+            json.dump({**metadata, "overall": overall, "scenarios": scenario_results}, fh, indent=2)
+        print(f"Metadata/results written to {json_out}")
     return 0
 
 
@@ -149,11 +172,12 @@ def main():
     ap = argparse.ArgumentParser(description="KMN-CyberSeek AI reasoning evals")
     ap.add_argument("--runs", type=int, default=3, help="runs per scenario (provider mode)")
     ap.add_argument("--selfcheck", action="store_true", help="validate scoring rules offline")
+    ap.add_argument("--json-out", help="write provider/model/run metadata and results to JSON")
     args = ap.parse_args()
 
     if args.selfcheck:
         return run_selfcheck()
-    return asyncio.run(run_provider(args.runs))
+    return asyncio.run(run_provider(args.runs, json_out=args.json_out))
 
 
 if __name__ == "__main__":
