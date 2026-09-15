@@ -606,6 +606,69 @@ def _matched_compromise_signals(command: str, output: str) -> List[str]:
     return list(dict.fromkeys(matched))
 
 
+def _explicit_ports_in_command(command: str) -> List[int]:
+    """Ports a command structurally CONNECTS to -- a real network target --
+    as opposed to a port number that merely appears somewhere in the
+    command's own text (e.g. inside an echoed "service:port" summary string
+    like "ftp:21 ssh:22 http:80 ..."). Checked: an explicit port in a URL
+    (http://host:PORT/...), a CLI target-port flag (-p/-P/--port/RPORT), and
+    <ip>:<port>. Returns every match found (not deduped), so the caller can
+    tell "exactly one distinct value" (decisive) from "several different
+    values" (a command that genuinely probes more than one other service --
+    still ambiguous) apart."""
+    c = command or ""
+    ports = [int(p) for p in re.findall(r'https?://[^/\s\'"]+?:(\d{1,5})\b', c)]
+    ports += [int(p) for p in re.findall(r'(?:-p|-P|--port|RPORT)\s+(\d{1,5})\b', c, re.IGNORECASE)]
+    ports += [int(p) for p in re.findall(r'\b\d{1,3}(?:\.\d{1,3}){3}:(\d{1,5})\b', c)]
+    return ports
+
+
+def _implied_webshell_port(command: str) -> Optional[int]:
+    """A bare http(s):// URL with no explicit port -- the common shape for a
+    curl-to-webshell command, e.g. `curl ... -G 'http://<target>/cmd.php'
+    --data-urlencode 'cmd=...'` -- is a real connection to the implied
+    default port. Only consulted when _explicit_ports_in_command() found no
+    more specific structural signal."""
+    c = command or ""
+    if re.search(r'\bhttps://[^\s\'"]+', c):
+        return 443
+    if re.search(r'\bhttp://[^\s\'"]+', c):
+        return 80
+    return None
+
+
+def _primary_exploited_service(command: str, referenced: List[Dict]) -> List[Dict]:
+    """Pick the ONE service a compromise-proof command actually exploited,
+    out of every service _services_referenced() matched by port-number
+    substring. That matcher is deliberately broad (it also has to catch
+    legitimate multi-service scans), but a "final summary"/closing command
+    that recites several other ports in its own text -- a status banner, or
+    a webshell command that also probes a second service -- must not credit
+    every one of them; only the one it actually reached should count.
+
+    Prefers a structural connection signal (an explicit port in a URL/flag,
+    or -- when the command has no such flag at all -- the implied port of a
+    bare http(s):// webshell URL) over the command merely mentioning a port
+    in passing text. Falls back to the first referenced service (the old,
+    naive behaviour) when the signal is missing, or genuinely ambiguous
+    (more than one distinct explicit port found) -- guessing wrong there
+    would be worse than not disambiguating at all."""
+    if len(referenced) <= 1:
+        return referenced
+    explicit = _explicit_ports_in_command(command)
+    distinct_explicit = set(explicit)
+    target_port = None
+    if len(distinct_explicit) == 1:
+        target_port = next(iter(distinct_explicit))
+    elif not distinct_explicit:
+        target_port = _implied_webshell_port(command)
+    if target_port is not None:
+        matching = [sv for sv in referenced if str(sv.get("port") or "") == str(target_port)]
+        if matching:
+            return matching[:1]
+    return referenced[:1]
+
+
 def _detect_privilege_level(output: str) -> Optional[str]:
     """Infer the privilege level proven by a command's output, or None if the
     output doesn't clearly show a shell / code-execution context.
@@ -7675,7 +7738,7 @@ Web apps: {webapps}
         exploited = bool(_matched)
         settle_state = "exploited" if exploited else "tested"
         referenced = self._services_referenced(session, command)
-        if exploited and len(referenced) > 1:
+        if exploited:
             # A compromise signal proves code execution via the ONE service
             # the command actually interacted with -- not every service
             # whose port number happens to appear in the command's own
@@ -7683,13 +7746,17 @@ Web apps: {webapps}
             # every discovered port (e.g. "echo ===SERVICES_CONFIRMED=== &
             # echo ftp:21 ssh:22 http:80 msrpc:135 ...") matches ALL of
             # those services via the port-substring heuristic in
-            # _services_referenced(), which would otherwise mark every one
-            # of them "exploited" off a single webshell whoami call that
-            # only actually touched one of them. Keep only the primary
-            # (first-matched) service, matching what
-            # _capture_exploitation_evidence() records as the compromise's
-            # service, so service state and compromise evidence agree.
-            referenced = referenced[:1]
+            # _services_referenced(), which would otherwise credit whichever
+            # one happens to be first in the list (e.g. the lowest port
+            # number) rather than the one actually exploited.
+            # _primary_exploited_service() prefers a real structural
+            # connection signal (an explicit port, or a bare webshell URL's
+            # implied port) over a port merely mentioned in passing text, so
+            # e.g. a webshell command probing itself at plain
+            # "http://<target>/cmd.php" correctly attributes to that
+            # webshell's own port instead of the lowest port it happens to
+            # recite in a "services confirmed" summary line.
+            referenced = _primary_exploited_service(command, referenced)
         for svc in referenced:
             self._promote_service(svc, settle_state)
         if exploited:

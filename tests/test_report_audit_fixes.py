@@ -430,3 +430,73 @@ def test_markdown_report_engagement_status_when_fully_complete():
     md = open(out_path, encoding="utf-8").read()
     assert "Assessment Goal: **SUFFICIENT**" in md
     assert "Engagement: **COMPLETE**" in md
+
+
+# ── Third pass: the earlier _settle_service_states fix stopped 14-way
+# cascade, but still picked the single service via naive list order, which
+# could (and in the audited report, did) credit the wrong service ──────────
+
+def test_settle_service_states_attributes_to_webshell_port_not_lowest_port():
+    """Reproduces the actual misattribution in the audited report: a
+    'final evidence' summary command run through the http:80 webshell
+    (`curl ... -G 'http://<target>/cmd.php' ...`) that also echoes every
+    other discovered port in a "services confirmed" banner got credited to
+    ftp:21 (the lowest port number / first in the services list) instead
+    of http:80 (the webshell it actually ran through)."""
+    from tests._helpers import svc as _svc
+    orch = make_orch()
+    s = make_session(services=[
+        _svc(21, "ftp"), _svc(22, "ssh"), _svc(80, "http"), _svc(135, "msrpc"),
+    ])
+    orch.sessions[s.session_id] = s
+    orch.add_evidence = lambda *a, **k: None
+
+    command = (
+        "curl -s -m 60 -G 'http://10.0.0.5/cmd.php' --data-urlencode "
+        "'cmd=echo ===FINAL_EVIDENCE=== & whoami & echo ===SERVICES_CONFIRMED=== "
+        "& echo ftp:21 ssh:22 http:80 msrpc:135'"
+    )
+    output = "===FINAL_EVIDENCE===\nnt authority\\system\n===SERVICES_CONFIRMED===\nftp:21 ssh:22 http:80 msrpc:135"
+
+    orch._settle_service_states(s, command, output, success=True)
+
+    exploited = [sv for sv in s.discovered_services if sv.get("test_state") == "exploited"]
+    assert len(exploited) == 1
+    assert exploited[0]["service"] == "http" and exploited[0]["port"] == 80
+    assert s.compromise_evidence[0]["service"] == "http"
+    assert s.compromise_evidence[0]["port"] == 80
+
+
+def test_settle_service_states_attributes_to_explicit_probed_port():
+    """A webshell command that probes a SPECIFIC other service by explicit
+    port (e.g. hitting the Tomcat manager on 127.0.0.1:8080) must credit
+    that service, not the webshell's own port or the first in list order."""
+    from tests._helpers import svc as _svc
+    orch = make_orch()
+    s = make_session(services=[_svc(80, "http"), _svc(8080, "http")])
+    orch.sessions[s.session_id] = s
+    orch.add_evidence = lambda *a, **k: None
+
+    command = (
+        "curl -s -m 90 -G 'http://10.0.0.5/cmd.php' --data-urlencode "
+        "'cmd=echo ===WHOAMI=== & whoami & echo ===8080MGR=== & "
+        "curl -s -m8 http://127.0.0.1:8080/manager/html'"
+    )
+    output = "===WHOAMI===\nnt authority\\system\n===8080MGR===\n401 Unauthorized"
+
+    orch._settle_service_states(s, command, output, success=True)
+
+    exploited = [sv for sv in s.discovered_services if sv.get("test_state") == "exploited"]
+    assert len(exploited) == 1
+    assert exploited[0]["port"] == 8080
+
+
+def test_primary_exploited_service_falls_back_when_genuinely_ambiguous():
+    """Two distinct explicit ports probed in one command (e.g. it hits two
+    OTHER local services by port) can't be confidently disambiguated -
+    must fall back to the first-referenced service rather than guess."""
+    import core.orchestrator as orch_mod
+    referenced = [{"service": "a", "port": 8009}, {"service": "b", "port": 8080}]
+    command = "curl http://127.0.0.1:8009/ ; curl http://127.0.0.1:8080/"
+    result = orch_mod._primary_exploited_service(command, referenced)
+    assert result == referenced[:1]
