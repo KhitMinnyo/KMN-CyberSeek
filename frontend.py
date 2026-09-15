@@ -567,6 +567,25 @@ def get_session_history():
     return []
 
 
+def cancel_session(session_id: str):
+    """Hard-stop a session right now: cancels pending commands, stops owned
+    shells/brute-force workers, and cancels the in-flight AI-loop task. Unlike
+    a Steer instruction (a suggestion the AI may take several turns to act on,
+    or ignore), this is immediate and does not depend on the AI's cooperation."""
+    try:
+        response = api_session.post(f"{API_BASE}/sessions/{session_id}/cancel", timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        try:
+            detail = response.json().get("detail", response.text)
+        except Exception:
+            detail = response.text
+        return {"status": "error", "message": detail}
+    except Exception as e:
+        logger.error(f"Failed to cancel session {session_id}: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 def complete_session(session_id: str):
     """Mark a session as completed."""
     try:
@@ -1498,6 +1517,27 @@ def show_session_overview(session_details: Dict):
                 st.rerun()
             else:
                 st.error(f"Failed to delete session: {response.status_code}")
+
+    # Stop Engagement — an actual hard stop, not a suggestion. Steering
+    # instructions ("end now", "skip remaining steps") are advisory: they get
+    # injected into the AI's next prompt as high-priority guidance, but the
+    # loop only stops once the AI itself decides to comply, which can take
+    # many more turns (or never, for a stubborn model). This button cancels
+    # pending commands and the in-flight AI task immediately, regardless of
+    # what the AI is doing.
+    if status in ("executing", "analyzing", "ready"):
+        if st.button("🛑 Stop Engagement",
+                     help="Immediately halt this session — cancels any pending/queued command "
+                          "and the running AI loop right now. Unlike a Steer instruction, this "
+                          "does not wait for the AI to agree to stop.",
+                     use_container_width=True):
+            result = cancel_session(session_id)
+            if result.get("status") == "error":
+                st.error(f"Failed to stop session: {result.get('message', 'unknown error')}")
+            else:
+                st.success("Engagement stopped.")
+                time.sleep(0.5)
+                st.rerun()
 
     # Full rescan — separate row, less prominent (expensive operation)
     if has_data:
