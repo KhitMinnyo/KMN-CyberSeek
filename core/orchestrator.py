@@ -46,7 +46,7 @@ from core.scanner import Scanner, classify_os
 from core.memory_index import FindingsIndex
 from core.validators import (
     is_valid_target, is_target_in_scope, is_allowlisted_command, is_cidr,
-    automation_capability_error,
+    automation_capability_error, check_command_scope,
 )
 from core import cve_lookup
 from core import threat_intel
@@ -2593,6 +2593,12 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 "execution_channel": getattr(ai_response, "execution_channel", "local"),
                 "handler_id": getattr(ai_response, "handler_id", None),
                 "msf_id": getattr(ai_response, "msf_id", None),
+                "target_host": getattr(ai_response, "target_host", ""),
+                "target_port": getattr(ai_response, "target_port", 0),
+                "action_type": getattr(ai_response, "action_type", "other"),
+                "expected_result": getattr(ai_response, "expected_result", ""),
+                "verification_method": getattr(ai_response, "verification_method", "none"),
+                "fallback_action": getattr(ai_response, "fallback_action", ""),
             }
             
             session.ai_decisions.append(decision)
@@ -2613,10 +2619,9 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 await self._ensure_exploitation_handler(session_id)
 
             # Update status based on auto-approve setting and risk level.
-            # FULL_AUTO_MODE overrides: execute everything regardless of risk.
-            # auto_approve=True means the operator has accepted full autonomy,
-            # so it is treated identically to FULL_AUTO_MODE (all risk levels).
-            if FULL_AUTO_MODE or session.auto_approve:
+            # FULL_AUTO_MODE is the only mode that bypasses HIGH-risk approval.
+            # auto_approve is a LOW/MEDIUM convenience setting only.
+            if FULL_AUTO_MODE or (session.auto_approve and _decision_risk in {"low", "medium"}):
                 session.status = "executing"
             else:
                 session.status = "ready"
@@ -2635,10 +2640,8 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             session._empty_response_count = 0
 
             # Kick off execution or queue for approval.
-            # When auto_approve=True the session operator has accepted full autonomy —
-            # treat it identically to FULL_AUTO_MODE (all risk levels auto-execute).
             is_high_risk = self.requires_approval(_cmd) or _decision_risk == "high"
-            if safe_only or FULL_AUTO_MODE or session.auto_approve:
+            if safe_only or FULL_AUTO_MODE or (session.auto_approve and not is_high_risk):
                 automated_error = self._execution_gate(
                     session_id, _cmd,
                     execution_mode=(
@@ -2799,6 +2802,10 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         safety_error = self._check_command_safety(command)
         if safety_error:
             return safety_error
+
+        scope_error = check_command_scope(command, session.scope_allowlist)
+        if scope_error:
+            return scope_error
 
         if execution_mode in ("ai_auto", "playbook", "shell_auto"):
             capability_error = automation_capability_error(command)
@@ -3734,6 +3741,12 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 "execution_channel": getattr(ai_response, "execution_channel", "local"),
                 "handler_id": getattr(ai_response, "handler_id", None),
                 "msf_id": getattr(ai_response, "msf_id", None),
+                "target_host": getattr(ai_response, "target_host", ""),
+                "target_port": getattr(ai_response, "target_port", 0),
+                "action_type": getattr(ai_response, "action_type", "other"),
+                "expected_result": getattr(ai_response, "expected_result", ""),
+                "verification_method": getattr(ai_response, "verification_method", "none"),
+                "fallback_action": getattr(ai_response, "fallback_action", ""),
             }
 
             session.ai_decisions.append(decision)
@@ -3937,17 +3950,41 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                         _queued_already = True
                         self._queue_ai_response(session_id, ai_response)
 
-                # Depth counter gate: pause auto-execution and require one manual
-                # approval after max_auto_depth consecutive non-critical commands.
-                # This gives the operator a periodic checkpoint even in full-auto mode.
-                if should_auto_execute and session.auto_depth_counter >= session.max_auto_depth:
-                    logger.warning(
-                        f"Session {session_id} reached max auto-execution depth ({session.max_auto_depth}). "
-                        f"Pausing for one manual approval checkpoint."
+                # The depth checkpoint is applied below for both modes.
+
+            # Common auto-depth checkpoint. Full-auto stays unattended by
+            # discarding the stale proposal and forcing a fresh strategic turn;
+            # convenience auto-approve pauses for explicit operator approval.
+            if should_auto_execute and session.auto_depth_counter >= session.max_auto_depth:
+                if FULL_AUTO_MODE:
+                    logger.info(
+                        f"Session {session_id} reached auto-depth {session.max_auto_depth}; "
+                        "forcing a fresh strategic re-plan."
                     )
-                    should_auto_execute = False
-                    _queued_already = True
-                    self._queue_ai_response(session_id, ai_response)
+                    _d = {
+                        "timestamp": datetime.now().isoformat(),
+                        "reasoning": "AUTO_DEPTH_CHECKPOINT: forced unattended strategic re-plan",
+                        "suggested_command": "",
+                        "risk_level": "low",
+                        "confidence": 1.0,
+                        "context": "auto_depth_replan",
+                    }
+                    session.ai_decisions.append(_d)
+                    self._save_ai_decision(session_id, _d)
+                    session.auto_depth_counter = 0
+                    session._stagnation_counter = 0
+                    session.status = "analyzing"
+                    self._track_task(
+                        session_id, self._analyze_with_ai(session_id), "auto_depth_replan"
+                    )
+                    return
+                logger.warning(
+                    f"Session {session_id} reached max auto-execution depth "
+                    f"({session.max_auto_depth}); requiring operator approval."
+                )
+                should_auto_execute = False
+                _queued_already = True
+                self._queue_ai_response(session_id, ai_response)
 
             # All automated paths share the same execution gate. A verifier
             # revision is checked here too, before it can be scheduled.
@@ -3975,9 +4012,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     )
                     if not approved_error and not _queued_already:
                         _queued_already = True
-                        self.queue_for_approval(
-                            session_id, ai_response.suggested_command
-                        )
+                        self._queue_ai_response(session_id, ai_response)
 
             # Empty command → recover instead of silently stalling / queuing "".
             if not (ai_response.suggested_command or "").strip():

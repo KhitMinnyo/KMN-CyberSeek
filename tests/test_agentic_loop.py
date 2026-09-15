@@ -566,6 +566,36 @@ def test_full_auto_critique_reject_no_unbound_error():
     assert not any(d.get("context") == "loop_error" for d in s.ai_decisions)
 
 
+def test_full_auto_depth_forces_replan_without_manual_approval():
+    import core.orchestrator as orch_mod
+    orch = _loop_orch()
+    s = make_session(authorization_confirmed=True)
+    s.status = "executing"
+    s.max_auto_depth = 1
+    s.auto_depth_counter = 1
+    orch.sessions[s.session_id] = s
+    response = AIResponse(
+        reasoning="routine next step", suggested_command="nmap -sV 10.0.0.5",
+        risk_level="low", confidence=0.9, attack_phase="enumeration",
+    )
+    orch.ai_connector.ask_ai_async = AsyncMock(return_value=response)
+    orch._vet_command = AsyncMock()
+    orch._analyze_with_ai = AsyncMock()
+    orch._track_task = lambda sid, coro, label: asyncio.create_task(coro)
+    original = orch_mod.FULL_AUTO_MODE
+    orch_mod.FULL_AUTO_MODE = True
+    try:
+        async def scenario():
+            await orch._process_command_output(s.session_id, "previous", "clean output")
+            await asyncio.sleep(0)
+        _run(scenario())
+    finally:
+        orch_mod.FULL_AUTO_MODE = original
+    assert s.ai_decisions[-1]["context"] == "auto_depth_replan"
+    assert s.auto_depth_counter == 0
+    orch._analyze_with_ai.assert_awaited_once()
+
+
 def test_operator_instruction_injected_into_context():
     orch = _loop_orch()
     s = make_session()

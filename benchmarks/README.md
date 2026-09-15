@@ -18,6 +18,9 @@ python benchmarks/score.py /path/to/kmn_report_<id>.md
 
 # Choose a lab explicitly / machine-readable output
 python benchmarks/score.py report.md --lab benchmarks/labs/kmn_training_win.json --json
+
+# Print the explicit code-level capability inventory (not a leaderboard)
+python benchmarks/compare_capabilities.py
 ```
 
 **Metrics**

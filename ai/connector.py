@@ -73,6 +73,12 @@ class AIResponse(BaseModel):
     execution_channel: str = Field("local", description="local or managed_shell")
     handler_id: Optional[str] = Field(None, description="Managed shell handler id when execution_channel is managed_shell")
     msf_id: Optional[int] = Field(None, description="Managed Meterpreter/command-shell id when execution_channel is managed_shell")
+    target_host: str = Field("", description="Concrete in-scope target host")
+    target_port: int = Field(0, description="Concrete target port when applicable")
+    action_type: str = Field("other", description="recon/exploit/post_exploit/pivot/validate")
+    expected_result: str = Field("", description="Expected evidence for success")
+    verification_method: str = Field("none", description="Tool-specific verification method")
+    fallback_action: str = Field("", description="Next action if this action fails")
 
 
 class KMN_AI_Connector:
@@ -128,7 +134,7 @@ class KMN_AI_Connector:
         )
 
         requested_provider = (provider or os.getenv("AI_PROVIDER", "") or "").strip().lower()
-        if requested_provider not in {"api", "local"}:
+        if requested_provider not in {"api", "local", "none"}:
             requested_provider = "api" if is_valid_api_key else "local"
         if requested_provider == "api" and not is_valid_api_key:
             logger.warning(
@@ -448,6 +454,8 @@ class KMN_AI_Connector:
         'await ask_ai_async(...)' there instead. This wrapper is kept for
         standalone/CLI/test usage only.
         """
+        if self.provider == "none":
+            return None
         if self.provider == "api":
             import asyncio
             try:
@@ -468,6 +476,8 @@ class KMN_AI_Connector:
         """
         Asynchronous AI query.
         """
+        if self.provider == "none":
+            return None
         if self.provider == "api":
             return await self.ask_ai_api(prompt, session_id, memory)
         else:
@@ -494,6 +504,8 @@ class KMN_AI_Connector:
         Returns None on any failure (invalid JSON, network error, etc) - never raises.
         """
         try:
+            if self.provider == "none":
+                return None
             if self.provider == "api":
                 return await self._ask_raw_api(system_prompt, user_prompt)
             else:

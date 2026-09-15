@@ -4,7 +4,7 @@
 ![Python](https://img.shields.io/badge/Python-3.8%2B-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-AI-driven autonomous penetration testing framework. Executes a full offensive engagement pipeline — OSINT → exploitation — using an LLM (DeepSeek API or local Ollama) with human-in-the-loop approval for high-risk actions.
+AI-driven autonomous penetration testing framework with policy-constrained full-auto execution and optional human oversight. Executes a full offensive engagement pipeline — OSINT → exploitation — using an LLM (DeepSeek API or local Ollama).
 
 Benchmark and evaluation results in this repository are self-scored engineering
 measurements. They are not independent third-party validation and do not support
@@ -81,6 +81,11 @@ AI_PROVIDER=api
 DEEPSEEK_API_KEY=sk-...
 DEEPSEEK_MODEL=deepseek-chat
 ```
+
+Set `AI_PROVIDER=none` to run without an LLM. In that mode deterministic scan,
+playbook, policy, verification, and reporting paths remain available; LLM-only
+creative exploit selection is explicitly reported as unavailable rather than
+silently guessed.
 
 ### Ports
 
