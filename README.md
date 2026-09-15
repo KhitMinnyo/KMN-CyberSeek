@@ -6,6 +6,11 @@
 
 AI-driven autonomous penetration testing framework. Executes a full offensive engagement pipeline — OSINT → exploitation — using an LLM (DeepSeek API or local Ollama) with human-in-the-loop approval for high-risk actions.
 
+Benchmark and evaluation results in this repository are self-scored engineering
+measurements. They are not independent third-party validation and do not support
+claims that KMN-CyberSeek outperforms another security agent. See
+`benchmarks/manifest.json` for the comparison policy.
+
 **Repository:** [https://github.com/KhitMinnyo/KMN-CyberSeek](https://github.com/KhitMinnyo/KMN-CyberSeek)
 
 ---

