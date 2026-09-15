@@ -407,6 +407,16 @@ def test_target_tool_risk_normalization_and_http_failure():
     assert _command_risk_level("curl -s http://10.0.0.5/shell.php?cmd=id", "high") == "medium"
     assert _command_risk_level("msfconsole -q -x 'use exploit/x; run'", "high") == "medium"
     assert _command_risk_level("sudo -l", "high") == "high"
+    # netexec/crackmapexec: a routine single-credential check is medium-tier
+    # like curl/msf, even when the model over-classified it as high. A
+    # wordlist-based spray (the system prompt's own HIGH example) is left high.
+    assert _command_risk_level("crackmapexec smb 10.0.0.5 -u admin -p Pw0rd!", "high") == "medium"
+    assert _command_risk_level("nxc winrm 10.0.0.5 -u admin -p Pw0rd! --shares", "high") == "medium"
+    assert _command_risk_level("netexec smb 10.0.0.5 -u admin -p Pw0rd!", "high") == "medium"
+    assert _command_risk_level(
+        "crackmapexec smb 10.0.0.5 -u users.txt -p /usr/share/wordlists/rockyou.txt --no-bruteforce",
+        "high",
+    ) == "high"
     assert orch._target_response_error(
         "curl -s -w 'HTTP_CODE:%{http_code}' http://10.0.0.5/shell.php",
         "HTTP_CODE:404",

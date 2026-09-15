@@ -162,6 +162,15 @@ _MSF_COMMAND_RE = re.compile(
     re.IGNORECASE,
 )
 _CURL_COMMAND_RE = re.compile(r"(?<![A-Za-z0-9_-])curl(?:\s|$)", re.IGNORECASE)
+_NETEXEC_COMMAND_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:crackmapexec|cme|netexec|nxc)\b", re.IGNORECASE,
+)
+# A wordlist/credential-file argument (vs. a single literal username/password)
+# is what actually makes a netexec/crackmapexec run a spray — matches the
+# system prompt's own criterion: "crackmapexec with wordlist" = HIGH.
+_WORDLIST_FILE_RE = re.compile(
+    r"\.txt\b|/usr/share/wordlists|/seclists|\brockyou\b", re.IGNORECASE,
+)
 
 
 def _is_msf_command(command: str) -> bool:
@@ -174,14 +183,34 @@ def _is_curl_command(command: str) -> bool:
     return bool(_CURL_COMMAND_RE.search(command or ""))
 
 
+def _is_netexec_command(command: str) -> bool:
+    """Return True when a command invokes crackmapexec/netexec (nxc) — an
+    approved SMB/AD auth-testing tool in this application, same tier as curl
+    and Metasploit for a routine single-credential check."""
+    return bool(_NETEXEC_COMMAND_RE.search(command or ""))
+
+
+def _is_wordlist_spray(command: str) -> bool:
+    """Return True when a command's credential arguments look like a wordlist
+    file rather than one literal credential — the actual HIGH-risk case."""
+    return bool(_WORDLIST_FILE_RE.search(command or ""))
+
+
 def _command_risk_level(command: str, model_risk: Optional[str] = None) -> str:
     """Normalize the displayed/execution risk for known framework commands.
 
     Curl and Metasploit are approved medium-tier tools in this application.
     Their non-interactive and binary allowlist gates still apply; this only
     prevents the model from turning every request into a second approval gate.
+
+    netexec/crackmapexec gets the same medium-tier treatment, but ONLY for a
+    routine single-credential auth check — a wordlist-based spray (the
+    system prompt's own HIGH example) is left as whatever the model reported,
+    since that genuinely warrants the stricter gate.
     """
     if _is_msf_command(command) or _is_curl_command(command):
+        return "medium"
+    if _is_netexec_command(command) and not _is_wordlist_spray(command):
         return "medium"
     risk = (model_risk or "unknown").lower()
     return risk if risk in {"low", "medium", "high"} else "unknown"
