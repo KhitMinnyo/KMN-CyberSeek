@@ -252,6 +252,46 @@ def test_watchdog_revives_idle_ready_session():
     assert s.status == "analyzing"
 
 
+def test_bound_session_memory_caps_unbounded_logs():
+    """MEMORY regression: ai_decisions has ~20 separate .append() call sites and
+    none of them trim, so a long-running (especially Fully Autonomous,
+    unattended) session grows these lists without limit. _bound_session_memory
+    is the single centralized trim, run every watchdog tick, that caps them."""
+    orch = _loop_orch()
+    s = make_session()
+    orch.sessions[s.session_id] = s
+    s.ai_decisions = [{"i": i} for i in range(1000)]
+    s.evidence = [{"i": i} for i in range(1000)]
+    s.scan_results = [{"i": i} for i in range(1000)]
+    s.episode_summaries = [f"e{i}" for i in range(1000)]
+    s.commands_executed = [{"i": i} for i in range(1000)]
+
+    orch._bound_session_memory(s)
+
+    assert len(s.ai_decisions) == 400 and s.ai_decisions[-1] == {"i": 999}
+    assert len(s.evidence) == 400
+    assert len(s.scan_results) == 150
+    assert len(s.episode_summaries) == 100
+    assert len(s.commands_executed) == 500
+
+    # Under the cap: left untouched (no needless copying/mutation every tick).
+    s.ai_decisions = [{"i": 1}]
+    orch._bound_session_memory(s)
+    assert s.ai_decisions == [{"i": 1}]
+
+
+def test_watchdog_tick_bounds_memory_for_every_session():
+    """The trim must actually run as part of the watchdog's per-tick sweep, not
+    just be reachable as a standalone method."""
+    orch = _loop_orch()
+    s = make_session()
+    s.status = "completed"  # not revivable, but still must get trimmed
+    orch.sessions[s.session_id] = s
+    s.ai_decisions = [{"i": i} for i in range(1000)]
+    _run(orch._watchdog_tick())
+    assert len(s.ai_decisions) == 400
+
+
 def test_watchdog_skips_ready_with_pending_approval():
     # A 'ready' session waiting for the operator to approve a command is NOT
     # stuck — the watchdog must leave it alone.

@@ -3619,6 +3619,8 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         }
 
         session.commands_executed.append(command_record)
+        if len(session.commands_executed) > 500:
+            session.commands_executed = session.commands_executed[-500:]
         if job_id:
             self._update_job(job_id, "completed", exit_code=return_code,
                              error=target_error or "")
@@ -6874,6 +6876,29 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             for c in self.pending_commands.values()
         )
 
+    def _bound_session_memory(self, session) -> None:
+        """Cap the session lists that grow for the entire lifetime of a
+        long-running (especially Fully Autonomous, unattended) engagement and
+        are never trimmed at their append sites: ai_decisions/evidence/
+        scan_results/episode_summaries. ai_decisions alone has ~20 separate
+        `.append()` call sites scattered through this module, so trimming
+        centrally here (run every watchdog tick, every session) is far less
+        error-prone than touching every one of them individually.
+        commands_executed is already capped at its append sites too; it is
+        re-checked here as a defense-in-depth backstop. Keeps plenty of recent
+        history for the UI/audit trail while bounding memory so a multi-hour
+        session doesn't grow without limit."""
+        if len(session.ai_decisions) > 400:
+            session.ai_decisions = session.ai_decisions[-400:]
+        if len(session.evidence) > 400:
+            session.evidence = session.evidence[-400:]
+        if len(session.scan_results) > 150:
+            session.scan_results = session.scan_results[-150:]
+        if len(session.episode_summaries) > 100:
+            session.episode_summaries = session.episode_summaries[-100:]
+        if len(session.commands_executed) > 500:
+            session.commands_executed = session.commands_executed[-500:]
+
     async def _watchdog_tick(self) -> None:
         """One watchdog pass. Revives sessions stuck with no progress:
           - 'executing'  → a command may legitimately run up to COMMAND_TIMEOUT,
@@ -6885,6 +6910,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         """
         now = time.monotonic()
         for sid, session in list(self.sessions.items()):
+            self._bound_session_memory(session)
             status = session.status
             if status in ("executing", "analyzing"):
                 # Active states — a command or AI call may legitimately be running,
