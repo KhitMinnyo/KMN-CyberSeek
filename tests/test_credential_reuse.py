@@ -4,9 +4,16 @@ to remember), skipping the origin service, deduped, and shell-safe.
 
 Also covers Fix #1: john _CRED_PATTERNS must have 2 groups so match.group(2) works."""
 
+import asyncio
 import re
+from unittest.mock import AsyncMock, MagicMock
+
 from core.orchestrator import _CRED_PATTERNS
 from tests._helpers import make_orch, make_session, svc
+
+
+def _run(coro):
+    return asyncio.run(coro)
 
 
 def _sess():
@@ -95,3 +102,40 @@ def test_secret_is_shell_quoted():
     # the raw unquoted secret must not appear verbatim (it was shlex.quoted)
     assert orch.queued
     assert "pa ss'w$rd" not in orch.queued[0]
+
+
+def test_execute_command_rotation_state_is_per_session():
+    """CORRECTNESS regression: the multi-credential rotation "already tried"
+    set must live on the Session (per-session, per-command-fingerprint state
+    — different sessions target different systems with different creds), not
+    on the shared Orchestrator singleton. A prior bug read/wrote
+    self._rotation_tried inside Orchestrator.execute_command, but
+    Orchestrator never defines that attribute (only Session.__init__ does)
+    — so every command that reached the rotation loop crashed with
+    AttributeError: 'Orchestrator' object has no attribute '_rotation_tried'."""
+    orch = make_orch()
+    s = make_session(services=[svc(22, "ssh")])
+    s.credentials = [{"username": "admin", "secret": "pw1", "secret_type": "password"}]
+    orch.sessions[s.session_id] = s
+
+    orch._last_activity = {}
+    orch._execution_gate = MagicMock(return_value=None)
+    orch._mark_services_in_progress = MagicMock()
+    orch._pick_credential = MagicMock(return_value=None)
+    orch._inject_credentials = lambda cmd, session, cred=None: cmd
+    orch._downsize_wordlists = lambda cmd: cmd
+    orch._execute_prepared_command = AsyncMock(return_value={
+        "command_id": "c1", "command": "id", "output": "uid=0(root)",
+        "error": "", "return_code": 0, "success": True,
+    })
+    orch._track_task = MagicMock()  # don't chase the follow-on AI analysis task
+
+    result = _run(orch.execute_command(s.session_id, "id"))
+
+    assert result["success"] is True
+    # Rotation-tried state lives on the session, never on the orchestrator: the
+    # command's fingerprint is recorded with an (empty, since nothing failed)
+    # tried-credentials set.
+    fp = orch._command_fingerprint("id")
+    assert s._rotation_tried == {fp: set()}
+    assert not hasattr(orch, "_rotation_tried")

@@ -3238,7 +3238,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             # vector. Commands with no injectable credential run exactly once.
             original_command = command
             _fp = self._command_fingerprint(original_command)
-            _tried = self._rotation_tried.setdefault(_fp, set())
+            _tried = session._rotation_tried.setdefault(_fp, set())
             _max_attempts = 1 + len(session.credentials or [])
             _record = None
             for _attempt in range(_max_attempts):
