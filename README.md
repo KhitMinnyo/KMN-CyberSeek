@@ -211,8 +211,41 @@ BRUTEFORCE_CONCURRENCY=2
 
 ## Further Reading
 
+- [Evidence, Headless Workflows, and Deployment Boundaries](docs/reliability.md)
+- [Sandbox and Scope Enforcement](docs/sandbox.md)
+- [API Inventory and Bounded Assessment Jobs](docs/assessment.md)
+- [Optional Scoped Browser Observations](docs/browser.md)
 - [Features & Architecture Detail](features.md)
 - [Changelog](change_log.md)
+
+## Evidence-Backed Workflows
+
+Findings now carry stable IDs, lifecycle events, and evidence/artifact references.
+Scanner labels, model confidence, and successful command exits do not by themselves
+verify a vulnerability. An authenticated operator can review session-owned raw
+artifacts and record verification, remediation, and retest outcomes. This is an
+operator-reviewed workflow, not automatic proof that every scanner result is real.
+
+```bash
+# Configure KMN_API_URL and API_AUTH_TOKEN in the calling environment first.
+python cli.py start 192.0.2.1 --authorization-confirmed
+python cli.py status SESSION_ID
+python cli.py report SESSION_ID --format sarif --output report.sarif --fail-on high
+python cli.py inventory import SESSION_ID openapi.json --inventory-base-url https://api.example.test
+```
+
+The headless client preserves approval controls. JSON/SARIF exports omit raw
+commands, credentials, and evidence bodies. Legacy reports and archives remain
+sensitive. Explicit CLI output files use mode `0600` and never overwrite existing
+files. Reports remain available for completed sessions after a backend restart.
+
+Local execution remains **unisolated** by default. The optional Docker backend
+requires a preprovisioned image and externally enforced network policy, with no
+silent host fallback. Shared process-local execution limits bound running and
+queued commands. OpenAPI import inventories declared operations without sending
+requests; the optional browser adapter performs restricted observations, not
+automatic authorization or business-logic testing. See the linked guides before
+enabling these paths.
 
 ## Session Retention
 

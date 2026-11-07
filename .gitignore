@@ -16,6 +16,12 @@ terminal_output.txt
 *.db-journal
 *.db-wal
 *.db-shm
+/evidence/
+/assessments/
+/.pytest_cache/
+/.coverage
+/htmlcov/
+*.sarif
 
 # OS
 .DS_Store

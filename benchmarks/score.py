@@ -9,12 +9,20 @@ Usage:
     python benchmarks/score.py <report.md> [--lab benchmarks/labs/kmn_training_win.json] [--json]
     python benchmarks/score.py --report-text "<raw text>" --lab <lab.json>
 
-Scoring (per ground-truth item):
+Legacy scoring (heuristic coverage only, NOT vulnerability verification):
     touched   = any of the item's signals appears ANYWHERE in the report text.
     confirmed = a signal appears in a CONFIRMED section of the report
                 (Confirmed Compromises / Credentials Captured / Vulnerability Findings).
 
 Dependency-free (stdlib only): works anywhere, no pip installs.
+
+Structured scoring:
+    python benchmarks/score.py findings.json --structured --lab lab.json --json
+    Input: {"findings": [finding, ...]}; each finding follows
+    core.finding_verification and may supply a single "ground_truth_id".
+    IDs are matched exactly, never inferred from prose or source labels. Missing
+    IDs on verified findings make precision unavailable, rather than hiding false
+    positives. Recall counts only verified IDs in the ground-truth item set.
 """
 
 import argparse
@@ -22,7 +30,12 @@ import json
 import os
 import re
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List
+
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.finding_verification import assess_finding
 
 # Report section headings whose content counts as "confirmed" (case-insensitive
 # substring match on the heading line).
@@ -68,6 +81,7 @@ def split_confirmed_text(report: str) -> str:
 
 
 def score(report: str, lab: Dict) -> Dict:
+    """Preserve legacy heading/signal counts; these are not verified findings."""
     full = report.lower()
     confirmed_text = split_confirmed_text(report).lower()
 
@@ -98,6 +112,9 @@ def score(report: str, lab: Dict) -> Dict:
         c["confirmed"] += 1 if r["confirmed"] else 0
 
     return {
+        "mode": "legacy_markdown_heuristic",
+        "verification": False,
+        "notice": "Heuristic text coverage only; confirmed counts are not verification.",
         "lab": lab.get("lab", "?"),
         "total": total,
         "touched": touched_n,
@@ -109,10 +126,77 @@ def score(report: str, lab: Dict) -> Dict:
     }
 
 
+def score_structured(report: Dict, lab: Dict) -> Dict:
+    """Score raw evidence-backed findings, deduplicating exact ground-truth IDs.
+
+    Precision and recall are fractions (0..1), or None when undefined. Unknown
+    verified IDs are false positives; unverified claims are not predictions.
+    Input assessments/status are ignored and recomputed from raw evidence.
+    This evaluates declared evidence, not the authenticity of artifact contents.
+    """
+    if (not isinstance(report, dict) or not isinstance(report.get("findings"), list)
+            or any(not isinstance(f, dict) for f in report["findings"])):
+        raise ValueError("Structured report requires a findings list of objects.")
+    items = lab.get("items", [])
+    ids = [item.get("id") for item in items]
+    if (any(not isinstance(key, str) or not key.strip() for key in ids)
+            or len(set(ids)) != len(ids)):
+        raise ValueError("Ground-truth items require unique nonempty string IDs.")
+    touched, predicted = set(), set()
+    assessments = []
+    unlabelled = 0
+    for finding in report["findings"]:
+        assessment = assess_finding(finding)
+        key = finding.get("ground_truth_id")
+        labelled = isinstance(key, str) and bool(key.strip())
+        if labelled:
+            touched.add(key)
+        if assessment["verified"]:
+            if labelled:
+                predicted.add(key)
+            else:
+                unlabelled += 1
+        assessments.append({"ground_truth_id": key if labelled else None,
+                            "assessment": assessment})
+    truth = set(ids)
+    true_positives, false_positives = predicted & truth, predicted - truth
+    false_negatives = truth - predicted
+    results, categories = [], {}
+    for item in items:
+        key = item["id"]
+        row = {"id": key, "title": item.get("title", key),
+               "category": item.get("category", "uncategorised"),
+               "touched": key in touched, "confirmed": key in true_positives,
+               "verified": key in true_positives}
+        results.append(row)
+        category = categories.setdefault(row["category"], {"total": 0, "touched": 0, "confirmed": 0})
+        category["total"] += 1
+        category["touched"] += int(row["touched"])
+        category["confirmed"] += int(row["verified"])
+    total, touched_n, verified_n = len(truth), len(touched & truth), len(true_positives)
+    return {
+        "mode": "structured_evidence", "verification": True,
+        "notice": "Evidence-reference assessment only; artifact authenticity is not checked.",
+        "lab": lab.get("lab", "?"), "total": total,
+        "touched": touched_n, "confirmed": verified_n, "verified": verified_n,
+        "touched_pct": round(100.0 * touched_n / total, 1) if total else 0.0,
+        "confirmed_pct": round(100.0 * verified_n / total, 1) if total else 0.0,
+        "categories": categories, "items": results, "assessments": assessments,
+        "true_positives": sorted(true_positives), "false_positives": sorted(false_positives),
+        "false_negatives": sorted(false_negatives), "unlabelled_verified": unlabelled,
+        "precision": len(true_positives) / len(predicted) if predicted and not unlabelled else None,
+        "recall": len(true_positives) / total if total else None,
+    }
+
+
 def print_report(res: Dict) -> None:
     print(f"\n=== Coverage vs {res['lab']} ===")
+    print(res["notice"])
     print(f"Touched:   {res['touched']}/{res['total']}  ({res['touched_pct']}%)")
-    print(f"Confirmed: {res['confirmed']}/{res['total']}  ({res['confirmed_pct']}%)")
+    label = "Verified" if res["verification"] else "Confirmed (heuristic)"
+    print(f"{label}: {res['confirmed']}/{res['total']}  ({res['confirmed_pct']}%)")
+    if res["verification"]:
+        print(f"Precision: {res['precision']}  Recall: {res['recall']}")
     print("\nBy category (confirmed / touched / total):")
     for cat, c in sorted(res["categories"].items()):
         print(f"  {cat:20s} {c['confirmed']:>2}/{c['touched']:>2}/{c['total']:<2}")
@@ -140,8 +224,11 @@ def main(argv=None) -> int:
     ap.add_argument("--report-text", help="Raw report text instead of a file")
     ap.add_argument("--lab", default=_default_lab(), help="Path to lab ground-truth JSON")
     ap.add_argument("--json", action="store_true", help="Emit JSON instead of a table")
+    ap.add_argument("--structured", action="store_true", help="Read evidence-backed findings JSON")
     args = ap.parse_args(argv)
 
+    if args.structured and (args.report_text is not None or not args.report):
+        ap.error("--structured requires a JSON report path, not --report-text")
     if args.report_text is not None:
         report = args.report_text
     elif args.report:
@@ -150,7 +237,11 @@ def main(argv=None) -> int:
     else:
         ap.error("provide a report path or --report-text")
 
-    res = score(report, load_lab(args.lab))
+    try:
+        res = (score_structured(json.loads(report), load_lab(args.lab)) if args.structured
+               else score(report, load_lab(args.lab)))
+    except ValueError as exc:
+        ap.error(str(exc))
     if args.json:
         print(json.dumps(res, indent=2))
     else:

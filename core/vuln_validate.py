@@ -14,12 +14,18 @@ with two normalised fields:
   - confidence: float in [0, 1]
 and may set finding["suppressed"] = True with a reason when it's almost certainly
 a false positive (callers may skip suppressed findings).
+
+The shipped status/confidence projection is retained for existing consumers and
+is NOT verification. The additive "verification" assessment is authoritative for
+evidence-backed lifecycle decisions; see core.finding_verification for its schema.
 """
 
 import re
 from typing import Dict, List, Optional
 
-# Sources whose findings are validated by an actual on-host check → confirmed.
+from core.finding_verification import assess_finding
+
+# Legacy source-based display projection only; this is not verification evidence.
 _CONFIRMED_SOURCES = {"nmap-vuln-script", "exploit", "manual", "post_ex"}
 # Sources that are heuristic keyword/version guesses → potential until validated.
 _POTENTIAL_SOURCES = {"nvd", "searchsploit", "vulners"}
@@ -74,6 +80,7 @@ def validate(finding: Dict, discovered_version: str = "") -> Dict:
     """Return a copy of `finding` with normalised status/confidence and possible
     suppression. Never raises."""
     f = dict(finding)
+    f["verification"] = assess_finding(finding)
     source = (f.get("source_tool") or "").lower()
     cve_ids = f.get("cve_ids") or []
     if isinstance(cve_ids, str):
@@ -98,7 +105,7 @@ def validate(finding: Dict, discovered_version: str = "") -> Dict:
         f["validation_note"] = f"version mismatch: finding vs discovered '{version}'"
         return f
 
-    # 3) Otherwise: confirmed sources are confirmed; heuristic sources are potential.
+    # 3) Preserve the shipped display projection independently of verification.
     if source in _CONFIRMED_SOURCES:
         f["status"] = f.get("status") or "confirmed"
         f["confidence"] = f.get("confidence", 0.9)

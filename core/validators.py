@@ -14,6 +14,7 @@ shrink blast radius for two realistic failure modes of an LLM-driven agent that 
 import ipaddress
 import os
 import re
+import shlex
 from typing import Optional, List
 
 # --- Target format validation -------------------------------------------------
@@ -26,8 +27,10 @@ _HOSTNAME_RE = re.compile(
 def is_cidr(value: str) -> bool:
     """Return True if value is a valid IPv4/IPv6 CIDR network (e.g. 192.168.1.0/24).
     strict=False so host bits set (192.168.1.5/24) are still accepted."""
+    if not isinstance(value, str) or "%" in value:
+        return False
     try:
-        net = ipaddress.ip_network(value.strip(), strict=False)
+        ipaddress.ip_network(value.strip(), strict=False)
         # Reject host addresses presented as plain IPs with no prefix — those
         # are handled by ip_address() in is_valid_target(). A valid CIDR must
         # contain a "/" character.
@@ -44,7 +47,7 @@ def is_valid_target(value: Optional[str]) -> bool:
     if not value or not isinstance(value, str):
         return False
     value = value.strip()
-    if not value or len(value) > 253:
+    if not value or len(value) > 253 or "%" in value:
         return False
 
     try:
@@ -56,27 +59,50 @@ def is_valid_target(value: Optional[str]) -> bool:
     if is_cidr(value):
         return True
 
-    return bool(_HOSTNAME_RE.match(value))
+    # A trailing dot is the DNS root, not a different authorization identity.
+    hostname = value.rstrip(".") if value.endswith(".") else value
+    if value.endswith("..") or re.fullmatch(r"[0-9.]+", hostname):
+        return False
+    return bool(_HOSTNAME_RE.fullmatch(hostname))
 
 
 # --- Scope allowlisting ---------------------------------------------------------
+
+def _scope_entries(allowlist_str: str) -> List[str]:
+    entries = [entry.strip() for entry in allowlist_str.split(",")]
+    for entry in entries:
+        value = entry[2:] if entry.startswith("*.") else entry
+        if not is_valid_target(value):
+            raise ValueError("Invalid scope allowlist configuration")
+        if entry.startswith("*."):
+            if not _HOSTNAME_RE.fullmatch(value.rstrip(".")):
+                raise ValueError("Scope wildcards require a DNS suffix")
+            try:
+                ipaddress.ip_address(value.rstrip("."))
+            except ValueError:
+                pass
+            else:
+                raise ValueError("Scope wildcards cannot match IP addresses")
+    return entries
+
 
 def is_target_in_scope(target: Optional[str], allowlist_str: Optional[str]) -> bool:
     """Check a target against an optional SCOPE_ALLOWLIST (comma-separated IPs,
     CIDR ranges, exact hostnames, or "*.suffix" wildcard hostnames).
 
-    If allowlist_str is empty/unset, scope is unrestricted (default, backward
-    compatible for solo/homelab use). Set SCOPE_ALLOWLIST in .env to enforce a
-    hard technical boundary on what this tool is permitted to target.
+    Empty/unset scope is unrestricted. This is lexical authorization, not DNS
+    resolution or a network firewall. Invalid configured entries fail closed.
     """
-    if not target:
+    if not is_valid_target(target):
         return False
+    target = target.strip()
     if not allowlist_str or not allowlist_str.strip():
         return True  # No allowlist configured -> unrestricted
 
-    entries = [e.strip() for e in allowlist_str.split(",") if e.strip()]
-    if not entries:
-        return True
+    try:
+        entries = _scope_entries(allowlist_str)
+    except ValueError:
+        return False
 
     try:
         target_ip = ipaddress.ip_address(target)
@@ -90,7 +116,7 @@ def is_target_in_scope(target: Optional[str], allowlist_str: Optional[str]) -> b
     except ValueError:
         target_net = None
 
-    target_lower = target.lower()
+    target_lower = target.lower().rstrip(".")
     for entry in entries:
         if target_ip is not None:
             try:
@@ -108,7 +134,10 @@ def is_target_in_scope(target: Optional[str], allowlist_str: Optional[str]) -> b
             except (ValueError, TypeError):
                 pass
 
-        entry_lower = entry.lower()
+        # IP literals must never fall through into DNS wildcard matching.
+        if target_ip is not None or target_net is not None:
+            continue
+        entry_lower = entry.lower().rstrip(".")
         if entry_lower == target_lower:
             return True
         if entry_lower.startswith("*.") and target_lower.endswith(entry_lower[1:]):
@@ -622,62 +651,220 @@ def tool_validate(tool_name: str, output: str, **kwargs) -> bool:
 
 
 # ── Command-level scope enforcement ───────────────────────────────────────────
-# Extracts every destination host embedded in a command string and checks each
-# against the scope allowlist.  Covers MSF option flags, URL host parts, and
-# common tool argument patterns.
+# Deliberately small grammars: an unrecognized option may load targets, change
+# routing, execute code, follow redirects, or select a default remote service.
+# Never infer safety merely from finding one authorized host in the text.
+_LOCAL_ONLY = {
+    "echo", "printf", "pwd", "ls", "cat", "head", "tail", "wc", "sort",
+    "uniq", "cut", "tr", "id", "whoami", "uname", "date", "stat", "file",
+    "strings", "grep", "egrep", "fgrep", "true", "false",
+}
+_TOOL_OPTIONS = {
+    # (flags with no value, options with an ordinary non-destination value)
+    "nmap": ({"-sV", "-sT", "-sS", "-sU", "-sC", "-sn", "-Pn", "-n", "-6", "-v", "-vv", "-O", "--osscan-guess", "--open", "--reason"},
+             {"-p", "--top-ports", "--max-retries", "--host-timeout", "--scan-delay", "--max-rtt-timeout", "--script", "--script-timeout", "-oN", "-oX", "-oG", "-oA", "-T"}),
+    "ping": ({"-4", "-6", "-n", "-q"}, {"-c", "-W", "-w", "-i", "-s", "-t"}),
+    "ping6": ({"-n", "-q"}, {"-c", "-W", "-w", "-i", "-s"}),
+    "traceroute": ({"-4", "-6", "-n", "-I", "-T"}, {"-m", "-q", "-w", "-p"}),
+    "nc": ({"-4", "-6", "-n", "-v", "-z", "-u"}, {"-w", "-p"}),
+    "ftp": ({"-n", "-v", "-i", "-p"}, set()),
+    "curl": ({"-s", "-S", "-sS", "--silent", "--show-error", "-I", "--head", "-k", "--insecure", "-4", "-6", "--fail", "-f"},
+             {"-o", "--output", "--max-time", "--connect-timeout", "-A", "--user-agent", "-H", "--header", "-X", "--request", "-d", "--data", "--data-raw"}),
+    "wget": ({"-q", "--quiet", "-S", "--server-response", "--spider", "-4", "-6"},
+             {"-O", "--output-document", "-T", "--timeout", "--tries", "--max-redirect"}),
+    "smbclient": ({"-N", "-g"}, {"-U", "--user", "-W", "--workgroup", "-p", "--port"}),
+    "mysql": ({"--batch", "--skip-column-names"}, {"-u", "--user", "-P", "--port"}),
+    "redis-cli": ({"--raw", "--no-auth-warning"}, {"-p", "-a", "--user"}),
+}
 
-_MSF_HOST_FLAGS = _re.compile(
-    r"(?:set\s+(?:RHOSTS?|LHOST|TARGET|SRVHOST)|"
-    r"-H|-h|--host|--target|-t|RHOSTS?=|TARGET=)"
-    r"\s+([\w.:-]+)",
-    _re.IGNORECASE,
-)
-_URL_HOST_RE = _re.compile(
-    r"https?://([\w.-]+(?::\d+)?)",
-    _re.IGNORECASE,
-)
-_GENERIC_HOST_FLAG = _re.compile(
-    r"(?:-H|-h|--host|--rhost|--target|-T)\s+([\w.:/+-]+)",
-    _re.IGNORECASE,
-)
-_FTP_DEST   = _re.compile(r"(?:ftp|sftp)(?:-?cli)?\s+(?:[^@]+@)?([\w.-]+)", _re.IGNORECASE)
-_SMB_DEST   = _re.compile(r"//([\w.:-]+)/", _re.IGNORECASE)
-_PROXY_DEST = _re.compile(r"--proxy[=\s]+(?:socks[45]?://|http://)?([\w.:-]+)", _re.IGNORECASE)
-_CIDR_ARG   = _re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})\b")
+# These selectors are shipped by scanner.py/playbooks.py, not a general NSE
+# expression/path allowlist. They assume a trusted installed NSE database and
+# still require external egress policy; built-in scripts are not a firewall.
+_NMAP_SCRIPT_SELECTORS = {"vuln", "vuln and not intrusive", "default"}
+_NMAP_SCRIPT_NAMES = {
+    "smb-protocols", "smb-security-mode", "ftp-anon", "ftp-bounce", "ftp-vuln*",
+    "ssh2-enum-algos", "ssh-auth-methods", "mysql-empty-password", "mysql-info",
+    "ajp-headers", "ajp-methods", "http-title", "rdp-ntlm-info",
+    "rdp-enum-encryption", "pgsql-info", "rmi-dumpregistry", "jmx-info",
+    "vnc-info", "vnc-title",
+}
+_NMAP_TIME_OPTIONS = {"--host-timeout", "--scan-delay", "--max-rtt-timeout", "--script-timeout"}
 
 
-def _strip_port(host: str) -> str:
-    if host.startswith("["):  # IPv6 bracket notation
-        return host.split("]")[0].lstrip("[")
-    return host.split(":")[0] if ":" in host else host
+def _destination(value: str) -> str:
+    """Parse one literal IP/CIDR, hostname, URL authority, or bracketed endpoint."""
+    from urllib.parse import urlsplit
+
+    if not value or any(c.isspace() for c in value) or any(c in value for c in "\\$`"):
+        raise ValueError(f"Invalid or dynamic destination: {value!r}")
+    if "://" in value or value.startswith("//"):
+        parsed = urlsplit(value if "://" in value else "smb:" + value)
+        if parsed.scheme.lower() not in {"http", "https", "ftp", "ftps", "smb", "socks4", "socks5", "socks5h"}:
+            raise ValueError("Unsupported destination URL scheme")
+        # Accessing port also validates malformed and out-of-range ports.
+        port = parsed.port
+        if port is not None and port == 0:
+            raise ValueError("Invalid URL port")
+        host = parsed.hostname
+        if not host or not is_valid_target(host) or "/" in host:
+            raise ValueError(f"Invalid URL destination: {value!r}")
+        return host.lower().rstrip(".")
+    if value.startswith("["):
+        match = re.fullmatch(r"\[([^]]+)\](?::([0-9]+))?", value)
+        if not match or (match[2] and not 0 < int(match[2]) <= 65535):
+            raise ValueError("Invalid bracketed endpoint")
+        ipaddress.IPv6Address(match[1])
+        return match[1]
+    if is_valid_target(value):
+        return value.lower().rstrip(".")
+    if value.count(":") == 1:
+        host, port = value.rsplit(":", 1)
+        if is_valid_target(host) and port.isdigit() and 0 < int(port) <= 65535:
+            return host.lower().rstrip(".")
+    raise ValueError(f"Invalid destination: {value!r}")
+
+
+def _command_destinations(command: str) -> List[str]:
+    from core.command_runner import _has_unquoted_shell_syntax
+
+    if not command or not command.strip():
+        raise ValueError("Empty command")
+    if (_has_unquoted_shell_syntax(command) or "\n" in command or "\r" in command
+            or "$" in command or "`" in command or "\x00" in command):
+        raise ValueError("Shell composition or expansion cannot be scope-checked")
+    argv = shlex.split(command, posix=True)
+    executable, args = argv[0], argv[1:]
+    binary = os.path.basename(executable)
+    if executable != binary and os.path.dirname(executable) not in {
+        "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/opt/homebrew/bin",
+    }:
+        raise ValueError("Executable path is outside trusted tool directories")
+    if binary == "searchsploit":
+        query_found = False
+        for arg in args:
+            if arg.startswith("-"):
+                if arg not in {"--json", "-j", "--title", "-t", "--exact", "-e", "--strict", "-s", "--case", "-c"}:
+                    raise ValueError("Only local SearchSploit query options are supported")
+            elif arg.strip():
+                query_found = True
+        if not query_found:
+            raise ValueError("SearchSploit requires a local query")
+        return []
+    if binary in _LOCAL_ONLY:
+        if binary == "sort" and any(
+            arg.startswith("--") and arg != "--"
+            and "--compress-program".startswith(arg.partition("=")[0]) for arg in args
+        ):
+            raise ValueError("Local sort cannot launch an external compression program")
+        return []
+    if binary == "set" and len(args) == 2 and args[0].upper() in {"RHOST", "RHOSTS", "LHOST", "SRVHOST", "TARGET"}:
+        return [_destination(args[1])]
+    if binary not in _TOOL_OPTIONS:
+        raise ValueError(f"Scope checking unsupported for command: {binary!r}")
+    flags, values = _TOOL_OPTIONS[binary]
+    destinations, positional = [], []
+    i = 0
+    options_done = False
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--" and not options_done:
+            options_done = True
+            continue
+        if not options_done and arg.startswith("-"):
+            option, sep, value = arg.partition("=")
+            if option in flags and not sep:
+                continue
+            host_options = {
+                "curl": {"--url", "--proxy", "-x"},
+                "smbclient": {"-I", "--ip-address", "-L", "--list"},
+                "mysql": {"-h", "--host"}, "redis-cli": {"-h"},
+            }.get(binary, set())
+            if option not in values | host_options:
+                # Common attached nmap port/timing arguments are unambiguous.
+                if binary == "nmap" and re.fullmatch(r"(?:-p(?:-|[0-9,\-]+)|-T[0-5])", arg):
+                    continue
+                raise ValueError(f"Unsupported scope-sensitive option: {arg!r}")
+            if not sep:
+                if i >= len(args):
+                    raise ValueError(f"Missing option value: {option}")
+                value = args[i]
+                i += 1
+            if not value or value.startswith("-"):
+                raise ValueError(f"Invalid option value: {option}")
+            if binary == "nmap":
+                if option == "--script" and value not in _NMAP_SCRIPT_SELECTORS:
+                    if any(name not in _NMAP_SCRIPT_NAMES for name in value.split(",")):
+                        raise ValueError("Unsupported Nmap script selector; custom scripts and expressions are forbidden")
+                if option in _NMAP_TIME_OPTIONS and not re.fullmatch(
+                    r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:ms|s|m|h)?", value
+                ):
+                    raise ValueError(f"Nmap {option} requires a numeric time with optional ms/s/m/h suffix")
+            if option in host_options:
+                if binary == "curl" and option == "--url" and not value.lower().startswith(
+                    ("http://", "https://", "ftp://", "ftps://")
+                ):
+                    raise ValueError("Explicit URL scheme required")
+                destinations.append(_destination(value))
+            if binary == "wget" and option == "--max-redirect" and value != "0":
+                raise ValueError("Redirect following cannot be scope-checked")
+            continue
+        positional.append(arg)
+    if binary in {"curl", "wget"}:
+        for value in positional:
+            if not value.lower().startswith(("http://", "https://", "ftp://", "ftps://")):
+                raise ValueError("Explicit URL scheme required")
+            # curl URL globbing expands into additional, unchecked hosts.
+            authority = value.split("://", 1)[1].split("/", 1)[0]
+            if any(c in authority for c in "{}*,"):
+                raise ValueError("URL destination expansion is unsupported")
+            destinations.append(_destination(value))
+        if binary == "wget":
+            # wget follows redirects by default, unlike curl.
+            if "--max-redirect=0" not in args and not any(
+                args[j:j + 2] == ["--max-redirect", "0"] for j in range(len(args))
+            ):
+                raise ValueError("Scoped wget requires --max-redirect=0")
+    elif binary in {"nc", "ftp"}:
+        if len(positional) not in {1, 2} or (len(positional) == 2 and not re.fullmatch(r"[0-9]+(?:-[0-9]+)?", positional[1])):
+            raise ValueError("Expected destination and optional numeric port")
+        destinations.append(_destination(positional[0]))
+    elif binary in {"mysql", "redis-cli"}:
+        if positional or not destinations:
+            raise ValueError("Explicit host required; command/query bodies are unsupported")
+    else:
+        if binary != "nmap" and len(positional) > 1:
+            raise ValueError("Ambiguous positional destinations")
+        destinations.extend(_destination(value) for value in positional)
+    if not destinations:
+        raise ValueError("No explicit destination found for network command")
+    return sorted(set(destinations))
 
 
 def extract_command_destinations(command: str) -> List[str]:
-    """Return every unique destination host found in *command*."""
-    out = set()
-    for pat in (_MSF_HOST_FLAGS, _URL_HOST_RE, _GENERIC_HOST_FLAG,
-                _FTP_DEST, _SMB_DEST, _PROXY_DEST):
-        for m in pat.finditer(command or ""):
-            host = _strip_port(m.group(1).strip())
-            if host:
-                out.add(host)
-    # CIDR arguments
-    for m in _CIDR_ARG.finditer(command or ""):
-        out.add(m.group(1))
-    return list(out)
+    """Extract supported literal destinations. Invalid/ambiguous syntax raises.
+
+    Use check_command_scope() for authorization, never an empty-list fallback.
+    """
+    return _command_destinations(command) if command and command.strip() else []
 
 
 def check_command_scope(command: str, allowlist_str: Optional[str]) -> Optional[str]:
     """Return None if every destination in *command* is in scope, or a
     human-readable rejection reason if any destination is out of scope.
 
-    Fail-closed: if allowlist_str is set and any extracted host fails
-    is_target_in_scope(), the command is blocked.
+    Configured scope rejects unknown/ambiguous syntax as well as out-of-scope
+    hosts. Only explicitly classified local commands may have no destination.
     """
     if not allowlist_str or not allowlist_str.strip():
         return None  # no allowlist configured, unrestricted
 
-    destinations = extract_command_destinations(command)
+    # Validate the entire configuration even for hostless commands.
+    try:
+        _scope_entries(allowlist_str)
+        destinations = _command_destinations(command)
+    except (ValueError, IndexError) as exc:
+        return f"Cannot safely determine command destinations: {exc}"
     for dest in destinations:
         if not is_target_in_scope(dest, allowlist_str):
             return f"Out-of-scope destination in command: {dest!r}"

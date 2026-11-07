@@ -5,11 +5,18 @@ FastAPI-based orchestrator for AI-driven autonomous red team operations.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import secrets
+import stat
 import sys
+import tempfile
+import threading
+import zipfile
+from pathlib import Path
 from dotenv import load_dotenv, set_key
 load_dotenv()
 from datetime import datetime
@@ -17,7 +24,8 @@ from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, field_validator
 import uvicorn
 
@@ -26,6 +34,9 @@ from core.orchestrator import Orchestrator
 from core.scanner import Scanner
 from core.shell_manager import validate_handler_config
 from core.validators import is_valid_target, is_cidr
+from core.report_export import build_report_snapshot, export_sarif
+from core.assessment import Assessment, AssessmentError, CoverageKey, MAX_BYTES
+from core.artifact_store import ArtifactStore, ArtifactStoreError
 
 # Single source of truth for the version (see _version.py / bump_version.py).
 try:
@@ -436,7 +447,9 @@ async def set_session_full_auto(session_id: str, request: FullAutoRequest):
 @app.get("/api/sessions/{session_id}/events")
 async def get_session_events(session_id: str):
     """Return the append-only lifecycle timeline for a session."""
-    if not orchestrator.get_session(session_id):
+    try:
+        orchestrator.get_session_report(session_id)
+    except ValueError:
         raise HTTPException(status_code=404, detail="Session not found")
     events = orchestrator.get_session_events(session_id)
     return {"session_id": session_id, "events": events, "count": len(events)}
@@ -445,7 +458,9 @@ async def get_session_events(session_id: str):
 @app.get("/api/sessions/{session_id}/jobs")
 async def get_session_jobs(session_id: str):
     """Return durable background jobs and their recovery state."""
-    if not orchestrator.get_session(session_id):
+    try:
+        orchestrator.get_session_report(session_id)
+    except ValueError:
         raise HTTPException(status_code=404, detail="Session not found")
     jobs = orchestrator.get_session_jobs(session_id)
     return {"session_id": session_id, "jobs": jobs, "count": len(jobs)}
@@ -454,7 +469,14 @@ async def get_session_jobs(session_id: str):
 async def delete_session(session_id: str):
     """Delete a specific session and all its associated data."""
     try:
-        result = orchestrator.delete_session(session_id)
+        preparation = await orchestrator.prepare_session_deletion(session_id)
+    except Exception:
+        logger.exception("Session cleanup failed before deletion")
+        raise HTTPException(status_code=503, detail="Session cleanup failed; session data was not deleted") from None
+    if not isinstance(preparation, dict) or preparation.get("status") != "success":
+        raise HTTPException(status_code=409, detail="Session cleanup pending or incomplete; session data was not deleted")
+    try:
+        result = await asyncio.to_thread(_delete_sessions, session_id)
         if result["status"] == "error":
             raise HTTPException(status_code=500, detail=result["message"])
         return result
@@ -466,7 +488,14 @@ async def delete_session(session_id: str):
 async def delete_all_sessions():
     """Delete all sessions and all associated data."""
     try:
-        result = orchestrator.delete_all_sessions()
+        preparation = await orchestrator.prepare_session_deletion(None)
+    except Exception:
+        logger.exception("Session cleanup failed before bulk deletion")
+        raise HTTPException(status_code=503, detail="Session cleanup failed; session data was not deleted") from None
+    if not isinstance(preparation, dict) or preparation.get("status") != "success":
+        raise HTTPException(status_code=409, detail="Session cleanup pending or incomplete; session data was not deleted")
+    try:
+        result = await asyncio.to_thread(_delete_sessions)
         if result["status"] == "error":
             raise HTTPException(status_code=500, detail=result["message"])
         return result
@@ -493,6 +522,269 @@ async def get_pending_commands(session_id: str):
     }
 
 
+@app.get("/api/sessions/{session_id}/report.json")
+async def download_session_report_json(session_id: str):
+    """Versioned, sanitized snapshot; raw commands and credentials are omitted."""
+    try:
+        report = orchestrator.get_session_report(session_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    snapshot = await asyncio.to_thread(build_report_snapshot, report)
+    return JSONResponse(content=snapshot, headers={"Cache-Control": "no-store"})
+
+
+_assessment_lock = threading.RLock()
+_assessment_cache = {}
+
+
+def _delete_sessions(session_id=None):
+    """Serialize deletion and snapshot admission without blocking the event loop."""
+    with _assessment_lock:
+        result = (orchestrator.delete_all_sessions() if session_id is None
+                  else orchestrator.delete_session(session_id))
+        if result["status"] == "success":
+            if session_id is None:
+                _assessment_cache.clear()
+            else:
+                name = hashlib.sha256(session_id.encode()).hexdigest() + ".json"
+                for path in list(_assessment_cache):
+                    if path.name == name:
+                        _assessment_cache.pop(path)
+        return result
+
+
+async def _bounded_json_body(request: Request, limit=MAX_BYTES):
+    """Bound JSON before decoding; no file paths, URLs or reference fetching."""
+    data = bytearray()
+    async for chunk in request.stream():
+        if len(data) + len(chunk) > limit:
+            raise HTTPException(status_code=413, detail="JSON exceeds size limit")
+        data.extend(chunk)
+    try:
+        payload = json.loads(data)
+        if not isinstance(payload, dict):
+            raise ValueError
+        return payload
+    except (ValueError, UnicodeError, RecursionError):
+        raise HTTPException(status_code=400, detail="Expected bounded JSON object") from None
+
+
+def _assessment_snapshot(session_id, payload=None, *, update=False):
+    with _assessment_lock:
+        # Check admission under the deletion lock so a queued import cannot
+        # recreate a snapshot after its active or historical session was deleted.
+        try:
+            orchestrator.get_session_report(session_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Session not found") from None
+        root = Path(os.getenv("KMN_ASSESSMENT_DIR") or Path(orchestrator.db_path).parent / "assessments").absolute()
+        path = root / (hashlib.sha256(session_id.encode()).hexdigest() + ".json")
+        try:
+            if any(parent.is_symlink() for parent in (root, *root.parents)):
+                raise OSError("Unsafe snapshot location")
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if root.stat().st_uid != os.getuid():
+                raise OSError("Unsafe snapshot location")
+            if os.path.lexists(path):
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
+                    raise OSError("Unsafe snapshot file")
+            if payload is not None and not update:
+                if (set(payload) - {"document", "base_url", "roles", "categories"}
+                        or not isinstance(payload.get("document"), dict)
+                        or not isinstance(payload.get("base_url"), str)
+                        or not isinstance(payload.get("categories", ["observation"]), list)):
+                    raise AssessmentError("Invalid inventory import fields")
+                if path.exists():
+                    raise HTTPException(status_code=409, detail="Assessment inventory already exists")
+                assessment = Assessment.from_openapi(
+                    payload["document"], base_url=payload["base_url"],
+                    roles=payload.get("roles"), categories=payload.get("categories", ["observation"]))
+            else:
+                assessment = _assessment_cache.get(path)
+                if assessment is None:
+                    assessment = Assessment.load(path)
+            if update:
+                if (set(payload) - {"endpoint_id", "role", "category", "status", "evidence_ref"}
+                        or not all(isinstance(payload.get(k), str)
+                                   for k in ("endpoint_id", "role", "category", "status"))):
+                    raise AssessmentError("Invalid coverage update fields")
+                key = CoverageKey(payload["endpoint_id"], payload["role"], payload["category"])
+                if payload["status"] == "attempted":
+                    if payload.get("evidence_ref") is not None:
+                        raise AssessmentError("An attempt cannot attach evidence")
+                    assessment.begin_attempt(key)
+                else:
+                    assessment.mark(key, payload["status"], evidence_ref=payload.get("evidence_ref"))
+            if payload is not None:
+                try:
+                    assessment.save(path)
+                except (AssessmentError, OSError):
+                    # Never retain an update that failed to reach durable storage.
+                    _assessment_cache.pop(path, None)
+                    raise
+            _assessment_cache[path] = assessment
+            return JSONResponse({"session_id": session_id, "snapshot": json.loads(assessment.to_json()),
+                                 "summary": assessment.summary()}, headers={"Cache-Control": "no-store"})
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Assessment inventory not found") from None
+        except (AssessmentError, KeyError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid assessment inventory or coverage state") from None
+        except OSError:
+            raise HTTPException(status_code=503, detail="Assessment storage unavailable") from None
+
+
+@app.post("/api/sessions/{session_id}/assessment/import")
+async def import_session_assessment(session_id: str, request: Request):
+    """Import local OpenAPI JSON with explicit base_url and credential references only."""
+    payload = await _bounded_json_body(request)
+    return await asyncio.to_thread(_assessment_snapshot, session_id, payload)
+
+
+@app.get("/api/sessions/{session_id}/assessment")
+async def get_session_assessment(session_id: str):
+    """Return inventory, role/category coverage and summary, without executing tests."""
+    return await asyncio.to_thread(_assessment_snapshot, session_id)
+
+
+@app.patch("/api/sessions/{session_id}/assessment/coverage")
+async def update_session_coverage(session_id: str, request: Request):
+    """Record external attempts/conclusions; verified requires an evidence reference."""
+    payload = await _bounded_json_body(request)
+    return await asyncio.to_thread(_assessment_snapshot, session_id, payload, update=True)
+
+
+def _session_artifacts(session_id):
+    try:
+        orchestrator.get_session_report(session_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Session not found") from None
+    try:
+        store = ArtifactStore(os.getenv("KMN_EVIDENCE_DIR") or Path(orchestrator.db_path).parent / "evidence",
+                              key=os.getenv("KMN_EVIDENCE_KEY") or None)
+        manifests = store.manifests(orchestrator._artifact_session_id(session_id))
+        return store, manifests
+    except (ArtifactStoreError, OSError, ValueError):
+        raise HTTPException(status_code=503, detail="Artifact storage unavailable") from None
+
+
+@app.get("/api/sessions/{session_id}/artifacts")
+def get_session_artifacts(session_id: str):
+    """List manifests only, never raw artifact content or filesystem paths."""
+    _, manifests = _session_artifacts(session_id)
+    return JSONResponse({"session_id": session_id, "artifacts": manifests, "count": len(manifests)},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/sessions/{session_id}/artifacts/{artifact_id}/content")
+def download_artifact_content(session_id: str, artifact_id: str, acknowledge_sensitive: bool = False):
+    """Sensitive raw bytes may contain credentials. Explicit acknowledgement is required."""
+    if not acknowledge_sensitive:
+        raise HTTPException(status_code=400, detail="Raw evidence is sensitive; set acknowledge_sensitive=true")
+    store, manifests = _session_artifacts(session_id)
+    if not any(manifest.get("id") == artifact_id for manifest in manifests):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    try:
+        content = store.read(artifact_id)
+    except (ArtifactStoreError, OSError, ValueError):
+        raise HTTPException(status_code=503, detail="Artifact content unavailable") from None
+    return Response(content, media_type="application/octet-stream", headers={
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": 'attachment; filename="sensitive-evidence.bin"',
+    })
+
+
+@app.post("/api/sessions/{session_id}/vulnerabilities/{finding_id}/verification")
+async def record_finding_verification(session_id: str, finding_id: str, request: Request):
+    """Record explicit operator review, not an automatic source-label verification.
+
+    Required: acknowledge_review=true, result (positive/negative/inconclusive),
+    method (1-200 characters), artifact_refs (1-32 distinct committed artifact IDs).
+    Optional kind defaults to verification; remediation requires applied, and
+    retest accepts positive/negative/inconclusive.
+    Optional evidence is operator prose, at most 4096 characters. The orchestrator
+    resolves the finding target and creates evidence/events from actual artifacts.
+    """
+    payload = await _bounded_json_body(request, limit=16384)
+    refs = payload.get("artifact_refs")
+    kind = payload.get("kind", "verification")
+    if (set(payload) - {"kind", "acknowledge_review", "result", "method", "artifact_refs", "evidence"}
+            or payload.get("acknowledge_review") is not True
+            or not isinstance(kind, str) or kind not in {"verification", "remediation", "retest"}
+            or not isinstance(payload.get("result"), str)
+            or payload["result"] not in ({"applied"} if kind == "remediation" else {"positive", "negative", "inconclusive"})
+            or not isinstance(payload.get("method"), str)
+            or not 1 <= len(payload["method"].strip()) <= 200
+            or len(payload["method"]) > 200
+            or any(ord(char) < 32 or ord(char) == 127 for char in payload["method"])
+            or not isinstance(refs, list) or not 1 <= len(refs) <= 32
+            or any(not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{64}\.[0-9a-f]{32}", ref) for ref in refs)
+            or len(set(refs)) != len(refs)
+            or ("evidence" in payload and (not isinstance(payload["evidence"], str) or len(payload["evidence"]) > 4096))
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", finding_id)):
+        raise HTTPException(status_code=400, detail="Invalid operator verification review")
+    _, manifests = await asyncio.to_thread(_session_artifacts, session_id)
+    if not set(refs).issubset({manifest["id"] for manifest in manifests}):
+        raise HTTPException(status_code=400, detail="Review requires this session's committed artifacts")
+    try:
+        result = await asyncio.to_thread(orchestrator.record_verification, session_id, finding_id, payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Finding not found") from None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid operator verification review") from None
+    except (ArtifactStoreError, OSError):
+        raise HTTPException(status_code=503, detail="Verification storage unavailable") from None
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/sessions/{session_id}/report.sarif")
+async def download_session_report_sarif(session_id: str):
+    """SARIF 2.1.0 using the same sanitized snapshot and verification rules."""
+    try:
+        report = orchestrator.get_session_report(session_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    content = await asyncio.to_thread(lambda: export_sarif(build_report_snapshot(report)))
+    return JSONResponse(content=content, media_type="application/sarif+json",
+                        headers={"Cache-Control": "no-store"})
+
+
+def _temporary_download(generate, data, suffix, media_type, filename=None):
+    """Run in a worker; each request owns its file until response cleanup."""
+    fd, path = tempfile.mkstemp(prefix="kmn_report_", suffix=suffix)
+    os.close(fd)
+    try:
+        generate(data, output_path=path)
+        return FileResponse(path=path, media_type=media_type,
+                            filename=filename or "kmn_report" + suffix,
+                            headers={"Cache-Control": "no-store"},
+                            background=BackgroundTask(os.unlink, path))
+    except BaseException:
+        Path(path).unlink(missing_ok=True)
+        raise
+
+
+async def _download_response(generate, data, suffix, media_type, filename=None):
+    """Retain ownership of generated files even when the route is cancelled."""
+    worker = asyncio.create_task(asyncio.to_thread(
+        _temporary_download, generate, data, suffix, media_type, filename))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # Threads cannot be cancelled. Repeated route cancellation must not orphan
+        # either the worker or its completed response's unserved temporary file.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not worker.cancelled() and worker.exception() is None:
+            Path(worker.result().path).unlink(missing_ok=True)
+        raise
+
+
 @app.get("/api/sessions/{session_id}/report")
 async def download_session_report(session_id: str):
     """Generate and download a DOCX penetration-test report for a session.
@@ -512,21 +804,14 @@ async def download_session_report(session_id: str):
         )
 
     try:
-        import tempfile, os
-        out_dir = tempfile.gettempdir()
-        out_path = os.path.join(out_dir, f"kmn_report_{session_id[:12]}.docx")
-        generate_report(report_data, output_path=out_path)
+        return await _download_response(
+            generate_report, report_data, ".docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            f"kmn_report_{session_id[:12]}.docx",
+        )
     except Exception as e:
         logger.error(f"Report generation failed for session {session_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Report generation failed: {e}")
-
-    filename = f"kmn_report_{session_id[:12]}.docx"
-    return FileResponse(
-        path=out_path,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=filename,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
 
 
 @app.get("/api/sessions/{session_id}/report/pdf")
@@ -544,21 +829,13 @@ async def download_session_report_pdf(session_id: str):
         raise HTTPException(status_code=501, detail=f"PDF generation unavailable: {e}. Install fpdf2.")
 
     try:
-        import tempfile
-        out_dir = tempfile.gettempdir()
-        out_path = os.path.join(out_dir, f"kmn_report_{session_id[:12]}.pdf")
-        generate_pdf_report(report_data, output_path=out_path)
+        return await _download_response(
+            generate_pdf_report, report_data, ".pdf", "application/pdf",
+            f"kmn_report_{session_id[:12]}.pdf",
+        )
     except Exception as e:
         logger.error(f"PDF report generation failed for session {session_id}: {e}")
         raise HTTPException(status_code=500, detail=f"PDF report generation failed: {e}")
-
-    filename = f"kmn_report_{session_id[:12]}.pdf"
-    return FileResponse(
-        path=out_path,
-        media_type="application/pdf",
-        filename=filename,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
 
 
 @app.get("/api/settings/features")
@@ -612,41 +889,39 @@ async def download_session_report_md(session_id: str):
 
     try:
         from core.report_generator import generate_markdown_report
-        import tempfile
-        out_dir = tempfile.gettempdir()
-        out_path = os.path.join(out_dir, f"kmn_report_{session_id[:12]}.md")
-        generate_markdown_report(report_data, output_path=out_path)
+        return await _download_response(
+            generate_markdown_report, report_data, ".md", "text/markdown",
+            f"kmn_report_{session_id[:12]}.md",
+        )
     except Exception as e:
         logger.error(f"Markdown report generation failed for session {session_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Markdown report generation failed: {e}")
 
-    filename = f"kmn_report_{session_id[:12]}.md"
-    return FileResponse(
-        path=out_path,
-        media_type="text/markdown",
-        filename=filename,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
-
 
 @app.get("/api/sessions/{session_id}/archive")
 async def download_session_archive(session_id: str):
-    """Download a portable session bundle containing report, events and jobs."""
+    """Sensitive report/events/jobs/metadata may contain secrets; raw files omitted."""
     try:
-        archive_path = orchestrator.archive_session(session_id)
+        return await _download_response(
+            _metadata_archive, session_id, ".zip", "application/zip",
+            f"kmn_archive_{session_id[:12]}.zip",
+        )
     except ValueError:
         raise HTTPException(status_code=404, detail="Session not found")
     except Exception as exc:
         logger.error(f"Session archive failed for {session_id}: {exc}")
         raise HTTPException(status_code=500, detail=f"Session archive failed: {exc}")
 
-    filename = f"kmn_archive_{session_id[:12]}.zip"
-    return FileResponse(
-        path=archive_path,
-        media_type="application/zip",
-        filename=filename,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+
+def _metadata_archive(session_id, output_path):
+    """Exclude raw files, not secrets in legacy report/events/jobs/manifest metadata."""
+    report = orchestrator.get_session_report(session_id)
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in (("session", report), ("events", orchestrator.get_session_events(session_id)),
+                           ("jobs", orchestrator.get_session_jobs(session_id)),
+                           ("manifest", {"format": 1, "session_id": session_id,
+                                         "artifacts": report.get("artifacts", []), "raw_artifacts": "omitted"})):
+            archive.writestr(name + ".json", json.dumps(data, indent=2, ensure_ascii=True, default=str))
 
 
 @app.get("/api/schedules")

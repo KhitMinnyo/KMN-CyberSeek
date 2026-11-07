@@ -170,9 +170,8 @@ def test_add_vulnerability_nvd_source_defaults_to_potential():
     assert record["status"] == "potential"
 
 
-def test_add_vulnerability_nmap_vuln_script_defaults_to_confirmed():
-    """An nmap NSE vuln-script hit is an actual on-host probe -- unchanged
-    behaviour: it should still default to 'confirmed'."""
+def test_add_vulnerability_source_label_does_not_verify_finding():
+    """A scanner source label without linked evidence cannot confirm a finding."""
     orch = _vuln_orch()
     s = make_session()
     orch.sessions[s.session_id] = s
@@ -181,7 +180,8 @@ def test_add_vulnerability_nmap_vuln_script_defaults_to_confirmed():
         "host": "10.0.0.5", "port": 80, "service": "http",
         "name": "Apache directory traversal", "source_tool": "nmap-vuln-script",
     })
-    assert record["status"] == "confirmed"
+    assert record["status"] == "potential"
+    assert record["verification"]["verified"] is False
 
 
 def test_add_vulnerability_stores_source_command():
@@ -228,7 +228,7 @@ def test_get_session_report_summary_hosts_compromised_and_pending_approval():
 
 # ── Fix: credential "validated" flag ────────────────────────────────────────
 
-def _reuse_execute_setup(orch, s, cred, output, success):
+def _reuse_execute_setup(orch, s, cred, output, success, command="ssh -l admin 10.0.0.5"):
     orch._last_activity = {}
     orch._execution_gate = MagicMock(return_value=None)
     orch._mark_services_in_progress = MagicMock()
@@ -236,33 +236,46 @@ def _reuse_execute_setup(orch, s, cred, output, success):
     orch._inject_credentials = lambda cmd, session, cred=None: cmd
     orch._downsize_wordlists = lambda cmd: cmd
     orch._execute_prepared_command = AsyncMock(return_value={
-        "command_id": "c1", "command": "ssh -l admin 10.0.0.5", "output": output,
+        "command_id": "c1", "command": command, "output": output,
         "error": "", "return_code": 0 if success else 1, "success": success,
     })
     orch._track_task = MagicMock()
 
 
 def test_credential_marked_validated_after_successful_reuse():
-    """A credential that gets injected into a command and produces NO
-    auth-failure signal must be marked validated=True -- the same
-    deterministic success criterion the rotation logic itself already
-    trusts. Before this fix, credentials had no way to distinguish 'scraped
-    from tool output, never re-tested' from 'confirmed working'."""
+    """Positive protocol proof must belong to the credential actually used."""
     orch = make_orch()
     s = make_session(services=[svc(22, "ssh")])
     cred = {"username": "admin", "secret": "pw1", "secret_type": "password",
             "host": "10.0.0.5", "validated": False}
     s.credentials = [cred]
     orch.sessions[s.session_id] = s
-    _reuse_execute_setup(orch, s, cred, "uid=0(root)", success=True)
+    command = "sshpass -p pw1 ssh -l admin 10.0.0.5 id"
+    _reuse_execute_setup(orch, s, cred, "uid=0(root)", success=True, command=command)
 
     marked = []
     orch._mark_credential_validated = lambda sid, c: marked.append((sid, c.get("username")))
 
-    result = _run(orch.execute_command(s.session_id, "ssh -l admin 10.0.0.5"))
+    result = _run(orch.execute_command(s.session_id, command))
 
     assert result["success"] is True
     assert marked == [(s.session_id, "admin")]
+
+
+def test_credential_not_validated_when_successful_command_did_not_use_it():
+    orch = make_orch()
+    session = make_session(services=[svc(22, "ssh")])
+    credential = {"username": "admin", "secret": "pw1", "host": "10.0.0.5"}
+    session.credentials = [credential]
+    orch.sessions[session.session_id] = session
+    _reuse_execute_setup(orch, session, credential, "uid=0(root)", success=True)
+    marked = []
+    orch._mark_credential_validated = lambda *args: marked.append(args)
+
+    result = _run(orch.execute_command(session.session_id, "ssh -l admin 10.0.0.5"))
+
+    assert result["success"] is True
+    assert marked == []
 
 
 def test_credential_not_marked_validated_after_auth_failure():

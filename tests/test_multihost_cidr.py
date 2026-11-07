@@ -82,11 +82,14 @@ def test_host_ip_in_cidr_scope():
     assert not is_target_in_scope("10.10.11.50", "10.10.10.0/24")
 
 
-# 7. check_command_scope (uses flag/URL destinations; bare positional args not extracted)
+# 7. Scope checks parse supported positional targets and reject unknown options.
 def test_nmap_scope_host_in_range():
-    # --host flag is extracted by _GENERIC_HOST_FLAG pattern
-    result = check_command_scope("nmap --host 192.168.1.5 -sV", "192.168.1.0/24")
+    result = check_command_scope("nmap 192.168.1.5 -sV", "192.168.1.0/24")
     assert result is None
+
+
+def test_nmap_unknown_host_option_is_rejected():
+    assert check_command_scope("nmap --host 192.168.1.5 -sV", "192.168.1.0/24") is not None
 
 
 def test_nmap_scope_host_outside_range():
