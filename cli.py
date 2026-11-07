@@ -5,7 +5,8 @@ Starting a session requires --authorization-confirmed. Full autonomy is opt-in.
 
 Exit codes: 0 success, 1 API/transport/local error, 2 invalid arguments,
 3 verified finding threshold, 4 approval required, 5 session failed,
-6 session cancelled, 7 wait timeout, 8 operator input required, 130 interrupted.
+6 session cancelled, 7 wait timeout, 8 operator input required,
+9 incomplete/unknown assessment, 130 interrupted.
 Report JSON/SARIF is sanitized; archives and legacy documents may contain secrets.
 Archives omit raw artifact files, but their report/events/jobs/metadata are NOT sanitized.
 """
@@ -48,7 +49,8 @@ class Client:
     def call(self, path, method="GET", payload=None, binary=False, timeout=None):
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         req = request.Request(self.base_url + path, data=body, method=method,
-                              headers={"X-API-Key": self.token, "Content-Type": "application/json"})
+                              headers={"Authorization": "Bearer " + self.token,
+                                       "X-API-Key": self.token, "Content-Type": "application/json"})
         try:
             with self.opener.open(req, timeout=self.timeout if timeout is None else min(self.timeout, timeout)) as response:
                 data = response.read()
@@ -98,8 +100,10 @@ def session_exit(snapshot, threshold="none"):
         return 5
     if status in {"cancelled", "canceled"}:
         return 6
-    if status in {"completed", "archived"}:
-        return 3 if exceeds_threshold(snapshot, threshold) else 0
+    if status in {"completed", "archived", "closed", "incomplete", "partial", "interrupted", "timed_out"}:
+        if exceeds_threshold(snapshot, threshold):
+            return 3
+        return 0 if (snapshot.get("completeness") or {}).get("verdict") == "complete" else 9
     if snapshot.get("summary", {}).get("pending_approval_count", 0) or status in {"awaiting_approval", "waiting_approval", "pending_approval"}:
         return 4
     if status in {"needs_operator", "paused"}:
@@ -110,7 +114,7 @@ def session_exit(snapshot, threshold="none"):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base-url", default=os.getenv("KMN_API_URL", "http://127.0.0.1:6000"))
-    parser.add_argument("--api-key", default=os.getenv("API_AUTH_TOKEN"), help="API key (prefer API_AUTH_TOKEN environment variable)")
+    parser.add_argument("--api-key", default=os.getenv("API_AUTH_TOKEN"), help="Bearer token (prefer API_AUTH_TOKEN environment variable)")
     parser.add_argument("--timeout", type=_positive, default=30, help="Per-request timeout in seconds (default: 30)")
     commands = parser.add_subparsers(dest="command", required=True)
     start = commands.add_parser("start", help="Start an explicitly authorized assessment; manual approval by default")
@@ -122,6 +126,13 @@ def main(argv=None):
     start.add_argument("--objective")
     start.add_argument("--auto-approve", action="store_true", help="Explicitly allow routine low/medium-risk commands")
     start.add_argument("--full-auto", action="store_true", help="Explicitly enable full autonomy for an isolated authorized lab")
+    preflight = commands.add_parser("preflight", help="Check configuration only; never probe a target or provider")
+    preflight_target = preflight.add_mutually_exclusive_group(required=True)
+    preflight_target.add_argument("target", nargs="?")
+    preflight_target.add_argument("--session-id", help="Read a session's retained preflight instead")
+    preflight.add_argument("--authorization-confirmed", action="store_true",
+                           help="Required for a target: confirm ownership or explicit permission")
+    preflight.add_argument("--scope-allowlist", help="Explicit scope for configuration-only checks")
     verify = commands.add_parser("verify", help="Record explicit operator review of retained evidence; never runs checks")
     verify.add_argument("session_id")
     verify.add_argument("finding_id")
@@ -133,6 +144,14 @@ def main(argv=None):
     verify.add_argument("--method", required=True, help="Review/check method, at most 200 characters")
     verify.add_argument("--artifact-id", action="append", required=True, help="Committed artifact ID; repeat for multiple artifacts")
     verify.add_argument("--evidence", help="Optional operator explanation, at most 4096 characters; may be sensitive")
+    verify.add_argument("--command-id", help="Runtime command ID; requires --attempt-id")
+    verify.add_argument("--attempt-id", help="Runtime attempt ID; requires --command-id")
+    source = commands.add_parser("source-import", help="Import bounded local JSON metadata; never read or fetch source code")
+    source.add_argument("session_id")
+    source.add_argument("file", help="Local source manifest or SARIF JSON file, at most 2 MiB")
+    source.add_argument("--kind", choices=("manifest", "sarif"), default="manifest")
+    for field in ("source-id", "revision", "digest"):
+        source.add_argument("--" + field, help="Required for SARIF metadata")
     evidence = commands.add_parser("evidence", help="List artifact manifests or explicitly download sensitive raw bytes")
     evidence_actions = evidence.add_subparsers(dest="evidence_action", required=True)
     for action in ("list", "download"):
@@ -160,7 +179,8 @@ def main(argv=None):
             sub.add_argument("category")
             sub.add_argument("status", choices=("attempted", "verified", "blocked", "skipped", "inconclusive"))
             sub.add_argument("--evidence-ref")
-    for name in ("status", "events", "jobs", "cancel", "report", "archive", "wait"):
+    for name in ("status", "events", "jobs", "cancel", "report", "archive", "wait",
+                 "completeness", "operations", "usage", "sources", "handoffs"):
         sub = commands.add_parser(name)
         sub.add_argument("session_id")
         if name in {"report", "archive"}:
@@ -169,19 +189,40 @@ def main(argv=None):
             sub.add_argument("--format", choices=("json", "sarif", "md", "pdf", "docx"), default="json",
                              help="JSON/SARIF sanitized; legacy documents may contain secrets")
         if name in {"report", "wait"}:
-            sub.add_argument("--fail-on", choices=("none", "info", "low", "medium", "high", "critical"), default="none",
-                             help="Fail only on verified findings at or above this severity")
+            sub.add_argument("--fail-on", choices=("none", "info", "low", "medium", "high", "critical"),
+                             default="none" if name == "wait" else None,
+                             help="Exit 3 for verified findings at this severity; otherwise 9 unless assessment is complete")
         if name == "wait":
             sub.add_argument("--wait-timeout", type=_positive, default=300)
             sub.add_argument("--poll-interval", type=_positive, default=2)
     args = parser.parse_args(argv)
     if args.command == "verify" and ((args.kind == "remediation") != (args.result == "applied")):
         parser.error("--kind remediation requires --result applied; applied is only valid for remediation")
+    if args.command == "verify" and (args.command_id is not None or args.attempt_id is not None):
+        if not args.command_id or not args.attempt_id:
+            parser.error("--command-id and --attempt-id must be supplied together and nonempty")
+    if args.command == "preflight":
+        if args.target is not None and not args.authorization_confirmed:
+            parser.error("Target preflight requires --authorization-confirmed")
+        if args.session_id is not None and (args.authorization_confirmed or args.scope_allowlist is not None):
+            parser.error("Session preflight does not accept target configuration")
+    if args.command == "source-import":
+        metadata = (args.source_id, args.revision, args.digest)
+        if (args.kind == "sarif" and not all(metadata)) or (args.kind == "manifest" and any(value is not None for value in metadata)):
+            parser.error("--source-id, --revision and --digest are required only for --kind sarif")
     try:
         client = Client(args.base_url, args.api_key, args.timeout)
         code = 0
         binary = False
-        if args.command == "start":
+        if args.command == "preflight":
+            if args.session_id is not None:
+                result = client.call("/api/sessions/" + parse.quote(args.session_id, safe="") + "/preflight")
+            else:
+                payload = {"target": args.target, "authorization_confirmed": True}
+                if args.scope_allowlist is not None:
+                    payload["scope_allowlist"] = args.scope_allowlist
+                result = client.call("/api/preflight", "POST", payload)
+        elif args.command == "start":
             result = client.call("/api/start", "POST", {
                 "ip": args.target, "domain": args.domain, "session_name": args.name,
                 "objective": args.objective, "authorization_confirmed": True,
@@ -199,8 +240,24 @@ def main(argv=None):
                            "artifact_refs": args.artifact_id}
                 if args.evidence is not None:
                     payload["evidence"] = args.evidence
+                if args.command_id is not None:
+                    payload.update(command_id=args.command_id, attempt_id=args.attempt_id)
                 result = client.call(path + "/vulnerabilities/" + parse.quote(args.finding_id, safe="") + "/verification",
                                      "POST", payload)
+            elif args.command == "source-import":
+                with Path(args.file).open("rb") as stream:
+                    raw = stream.read(MAX_INVENTORY_BYTES + 1)
+                if len(raw) > MAX_INVENTORY_BYTES:
+                    raise ClientError("Source metadata file exceeds the 2 MiB limit")
+                document = json.loads(raw)
+                if not isinstance(document, dict):
+                    raise ClientError("Source metadata must be a JSON object")
+                payload = {"kind": args.kind, "document": document}
+                if args.kind == "sarif":
+                    payload.update(source_id=args.source_id, revision=args.revision, digest=args.digest)
+                if len(json.dumps(payload).encode()) > MAX_INVENTORY_BYTES:
+                    raise ClientError("Source metadata request exceeds the 2 MiB limit")
+                result = client.call(path + "/sources/import", "POST", payload)
             elif args.command == "evidence":
                 if args.evidence_action == "list":
                     result = client.call(path + "/artifacts")
@@ -259,7 +316,7 @@ def main(argv=None):
                         if args.command == "wait" and time.monotonic() >= deadline:
                             raise TimeoutError from None
                         raise
-                    outcome = session_exit(result, getattr(args, "fail_on", "none"))
+                    outcome = session_exit(result, getattr(args, "fail_on", None) or "none")
                     if args.command != "wait" or outcome is not None:
                         break
                     time.sleep(min(args.poll_interval, max(0, deadline - time.monotonic())))
@@ -269,7 +326,9 @@ def main(argv=None):
                     code = outcome if outcome is not None else 0
                 else:
                     from core.report_export import exceeds_threshold, export_sarif
-                    code = 3 if exceeds_threshold(result, args.fail_on) else 0
+                    if args.fail_on is not None:
+                        code = (3 if exceeds_threshold(result, args.fail_on) else
+                                0 if (result.get("completeness") or {}).get("verdict") == "complete" else 9)
                     if args.format == "sarif":
                         result = export_sarif(result)
                     elif args.format != "json":
@@ -280,7 +339,8 @@ def main(argv=None):
                         binary = True
             else:
                 binary = args.command == "archive"
-                result = client.call(path + "/" + args.command,
+                suffix = "telemetry/summary" if args.command == "usage" else args.command
+                result = client.call(path + "/" + suffix,
                                      "POST" if args.command == "cancel" else "GET", binary=binary)
         if binary:
             _write_private_output(args.output, result)

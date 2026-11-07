@@ -8,7 +8,15 @@ import json
 import logging
 import os
 import re
+import math
+import time
+from contextlib import contextmanager
+from contextvars import copy_context
 from typing import Dict, List, Optional, Any
+
+from core.model_telemetry import (
+    ModelTelemetryStore, ROLES, current_model_context, model_call_context,
+)
 
 from dotenv import load_dotenv
 # Force reload environment variables to ensure fresh values
@@ -93,7 +101,7 @@ class KMN_AI_Connector:
     
     def __init__(self, provider: str = None, api_key: Optional[str] = None,
                  local_model: Optional[str] = None, ollama_url: Optional[str] = None,
-                 api_model: Optional[str] = None):
+                 api_model: Optional[str] = None, telemetry_store=None):
         """
         Initialize AI connector.
 
@@ -107,6 +115,8 @@ class KMN_AI_Connector:
                 Falls back to OLLAMA_URL env var, then localhost default.
             api_model: DeepSeek API model name, e.g. "deepseek-chat" or "deepseek-coder".
                 Falls back to DEEPSEEK_MODEL env var, then a built-in default.
+            telemetry_store: Optional ModelTelemetryStore injection. Default storage,
+                budgets, and the context API are documented in core.model_telemetry.
         """
         # Load environment variables fresh
         load_dotenv(override=True)
@@ -127,6 +137,8 @@ class KMN_AI_Connector:
                     requested_provider = candidate
                     break
             requested_provider = requested_provider or "local"
+        # Preflight must distinguish the normalized request from any fallback.
+        self.requested_provider = requested_provider
         # Check the provider-specific key; explicit api_key wins.
         self.api_key = api_key or os.getenv(key_env.get(requested_provider, ""), "")
         
@@ -224,11 +236,103 @@ class KMN_AI_Connector:
         except ValueError:
             self.tactical_temperature = 0.2
 
+        self.telemetry_store = telemetry_store if telemetry_store is not None else ModelTelemetryStore()
+        self.model_profiles = self._load_profiles()
+
         logger.info(
             f"Initialized AI connector — provider={self.provider}, "
             f"context_window={self.context_window} tokens, "
             f"max_tokens={self.max_tokens}, tactical_temp={self.tactical_temperature}"
         )
+
+    def _load_profiles(self):
+        """Trusted JSON: role -> {model, max_tokens, temp, reasoning: {effort}}.
+
+        Roles are tactical/strategist/verifier/summary/specialist. All fields are
+        optional; absent profiles retain the selected provider/model and defaults.
+        reasoning.effort supports low/medium/high on OpenAI/OpenRouter only.
+        OpenAI reasoning uses max_completion_tokens and omits temperature;
+        an explicit temp with OpenAI reasoning is rejected.
+        Profiles cannot contain providers, URLs, headers, keys, or arbitrary API
+        options. Invalid/unsupported settings fail rather than falling back.
+        """
+        path = os.getenv("KMN_MODEL_PROFILES_FILE")
+        if path is None:
+            return {}
+        with open(path, encoding="utf-8") as source:
+            profiles = json.load(source)
+        if not isinstance(profiles, dict) or set(profiles) - ROLES:
+            raise ValueError("Invalid model profile roles")
+        for profile in profiles.values():
+            if not isinstance(profile, dict) or set(profile) - {"model", "max_tokens", "temp", "reasoning"}:
+                raise ValueError("Unsupported model profile option")
+            if "model" in profile and (not isinstance(profile["model"], str) or not profile["model"].strip()):
+                raise ValueError("Profile model must be a nonempty string")
+            if "max_tokens" in profile and (type(profile["max_tokens"]) is not int or not 0 < profile["max_tokens"] < 2**31):
+                raise ValueError("Profile max_tokens must be a positive integer")
+            if "temp" in profile and (type(profile["temp"]) not in (float, int) or not math.isfinite(profile["temp"]) or not 0 <= profile["temp"] <= 2):
+                raise ValueError("Profile temp must be between 0 and 2")
+            if "reasoning" in profile:
+                reasoning = profile["reasoning"]
+                if (self.provider not in {"openai", "openrouter"} or not isinstance(reasoning, dict)
+                        or set(reasoning) != {"effort"} or reasoning["effort"] not in ("low", "medium", "high")):
+                    raise ValueError("Unsupported profile reasoning options for provider")
+                if self.provider == "openai" and "temp" in profile:
+                    raise ValueError("OpenAI reasoning profiles do not support temp")
+        return profiles
+
+    def _profile_payload(self, payload, context):
+        profile = self.model_profiles.get(context[1], {})
+        payload["model"] = profile.get("model", payload["model"])
+        if self.provider == "local":
+            options = payload["options"]
+            options["num_predict"] = profile.get("max_tokens", options.get("num_predict", self.max_tokens))
+            options["temperature"] = profile.get("temp", options["temperature"])
+            limit = options["num_predict"]
+        else:
+            payload["max_tokens"] = profile.get("max_tokens", payload["max_tokens"])
+            payload["temperature"] = profile.get("temp", payload["temperature"])
+            limit = payload["max_tokens"]
+            if "reasoning" in profile:
+                if self.provider == "openrouter":
+                    payload["reasoning"] = dict(profile["reasoning"])
+                else:
+                    payload["reasoning_effort"] = profile["reasoning"]["effort"]
+                    payload["max_completion_tokens"] = payload.pop("max_tokens")
+                    payload.pop("temperature", None)
+        if type(limit) is not int or not 0 < limit < 2**31:
+            raise ValueError("Model output limit must be a positive integer")
+
+    @contextmanager
+    def _model_call(self, payload, context, retry_ordinal=1):
+        self._profile_payload(payload, context)
+        # Byte bound plus framing allowance, not the legacy chars/4 heuristic.
+        inputs = {key: payload[key] for key in ("prompt", "system", "messages") if key in payload}
+        estimate = len(json.dumps(inputs, ensure_ascii=False).encode("utf-8")) + 256
+        limit = payload["options"]["num_predict"] if self.provider == "local" else payload.get("max_completion_tokens", payload.get("max_tokens"))
+        event_id = self.telemetry_store.reserve(
+            session_id=context[0], purpose=context[1], operation_id=context[2],
+            retry_ordinal=retry_ordinal, provider=self.provider, model=payload["model"],
+            estimated_input_tokens=estimate, max_tokens=limit,
+        )
+        started = time.perf_counter()
+        metadata = {"parse_result": "not_attempted"}
+        try:
+            yield metadata
+        except BaseException as exc:
+            if isinstance(exc, (httpx.HTTPStatusError, requests.exceptions.HTTPError)):
+                metadata["error"] = "http_error"
+            elif isinstance(exc, (httpx.RequestError, requests.exceptions.RequestException)):
+                metadata["error"] = "transport_error"
+            elif not isinstance(exc, Exception):
+                metadata["error"] = "cancelled"
+            else:
+                metadata["error"] = "response_error"
+            raise
+        finally:
+            if metadata["parse_result"] in {"invalid_json", "validation_error", "truncated"}:
+                metadata["error"] = metadata["parse_result"]
+            self.telemetry_store.finish(event_id, latency_ms=(time.perf_counter() - started) * 1000, **metadata)
 
     # ── Token budget helpers ──────────────────────────────────────────────────
 
@@ -350,30 +454,33 @@ class KMN_AI_Connector:
                 }
             }
 
-            response = requests.post(self.ollama_url, json=payload, timeout=180)
-            response.raise_for_status()
-            
-            result = response.json()
-            response_text = result.get('response', '')
-
-            # Parse JSON response — use robust extractor that handles markdown
-            # fences, preamble text, and thinking tokens before the JSON blob.
-            ai_data = _extract_json(response_text)
-            if ai_data is None:
-                logger.error(
-                    f"Could not extract valid JSON from Ollama response "
-                    f"(model={self.local_model}): {response_text[:500]}"
-                )
-                return None  # Caller (orchestrator) handles None: logs + stops session cleanly
-            try:
-                return AIResponse(**ai_data)
-            except Exception as e:
-                logger.error(f"AIResponse validation failed: {e} | data={ai_data}")
-                return None
+            with self._model_call(payload, current_model_context(session_id)) as call:
+                response = requests.post(self.ollama_url, json=payload, timeout=180)
+                response.raise_for_status()
+                result = response.json()
+                call["result"] = result
+                response_text = result.get('response', '')
+                call["text"] = response_text
+                if result.get("done_reason") == "length":
+                    call["parse_result"] = "truncated"
+                    return None
+                ai_data = _extract_json(response_text)
+                if ai_data is None:
+                    call["parse_result"] = "invalid_json"
+                    logger.error("Could not extract valid JSON from Ollama response")
+                    return None
+                try:
+                    answer = AIResponse(**ai_data)
+                except Exception:
+                    call["parse_result"] = "validation_error"
+                    logger.error("AIResponse validation failed")
+                    return None
+                call["parse_result"] = "success"
+                return answer
                 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Local AI request failed: {e}")
-            raise ConnectionError(f"Failed to connect to local Ollama: {e}")
+        except requests.exceptions.RequestException:
+            logger.error("Local AI request failed")
+            raise ConnectionError("Failed to connect to local Ollama") from None
     
     async def ask_ai_api(self, prompt: str, session_id: Optional[str] = None, memory: Optional[str] = None) -> AIResponse:
         """Query a configured cloud provider using its native API shape."""
@@ -430,6 +537,7 @@ class KMN_AI_Connector:
             # repair pass at temperature 0 with a stricter, more compact-JSON
             # instruction. This turns a transient bad reply (the #1 cause of the
             # loop stalling on a phantom "empty command") into a self-heal.
+            context = current_model_context(session_id)
             async with httpx.AsyncClient(timeout=90.0) as client:
                 for attempt in range(2):
                     temperature = self.tactical_temperature
@@ -456,41 +564,39 @@ class KMN_AI_Connector:
                         if self.provider in {"deepseek", "openai"}:
                             payload["response_format"] = {"type": "json_object"}
 
-                    response = await client.post(
-                        self.api_urls[self.provider], json=payload, headers=headers
-                    )
-                    response.raise_for_status()
-
-                    result = response.json()
-                    if self.provider == "anthropic":
-                        response_text = "".join(
-                            block.get("text", "") for block in result.get("content", [])
-                            if block.get("type") == "text"
+                    with self._model_call(payload, context, attempt + 1) as call:
+                        # Repair remains deterministic even with a role temperature.
+                        if attempt and "temperature" in payload:
+                            payload["temperature"] = 0.0
+                        response = await client.post(
+                            self.api_urls[self.provider], json=payload, headers=headers
                         )
-                        finish_reason = result.get("stop_reason")
-                    else:
-                        choice = result['choices'][0]
-                        response_text = choice['message']['content']
-                        finish_reason = choice.get('finish_reason')
-
-                    # Parse JSON response — robust extractor handles fences/preamble.
-                    ai_data = _extract_json(response_text)
-                    truncated = finish_reason in ("length", "max_tokens")
-
-                    if ai_data is not None and not truncated:
-                        try:
-                            return AIResponse(**ai_data)
-                        except Exception as e:
-                            logger.warning(
-                                f"AIResponse validation failed (attempt {attempt + 1}): "
-                                f"{e} | data={ai_data}"
+                        response.raise_for_status()
+                        result = response.json()
+                        call["result"] = result
+                        if self.provider == "anthropic":
+                            response_text = "".join(
+                                block.get("text", "") for block in result.get("content", [])
+                                if block.get("type") == "text"
                             )
-                    else:
-                        logger.warning(
-                            f"API reply unusable (attempt {attempt + 1}, "
-                            f"finish_reason={finish_reason}, model={self.api_model}): "
-                            f"{response_text[:300]}"
-                        )
+                            finish_reason = result.get("stop_reason")
+                        else:
+                            choice = result['choices'][0]
+                            response_text = choice['message']['content']
+                            finish_reason = choice.get('finish_reason')
+                        call["text"] = response_text
+                        ai_data = _extract_json(response_text)
+                        call["parse_result"] = "invalid_json" if ai_data is None else "success"
+                        if finish_reason in ("length", "max_tokens"):
+                            call["parse_result"] = "truncated"
+                        elif ai_data is not None:
+                            try:
+                                answer = AIResponse(**ai_data)
+                            except Exception:
+                                call["parse_result"] = "validation_error"
+                            else:
+                                return answer
+                        logger.warning("API reply unusable (attempt %s)", attempt + 1)
                     # Fall through to the repair attempt.
 
                 logger.error(
@@ -499,9 +605,9 @@ class KMN_AI_Connector:
                 )
                 return None  # Caller handles None: retry+visible-halt recovery
 
-        except httpx.RequestError as e:
-            logger.error(f"API request failed: {e}")
-            raise ConnectionError(f"Failed to connect to DeepSeek API: {e}")
+        except httpx.RequestError:
+            logger.error("API request failed")
+            raise ConnectionError("Failed to connect to model API") from None
     
     def ask_ai(self, prompt: str, session_id: Optional[str] = None) -> AIResponse:
         """
@@ -542,10 +648,11 @@ class KMN_AI_Connector:
             from concurrent.futures import ThreadPoolExecutor
             
             loop = asyncio.get_running_loop()
+            context = copy_context()
             with ThreadPoolExecutor() as executor:
                 return await loop.run_in_executor(
                     executor,
-                    lambda: self.ask_ai_local(prompt, session_id, memory)
+                    lambda: context.run(self.ask_ai_local, prompt, session_id, memory)
                 )
     
     async def ask_raw_async(self, system_prompt: str, user_prompt: str) -> Optional[Any]:
@@ -569,12 +676,13 @@ class KMN_AI_Connector:
                 from concurrent.futures import ThreadPoolExecutor
 
                 loop = asyncio.get_running_loop()
+                context = copy_context()
                 with ThreadPoolExecutor() as executor:
                     return await loop.run_in_executor(
-                        executor, lambda: self._ask_raw_local(system_prompt, user_prompt)
+                        executor, lambda: context.run(self._ask_raw_local, system_prompt, user_prompt)
                     )
-        except Exception as e:
-            logger.warning(f"ask_raw_async failed (non-fatal): {e}")
+        except Exception:
+            logger.warning("ask_raw_async failed (non-fatal)")
             return None
 
     async def _ask_raw_api(self, system_prompt: str, user_prompt: str) -> Optional[Any]:
@@ -613,19 +721,26 @@ class KMN_AI_Connector:
             }
 
         async with httpx.AsyncClient(timeout=90.0) as client:
-            response = await client.post(
-                self.api_urls[self.provider], json=payload, headers=headers
-            )
-            response.raise_for_status()
-            result = response.json()
-            if self.provider == "anthropic":
-                text = "".join(
-                    block.get("text", "") for block in result.get("content", [])
-                    if block.get("type") == "text"
+            with self._model_call(payload, current_model_context(purpose="specialist")) as call:
+                response = await client.post(
+                    self.api_urls[self.provider], json=payload, headers=headers
                 )
-            else:
-                text = result['choices'][0]['message']['content']
-            return self._extract_json(text)
+                response.raise_for_status()
+                result = response.json()
+                call["result"] = result
+                if self.provider == "anthropic":
+                    text = "".join(
+                        block.get("text", "") for block in result.get("content", [])
+                        if block.get("type") == "text"
+                    )
+                    truncated = result.get("stop_reason") == "max_tokens"
+                else:
+                    text = result['choices'][0]['message']['content']
+                    truncated = result['choices'][0].get('finish_reason') == "length"
+                call["text"] = text
+                answer = self._extract_json(text)
+                call["parse_result"] = "truncated" if truncated else ("success" if answer is not None else "invalid_json")
+                return None if truncated else answer
 
     def _ask_raw_local(self, system_prompt: str, user_prompt: str) -> Optional[Any]:
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
@@ -633,13 +748,21 @@ class KMN_AI_Connector:
             "model": self.local_model,
             "prompt": full_prompt,
             "stream": False,
-            "options": {"temperature": 0.3, "num_ctx": self.context_window},
+            "options": {"temperature": 0.3, "num_ctx": self.context_window, "num_predict": self.max_tokens},
         }
-        response = requests.post(self.ollama_url, json=payload, timeout=60)
-        response.raise_for_status()
-        result = response.json()
-        text = result.get('response', '')
-        return self._extract_json(text)
+        with self._model_call(payload, current_model_context(purpose="specialist")) as call:
+            response = requests.post(self.ollama_url, json=payload, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            call["result"] = result
+            text = result.get('response', '')
+            call["text"] = text
+            if result.get("done_reason") == "length":
+                call["parse_result"] = "truncated"
+                return None
+            answer = self._extract_json(text)
+            call["parse_result"] = "success" if answer is not None else "invalid_json"
+            return answer
 
     @staticmethod
     def _extract_json(text: str) -> Optional[Any]:
@@ -654,7 +777,7 @@ class KMN_AI_Connector:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            logger.warning(f"ask_raw_async: failed to parse JSON from model response: {text[:200]}")
+            logger.warning("ask_raw_async: failed to parse JSON from model response")
             return None
 
 

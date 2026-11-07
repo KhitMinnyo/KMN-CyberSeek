@@ -19,6 +19,8 @@ import re
 import zipfile
 import uuid
 from types import SimpleNamespace
+from datetime import datetime
+from typing import Dict, Optional
 from unittest.mock import AsyncMock
 
 import pytest
@@ -26,6 +28,7 @@ import pytest
 from core.report_export import build_report_snapshot, exceeds_threshold, export_sarif
 from core.assessment import Assessment, AssessmentError, CoverageKey, MAX_BYTES
 from core.artifact_store import ArtifactStore, ArtifactStoreError
+from core.access_control import AccessControl, AccessStore, AccessError
 
 
 def verification_fields():
@@ -40,6 +43,7 @@ def verification_fields():
 def report():
     return {
         "session": {"session_id": "s1", "status": "completed", "target_ip": "192.0.2.1",
+                    "scope_allowlist": "",
                     "api_token": "session-token", "compromise_evidence": [{"proof": "private-proof"}]},
         "summary": {"pending_approval_count": 0},
         "credentials": [{"username": "admin", "secret": "captured-password"}],
@@ -183,9 +187,12 @@ def api(report, monkeypatch, tmp_path):
     from fastapi.responses import FileResponse, JSONResponse, Response
     from fastapi.testclient import TestClient
     from starlette.background import BackgroundTask
+    from pydantic import BaseModel, Field, field_validator
+    from core.validators import is_valid_target
     import logging
 
     app = fastapi.FastAPI()
+    monkeypatch.delenv("KMN_AUTH_PRINCIPALS_FILE", raising=False)
     monkeypatch.setenv("KMN_ASSESSMENT_DIR", str(tmp_path.resolve() / "assessments"))
     monkeypatch.setenv("KMN_EVIDENCE_DIR", str(tmp_path.resolve() / "evidence"))
     monkeypatch.delenv("KMN_EVIDENCE_KEY", raising=False)
@@ -212,19 +219,26 @@ def api(report, monkeypatch, tmp_path):
     ))
     namespace = dict(app=app, asyncio=asyncio, os=os, json=json, tempfile=tempfile, secrets=secrets,
                      Request=fastapi.Request, HTTPException=fastapi.HTTPException,
+                     WebSocket=fastapi.WebSocket, WebSocketDisconnect=fastapi.WebSocketDisconnect,
+                     BaseModel=BaseModel, Field=Field, field_validator=field_validator,
+                     is_valid_target=is_valid_target, Optional=Optional, Dict=Dict, datetime=datetime,
+                     APP_VERSION="test", active_connections={},
+                     ai_connector=SimpleNamespace(provider="none"), scanner=SimpleNamespace(),
                      FileResponse=FileResponse, JSONResponse=JSONResponse, Response=Response, BackgroundTask=BackgroundTask,
-                     Path=Path, hashlib=hashlib, zipfile=zipfile, re=re, stat=stat,
+                     Path=Path, hashlib=hashlib, zipfile=zipfile, re=re, stat=stat, sqlite3=sqlite3,
+                     AccessError=AccessError,
+                     access_control=AccessControl("test-api-key", AccessStore(tmp_path / "access.sqlite3")),
                      Assessment=Assessment, AssessmentError=AssessmentError, CoverageKey=CoverageKey, MAX_BYTES=MAX_BYTES,
                      ArtifactStore=ArtifactStore, ArtifactStoreError=ArtifactStoreError,
                      _assessment_lock=threading.RLock(), _assessment_cache={},
                       orchestrator=SimpleNamespace(get_session_report=get_report, archive_session=archive,
                          prepare_session_deletion=AsyncMock(return_value={"status": "success"}),
                          db_path=str(tmp_path.resolve() / "sessions.db"),
-                         get_session_events=lambda sid: [], get_session_jobs=lambda sid: [],
+                          get_session_events=lambda sid: [], get_session_jobs=lambda sid: [],
                          _artifact_session_id=lambda sid: sid if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", sid)
                          else hashlib.sha256(sid.encode()).hexdigest()),
                      build_report_snapshot=build_report_snapshot, export_sarif=export_sarif,
-                     API_AUTH_TOKEN="test-api-key", _OPEN_PATHS=set(), logger=logging.getLogger(__name__))
+                     logger=logging.getLogger(__name__))
     tree = ast.parse((Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8"))
     names = {"enforce_api_key", "download_session_report_json", "download_session_report_sarif",
              "_temporary_download", "_download_response", "download_session_report", "download_session_report_pdf",
@@ -232,11 +246,22 @@ def api(report, monkeypatch, tmp_path):
              "_bounded_json_body", "_assessment_snapshot", "import_session_assessment", "get_session_assessment",
              "update_session_coverage", "_session_artifacts", "get_session_artifacts", "download_artifact_content",
              "record_finding_verification", "_delete_sessions", "delete_session", "delete_all_sessions",
-             "get_session_events", "get_session_jobs"}
-    nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
+             "get_session_events", "get_session_jobs", "get_pending_commands", "get_identity", "root", "health_check",
+             "TargetRequest", "CommandRequest", "ApprovalRequest", "start_session", "list_sessions",
+             "list_session_history", "get_session", "get_aggregate_stats", "get_vulnerabilities",
+             "list_all_vulnerabilities", "execute_command", "approve_command", "broadcast_message", "websocket_endpoint",
+             "_require_session_report", "evaluate_configuration_preflight", "get_session_completeness",
+             "get_session_preflight", "get_session_operations", "record_session_waiver", "get_session_model_summary",
+             "get_session_model_events", "get_session_sources", "import_session_source", "get_session_handoffs", "run_session_handoff",
+              "_session_handoff", "_run_session_work", "_import_source_snapshot", "_purge_session_access",
+              "_session_evidence_bindings", "_expand_evidence_refs", "_revoke_source_evidence", "_filter_session_evidence_refs"}
+    nodes = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
     assert len(nodes) == len(names)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "main.py", "exec"), namespace)
     with TestClient(app) as client:
+        async def initialize_slots():
+            namespace["_specialist_slots"] = asyncio.Semaphore(1)
+        client.portal.call(initialize_slots)
         yield client, namespace, paths, worker_threads
 
 
@@ -245,9 +270,11 @@ def persisted_api(api, monkeypatch, tmp_path):
     """Real SQLite orchestration and artifact storage, without AI or scanning."""
     pytest.importorskip("dotenv")
     pytest.importorskip("requests")
-    from core.orchestrator import Orchestrator
-
     client, namespace, _, _ = api
+    async def import_orchestrator():
+        from core.orchestrator import Orchestrator
+        return Orchestrator
+    Orchestrator = client.portal.call(import_orchestrator)
     # Importing the connector may load .env; reapply isolated operator paths.
     root = tmp_path.resolve()
     monkeypatch.setenv("DB_PATH", str(root / "persisted.db"))
@@ -256,8 +283,15 @@ def persisted_api(api, monkeypatch, tmp_path):
     monkeypatch.delenv("KMN_EVIDENCE_KEY", raising=False)
     monkeypatch.delenv("MSFRPC_URL", raising=False)
     monkeypatch.setenv("SCOPE_ALLOWLIST", "")
-    instance = Orchestrator(SimpleNamespace(provider="api"), SimpleNamespace(parse_nmap_results=lambda value: []))
+    from core.model_telemetry import ModelTelemetryStore
+    instance = Orchestrator(SimpleNamespace(provider="api", ollama_url="", api_key="",
+                                           telemetry_store=ModelTelemetryStore(root / "ledger.sqlite3")),
+                            SimpleNamespace(parse_nmap_results=lambda value: []))
     namespace["orchestrator"] = instance
+    with namespace["access_control"].store.connect():
+        pass
+    instance.register_evidence_reference_filter(namespace["_filter_session_evidence_refs"])
+    instance.register_session_purge_hook(namespace["_purge_session_access"])
     session_id = instance.create_session("192.0.2.1", session_name="delivery.history", authorization_confirmed=True)
     return client, namespace, instance, session_id
 
@@ -356,12 +390,12 @@ def test_cancelled_download_waits_for_blocked_worker_and_removes_temp_file(api, 
     asyncio.run(cancel_route())
 
 
-def test_assessment_import_update_persistence_and_session_isolation(api):
-    client, namespace, _, _ = api
+def test_assessment_import_update_persistence_and_session_isolation(persisted_api):
+    client, namespace, instance, sid = persisted_api
     headers = {"X-API-Key": "test-api-key"}
-    path = "/api/sessions/historical.named/assessment"
+    path = f"/api/sessions/{sid}/assessment"
     payload = {"document": {"openapi": "3.0.3", "paths": {"/users": {"get": {}}}},
-               "base_url": "https://example.com", "roles": {"reader": "env:READER_TOKEN"},
+               "base_url": "https://192.0.2.1", "roles": {"reader": "env:READER_TOKEN"},
                "categories": ["authorization"]}
     assert client.post(path + "/import", json=payload).status_code == 401
     assert client.get(path).status_code == 401
@@ -379,7 +413,9 @@ def test_assessment_import_update_persistence_and_session_isolation(api):
     assert client.get(path, headers=headers).json()["snapshot"]["coverage"][0]["status"] == "attempted"
     assert client.patch(path + "/coverage", json={**update, "status": "verified"}, headers=headers).status_code == 400
     assert client.get(path, headers=headers).json()["snapshot"]["coverage"][0]["status"] == "attempted"
-    response = client.patch(path + "/coverage", json={**update, "status": "verified", "evidence_ref": "evidence:check"}, headers=headers)
+    assert client.patch(path + "/coverage", json={**update, "status": "verified", "evidence_ref": "evidence:check"}, headers=headers).status_code == 400
+    instance.add_evidence(sid, "manual_observation", {"id": "retained-check", "result": "observed"})
+    response = client.patch(path + "/coverage", json={**update, "status": "verified", "evidence_ref": "evidence:retained-check"}, headers=headers)
     assert response.status_code == 200
     assert response.json()["summary"]["counts"]["verified"] == 1
     namespace["_assessment_cache"].clear()
@@ -387,7 +423,7 @@ def test_assessment_import_update_persistence_and_session_isolation(api):
     assert client.get("/api/sessions/s1/assessment", headers=headers).status_code == 404
     root = Path(os.environ["KMN_ASSESSMENT_DIR"])
     files = list(root.iterdir())
-    assert len(files) == 1 and files[0].name == hashlib.sha256(b"historical.named").hexdigest() + ".json"
+    assert len(files) == 1 and files[0].name == hashlib.sha256(sid.encode()).hexdigest() + ".json"
     assert files[0].stat().st_mode & 0o777 == 0o600
 
 
@@ -495,7 +531,8 @@ def test_verification_requires_auth_and_passes_explicit_review_to_orchestrator(r
     response = client.post(path, json=payload, headers={"X-API-Key": "test-api-key"})
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
-    assert calls == [("s1", "42", payload)]
+    assert calls == [("s1", "42", {**payload, "reviewer": "legacy-service-admin",
+                                  "provenance": {"type": "review_only", "source": "operator_review"}})]
     assert response.json()["verification"]["verified"] is (result == "positive")
 
 
@@ -551,7 +588,8 @@ def test_verification_route_accepts_explicit_lifecycle_kinds(review, kind, resul
     response = client.post("/api/sessions/s1/vulnerabilities/42/verification", json=payload,
                            headers={"X-API-Key": "test-api-key"})
     assert response.status_code == 200
-    assert calls[-1][2] == payload
+    assert calls[-1][2] == {**payload, "reviewer": "legacy-service-admin",
+                           "provenance": {"type": "review_only", "source": "operator_review"}}
 
 
 def test_real_persisted_operator_lifecycle_through_http(persisted_api):

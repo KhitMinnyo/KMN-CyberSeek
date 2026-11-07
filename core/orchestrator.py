@@ -77,7 +77,7 @@ _STOP_INTENT_RE = re.compile(
 
 from ai.connector import KMN_AI_Connector, AIResponse
 from core.scanner import Scanner, classify_os
-from core.memory_index import FindingsIndex
+from core.memory_index import FindingsIndex, PersistentFindingsIndex
 from core.validators import (
     is_valid_target, is_target_in_scope, is_allowlisted_command, is_cidr,
     automation_capability_error, check_command_scope,
@@ -101,9 +101,18 @@ from core.msf_rpc import MsfRpcClient
 from core.observations import prompt_observation, project_untrusted_output
 from core.command_runner import backend_config_from_env, execution_slot, plan_command, plan_execution, run_subprocess
 from core.finding_verification import assess_finding
+from core.preflight import evaluate_preflight
+from core.run_policy import evaluate_completeness, check_identity
 
 logger = logging.getLogger(__name__)
 _EXECUTION_EPOCH = contextvars.ContextVar("orchestrator_execution_epoch", default=None)
+_OPERATION_CONTEXT = contextvars.ContextVar("orchestrator_operation_context", default=None)
+_OPERATIONS_SCHEMA = '''CREATE TABLE IF NOT EXISTS operations (
+    operation_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+    command_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
+    config_revision TEXT NOT NULL, state TEXT NOT NULL,
+    result_json TEXT, updated_at TEXT NOT NULL,
+    UNIQUE(session_id, command_id, attempt_id, config_revision))'''
 
 
 def _serialize_findings(method):
@@ -113,6 +122,25 @@ def _serialize_findings(method):
         with self._finding_mutation_lock():
             return method(self, *args, **kwargs)
     return locked
+
+
+def _guard_operations(method):
+    """Own checkpoints through result persistence and all derived projections."""
+    @wraps(method)
+    async def guarded(self, session_id, *args, **kwargs):
+        operations = []
+        token = _OPERATION_CONTEXT.set((id(self), operations))
+        try:
+            return await method(self, session_id, *args, **kwargs)
+        finally:
+            try:
+                if operations:
+                    self._finalize_operation_boundary(session_id, operations)
+            finally:
+                for operation_id in operations:
+                    self.__dict__.get("_active_operations", set()).discard(operation_id)
+                _OPERATION_CONTEXT.reset(token)
+    return guarded
 
 # How long to wait for a single executed command before killing it (seconds).
 # Configurable since brute-force/full-port-range tools can legitimately run long.
@@ -1142,6 +1170,9 @@ class Orchestrator:
         try:
             conn = self._db_connect()
             cursor = conn.cursor()
+            cursor.execute(_OPERATIONS_SCHEMA)
+            cursor.execute('''CREATE TABLE IF NOT EXISTS completeness_waivers (
+                session_id TEXT NOT NULL, waiver_json TEXT NOT NULL)''')
             
             # Create sessions table
             cursor.execute('''
@@ -1535,6 +1566,253 @@ class Orchestrator:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    def _assessment_snapshot(self, session_id):
+        from pathlib import Path
+        from core.assessment import Assessment, MAX_BYTES
+        if not getattr(self, "db_path", None):
+            return None
+        root = Path(os.getenv("KMN_ASSESSMENT_DIR") or Path(self.db_path).parent / "assessments")
+        path = root / (hashlib.sha256(session_id.encode()).hexdigest() + ".json")
+        if root.is_symlink() or path.is_symlink():
+            raise ValueError("Unsafe assessment snapshot")
+        try:
+            with path.open("rb") as stream:
+                document = stream.read(MAX_BYTES + 1)
+        except FileNotFoundError:
+            return None
+        session = self.sessions.get(session_id) or self._read_session_snapshot(session_id)
+        assessment = Assessment.from_json(document, allowlist=session.scope_allowlist if session else "")
+        return json.loads(assessment.to_json())
+
+    def get_session_completeness(self, session_id: str) -> Dict:
+        """Assessment verdict only, never inferred from objective or lifecycle."""
+        if session_id not in self.sessions and self._read_session_snapshot(session_id) is None:
+            raise ValueError("Session not found")
+        try:
+            snapshot = self._assessment_snapshot(session_id)
+            waivers = []
+            if getattr(self, "db_path", None):
+                with contextlib.closing(self._db_connect()) as conn:
+                    waivers = [json.loads(row[0]) for row in conn.execute(
+                        "SELECT waiver_json FROM completeness_waivers WHERE session_id=? ORDER BY rowid", (session_id,))]
+            evidence_refs = self.get_session_committed_evidence_refs(session_id) if snapshot else []
+            return evaluate_completeness(snapshot, waivers, evidence_refs=evidence_refs)
+        except Exception:
+            result = evaluate_completeness()
+            result["blockers"] = [{"reason": "assessment_state_unavailable"}]
+            return result
+
+    @_serialize_findings
+    def register_evidence_reference_filter(self, callback) -> None:
+        """Register a trusted synchronous filter(session_id, refs) -> list[str].
+
+        Filters run in registration order after committed-evidence validation and
+        may only remove references. They must be thread-safe and consult current
+        source revision/revocation state on every call. Exceptions propagate from
+        the resolver and make completeness unknown. Registration is runtime-only;
+        integrations must register their store filter on every worker startup.
+        """
+        if (not callable(callback) or asyncio.iscoroutinefunction(callback)
+                or asyncio.iscoroutinefunction(getattr(callback, "__call__", None))):
+            raise ValueError("Evidence reference filters must be synchronous callables")
+        filters = self.__dict__.setdefault("_evidence_reference_filters", [])
+        if callback not in filters:
+            filters.append(callback)
+
+    def get_session_committed_evidence_refs(self, session_id: str) -> List[str]:
+        """Resolve coverage references against durable evidence and readable artifacts.
+
+        Returns exact evidence:<id> references belonging to this engagement.
+        Claimed references in a coverage snapshot or live session are not input.
+        Storage/integrity/filter failures propagate so callers cannot accept stale
+        proof. Registered filters can remove, never introduce or revive, evidence.
+        """
+        refs = set()
+        if getattr(self, "db_path", None):
+            store = self._get_artifact_store()
+            artifacts = set()
+            if store is not None:
+                for manifest in store.manifests(self._artifact_session_id(session_id)):
+                    store.read(manifest["id"])
+                    artifacts.add(manifest["id"])
+            refs = {"evidence:" + identity for identity in artifacts}
+            with contextlib.closing(self._db_connect()) as conn:
+                rows = conn.execute("SELECT id,evidence_data FROM evidence WHERE session_id=?", (session_id,)).fetchall()
+            for identity, payload in rows:
+                data = json.loads(payload)
+                if isinstance(data, dict):
+                    linked = data.get("artifact_refs", [])
+                    if not isinstance(linked, list) or any(not isinstance(ref, str) or ref not in artifacts for ref in linked):
+                        continue
+                    for key in ("id", "evidence_id"):
+                        if isinstance(data.get(key), str) and data[key]:
+                            refs.add("evidence:" + data[key])
+                refs.add("evidence:" + str(identity))
+        with self._finding_mutation_lock():
+            filters = tuple(self.__dict__.get("_evidence_reference_filters", ()))
+        for filter_refs in filters:
+            filtered = filter_refs(session_id, sorted(refs))
+            if asyncio.iscoroutine(filtered):
+                filtered.close()
+            if not isinstance(filtered, list) or any(not isinstance(ref, str) for ref in filtered):
+                raise ValueError("Evidence reference filters must return a list of strings")
+            retained = set(filtered)
+            if not retained <= refs:
+                raise ValueError("Evidence reference filters cannot introduce or revive references")
+            refs = retained
+        return sorted(refs)
+
+    @_serialize_findings
+    def record_completeness_waiver(self, session_id: str, data: Dict) -> Dict:
+        """Persist an explicit attributed waiver for one existing coverage cell.
+
+        The authenticated caller supplies endpoint_id, role, category, reviewer,
+        and reason. Timestamp is generated by the server. No implicit waivers.
+        """
+        session = self.sessions.get(session_id) or self._read_session_snapshot(session_id)
+        if not session or not session.authorization_confirmed:
+            raise ValueError("Authorized session required")
+        fields = {"endpoint_id", "role", "category", "reviewer", "reason"}
+        if (not isinstance(data, dict) or set(data) != fields
+                or any(not isinstance(v, str) or not v.strip() or len(v) > 2000
+                       or any(ord(c) < 32 for c in v) for v in data.values())):
+            raise ValueError("An explicit attributed completeness waiver is required")
+        snapshot = self._assessment_snapshot(session_id)
+        if not snapshot or check_identity(data) not in [check_identity(row) for row in snapshot["coverage"]]:
+            raise ValueError("Waiver must identify an existing assessment check")
+        waiver = {**data, "timestamp": datetime.now().isoformat()}
+        with contextlib.closing(self._db_connect()) as conn, conn:
+            conn.execute("INSERT INTO completeness_waivers VALUES (?,?)", (session_id, json.dumps(waiver)))
+        return self.get_session_completeness(session_id)
+
+    def get_session_preflight(self, session_id: str) -> Dict:
+        session = self.sessions.get(session_id) or self._read_session_snapshot(session_id)
+        if not session:
+            raise ValueError("Session not found")
+        return evaluate_preflight(session.target_ip, session.authorization_confirmed,
+                                  session.scope_allowlist, self.ai_connector,
+                                  getattr(self, "scanner", None))
+
+    def _require_preflight(self, session_id):
+        # __new__ reasoning harnesses explicitly replace persistence and inference.
+        # Real instances always have db_path, including failed configuration;
+        # actual dispatch still requires a committed journal in either case.
+        if ("db_path" not in self.__dict__ and callable(self.__dict__.get("_save_session_status"))
+                and not isinstance(self.ai_connector, KMN_AI_Connector)):
+            return True
+        preflight = self.get_session_preflight(session_id)
+        if preflight["ready"]:
+            with contextlib.closing(self._db_connect()) as conn:
+                unresolved = self._unresolved_operations(conn, session_id)
+            if not unresolved:
+                return True
+        session = self.sessions[session_id]
+        session.status = "paused"
+        session.pause_reason = "preflight_blocked" if not preflight["ready"] else "needs_reconciliation"
+        self._save_session_status(session_id, session)
+        return False
+
+    def _prepare_operation(self, session_id, command_id, attempt_id, purpose):
+        """Fail closed before dispatch; single-worker checkpoint, not exactly-once."""
+        session = self.sessions[session_id]
+        config = {"backend": {k: v for k, v in os.environ.items() if k.startswith("KMN_DOCKER_")
+                               or k in {"KMN_EXECUTION_BACKEND", "AUTONOMOUS_SHELL_COMPOSITION", "AUTONOMOUS_RUNTIME_COMMANDS"}},
+                  "scope": session.scope_allowlist, "authorization": session.authorization_confirmed,
+                  "purpose": purpose, "provider": vars(self.ai_connector).get("provider"),
+                  "full_auto": FULL_AUTO_MODE or session.full_auto, "auto_approve": session.auto_approve,
+                  "features": get_feature_flags(), "command_timeout": COMMAND_TIMEOUT,
+                  "model": {key: value for key, value in vars(self.ai_connector).items()
+                            if key in {"local_model", "api_model", "requested_provider"} and isinstance(value, str)}}
+        revision = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+        operation_id = hashlib.sha256(json.dumps([session_id, command_id, attempt_id, revision]).encode()).hexdigest()
+        with contextlib.closing(self._operation_connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            same_command = conn.execute("SELECT 1 FROM operations WHERE session_id=? AND command_id=? "
+                                        "AND state IN ('dispatching','result_committed','needs_reconciliation') LIMIT 1",
+                                        (session_id, command_id)).fetchone()
+            if same_command or self._unresolved_operations(conn, session_id):
+                raise RuntimeError("Session needs reconciliation before dispatch")
+            conn.execute("INSERT INTO operations VALUES (?,?,?,?,?,'prepare',NULL,?)",
+                         (operation_id, session_id, command_id, attempt_id, revision, datetime.now().isoformat()))
+        context = _OPERATION_CONTEXT.get()
+        if context is not None and context[0] == id(self):
+            context[1].append(operation_id)
+            self.__dict__.setdefault("_active_operations", set()).add(operation_id)
+        return operation_id
+
+    def _unresolved_operations(self, conn, session_id):
+        if session_id in self.__dict__.get("_uncertain_sessions", set()):
+            return True
+        active = self.__dict__.get("_active_operations", set())
+        return any(state == "needs_reconciliation" or identity not in active for identity, state in conn.execute(
+            "SELECT operation_id,state FROM operations WHERE session_id=? "
+            "AND state IN ('dispatching','result_committed','needs_reconciliation')", (session_id,)))
+
+    def _finalize_operation_boundary(self, session_id, operations):
+        try:
+            with contextlib.closing(self._operation_connect()) as conn, conn:
+                for operation_id in operations:
+                    state = conn.execute("SELECT state FROM operations WHERE operation_id=?", (operation_id,)).fetchone()
+                    if state and state[0] in {"dispatching", "result_committed", "needs_reconciliation"}:
+                        self.__dict__.setdefault("_uncertain_sessions", set()).add(session_id)
+                        conn.execute("UPDATE operations SET state='needs_reconciliation',updated_at=? WHERE operation_id=?",
+                                     (datetime.now().isoformat(), operation_id))
+                    elif state and state[0] == "prepare":
+                        conn.execute("UPDATE operations SET state='blocked',updated_at=? WHERE operation_id=?",
+                                     (datetime.now().isoformat(), operation_id))
+        except BaseException:
+            # If the failure itself cannot be journaled, still prevent another
+            # dispatch in this worker. The durable unfinished checkpoint survives.
+            self.__dict__.setdefault("_uncertain_sessions", set()).add(session_id)
+            raise
+
+    def _checkpoint_operation(self, operation_id, state, result=None):
+        previous = {"dispatching": "prepare", "result_committed": "dispatching",
+                    "projection_applied": "result_committed", "blocked": "prepare"}
+        with contextlib.closing(self._operation_connect()) as conn, conn:
+            updated = conn.execute("UPDATE operations SET state=?,result_json=COALESCE(?,result_json),updated_at=? "
+                                   "WHERE operation_id=? AND state=?",
+                                   (state, json.dumps(result) if result is not None else None,
+                                    datetime.now().isoformat(), operation_id, previous[state]))
+            if updated.rowcount != 1:
+                raise RuntimeError("Operation checkpoint transition rejected")
+
+    def get_session_operations(self, session_id: str) -> List[Dict]:
+        """Ordered checkpoints; result is retained for explicit reconciliation."""
+        with contextlib.closing(self._operation_connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = [dict(r) for r in conn.execute("SELECT * FROM operations WHERE session_id=? ORDER BY rowid", (session_id,))]
+        for row in rows:
+            row["result"] = json.loads(row.pop("result_json") or "null")
+        return rows
+
+    def _operation_connect(self):
+        if getattr(self, "db_path", None):
+            return self._db_connect()
+        # Explicitly injected persistence adapters (DB-free unit harnesses) get
+        # a real isolated SQLite journal, not a skipped checkpoint. A configured
+        # production database NEVER falls back on failure.
+        if ("db_path" in self.__dict__ or not callable(self.__dict__.get("_save_session_status"))
+                or not any(callable(self.__dict__.get(name)) for name in
+                           ("_save_command_result", "_save_scan_results"))):
+            return self._db_connect()
+        import tempfile
+        with self._finding_mutation_lock():
+            if not hasattr(self, "_injected_operation_store"):
+                self._injected_operation_store = tempfile.TemporaryDirectory(prefix="kmn-operations-")
+            conn = sqlite3.connect(os.path.join(self._injected_operation_store.name, "operations.sqlite"), timeout=30)
+            conn.execute(_OPERATIONS_SCHEMA)
+            conn.commit()
+            return conn
+
+    async def _call_model(self, session_id, purpose, method, *args, **kwargs):
+        try:
+            from core.model_telemetry import model_call_context
+        except ImportError:
+            model_call_context = None
+        with model_call_context(session_id, purpose) if model_call_context else contextlib.nullcontext():
+            return await method(*args, **kwargs)
+
     def _record_event(self, session_id: str, event_type: str,
                       payload: Optional[Dict] = None) -> None:
         """Append a small, JSON-serializable event to the durable timeline."""
@@ -1906,12 +2184,15 @@ class Orchestrator:
         """Get all active sessions."""
         return [session.to_dict() for session in self.sessions.values()]
     
+    @_guard_operations
     async def start_reconnaissance(self, session_id: str):
         """Start initial reconnaissance for a session."""
         session = self.sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
         if session.status in {"cancelled", "completed", "failed", "error"}:
+            return
+        if not self._require_preflight(session_id):
             return
         epoch = self._session_epoch(session_id)
         
@@ -1927,6 +2208,8 @@ class Orchestrator:
 
         try:
             logger.info(f"Starting reconnaissance for session {session_id}")
+            recon_operation = self._prepare_operation(session_id, recon_job_id, str(uuid.uuid4()), "initial_recon")
+            self._checkpoint_operation(recon_operation, "dispatching")
 
             # --- Domain detection: fire passive DNS recon in background --------
             # If the primary target looks like a hostname/domain (not a bare IP
@@ -1987,6 +2270,7 @@ class Orchestrator:
             scan_results = await self.scanner.perform_nmap_scan(scan_target, "default")
             if self._stale_execution(session_id, epoch):
                 return
+            self._checkpoint_operation(recon_operation, "result_committed", scan_results)
             session.scan_results.append(scan_results)
 
             # Save scan results to database
@@ -2018,6 +2302,7 @@ class Orchestrator:
             session.status = "analyzing"
             session.current_stage = "osint" if _do_osint else "enumeration"
             self._save_session_status(session_id, session)
+            self._checkpoint_operation(recon_operation, "projection_applied")
 
             # Auto-trigger threat-intel background research for any service names
             # not yet in the cache. This is the "database gets better over time
@@ -2044,6 +2329,7 @@ class Orchestrator:
             if self._stale_execution(session_id, epoch):
                 return
             logger.error(f"Reconnaissance failed for session {session_id}: {e}")
+            self._finish_running_attempts(session_id, recon_job_id, "failed", str(e))
             self._update_job(recon_job_id, "failed", exit_code=-1, error=str(e))
             session.status = "failed"
             session.current_stage = "error"
@@ -2097,6 +2383,7 @@ class Orchestrator:
             )
             asyncio.create_task(self.run_threat_intel_research(topic))
 
+    @_guard_operations
     async def _run_initial_domain_recon(self, session_id: str, domain: str):
         """Fire-and-forget passive DNS recon for domain targets.
         Runs whois + dig concurrently with the nmap scan.  Results are stored
@@ -2108,27 +2395,33 @@ class Orchestrator:
         if not session:
             return
 
-        async def _run_cmd(args: List[str], timeout: int = 20) -> str:
+        async def _run_cmd(args: List[str], timeout: int = 20) -> Tuple[str, str]:
+            command_id = "domain_recon:" + hashlib.sha256(json.dumps(args).encode()).hexdigest()
+            operation_id = self._prepare_operation(session_id, command_id, str(uuid.uuid4()), "domain_recon")
+            self._checkpoint_operation(operation_id, "dispatching")
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *args,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-                return stdout.decode("utf-8", errors="replace").strip()
+                result = await run_subprocess(args, timeout=timeout)
+                output = result.stdout.decode("utf-8", errors="replace").strip()
             except Exception as exc:
-                return f"[error: {exc}]"
+                self._finish_running_attempts(session_id, command_id, "failed", str(exc))
+                raise
+            self._checkpoint_operation(operation_id, "result_committed", {"output": output, "command": args})
+            return operation_id, output
 
         try:
             # Run all DNS lookups concurrently
-            whois_out, dig_any, dig_ns, dig_mx, dig_txt = await asyncio.gather(
+            observations = await asyncio.gather(
                 _run_cmd(["whois", domain], timeout=30),
                 _run_cmd(["dig", domain, "ANY", "+noall", "+answer"], timeout=15),
                 _run_cmd(["dig", domain, "NS", "+short"], timeout=10),
                 _run_cmd(["dig", domain, "MX", "+short"], timeout=10),
                 _run_cmd(["dig", domain, "TXT", "+short"], timeout=10),
+                return_exceptions=True,
             )
+            for observation in observations:
+                if isinstance(observation, BaseException):
+                    raise observation
+            whois_out, dig_any, dig_ns, dig_mx, dig_txt = [output for _, output in observations]
 
             results = {
                 "domain": domain,
@@ -2150,6 +2443,9 @@ class Orchestrator:
                     session.discovered_subdomains.append(sub)
 
             self.add_evidence(session_id, "domain_recon", results)
+            self._save_session_status(session_id, session)
+            for operation_id, _ in observations:
+                self._checkpoint_operation(operation_id, "projection_applied")
             logger.info(
                 f"Initial domain recon done for {domain}: "
                 f"NS={dig_ns[:60].strip()!r}, "
@@ -2158,6 +2454,8 @@ class Orchestrator:
 
         except Exception as exc:
             logger.warning(f"Initial domain recon failed for {domain}: {exc} (non-fatal)")
+            if isinstance(exc, sqlite3.Error):
+                raise
 
     # ── Attack-surface auto-parsing helpers ─────────────────────────────────
 
@@ -2362,6 +2660,7 @@ class Orchestrator:
             except Exception as e:
                 logger.warning(f"AI-run nmap auto-parse failed (non-fatal): {e}")
 
+    @_guard_operations
     async def _run_vulnerability_analysis(self, session_id: str):
         """Vulnerability analysis pipeline — per-port NSE + searchsploit + NVD + Vulners + threat-intel.
 
@@ -2427,23 +2726,31 @@ class Orchestrator:
 
             async def _scan_vuln_target(host: str, port: int):
                 async with vuln_sem:
+                    operation_id = self._prepare_operation(session_id, _vuln_marker(host, port),
+                                                           str(uuid.uuid4()), "nmap_vulnerability_scan")
+                    self._checkpoint_operation(operation_id, "dispatching")
                     try:
-                        return host, port, await self.scanner.perform_vulnerability_scan_port(
+                        result = await self.scanner.perform_vulnerability_scan_port(
                             host, port
                         )
                     except Exception as exc:
                         logger.warning(
                             f"[{session_id}] NSE scan failed for {host}:{port}: {exc}"
                         )
-                        return host, port, {
+                        result = {
                             "port": port, "success": False,
                             "error": str(exc), "vulnerabilities": [],
                         }
+                    self._checkpoint_operation(operation_id, "result_committed", result)
+                    return host, port, operation_id, result
 
             scan_results = await asyncio.gather(
-                *(_scan_vuln_target(host, port) for host, port in pending_targets)
+                *(_scan_vuln_target(host, port) for host, port in pending_targets), return_exceptions=True
             )
-            for host, port, result in scan_results:
+            for result in scan_results:
+                if isinstance(result, BaseException):
+                    raise result
+            for host, port, operation_id, result in scan_results:
                 marker = _vuln_marker(host, port)
                 # Save marker FIRST (even on failure) to preserve true resume.
                 self._save_scan_results(session_id, marker, {
@@ -2466,6 +2773,7 @@ class Orchestrator:
                         "source_tool": "nmap-vuln-script",
                         "source_command": result.get("command"),
                     })
+                self._checkpoint_operation(operation_id, "projection_applied")
         else:
             logger.info(f"[{session_id}] No open ports — skipping NSE vuln scan")
 
@@ -2845,7 +3153,9 @@ class Orchestrator:
         logger.info(f"Starting AI analysis for {session_id}")
         if session.status in {"cancelled", "completed", "failed", "error"}:
             return
-        
+        if not self._require_preflight(session_id):
+            return
+
         try:
             if safe_only:
                 session._safe_followup_active = False
@@ -2989,7 +3299,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             memory_string = self._build_ai_memory(session_id)
             
             # Get AI decision, passing memory explicitly to format SYSTEM_PROMPT
-            ai_response = await self.ai_connector.ask_ai_async(
+            ai_response = await self._call_model(session_id, "tactical", self.ai_connector.ask_ai_async,
                 self._project_prompt(session, context), session_id,
                 memory=self._project_prompt(session, memory_string))
             if self._stale_execution(session_id, epoch) or session.status == "cancelled":
@@ -3933,7 +4243,13 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
     def _finish_running_attempts(self, session_id: str, command_id: str, status: str, error: str):
         if self._stale_execution(session_id) or not getattr(self, "db_path", None):
             return
-        with contextlib.closing(self._db_connect()) as conn:
+        with contextlib.closing(self._db_connect()) as conn, conn:
+            # Even a failed projection can follow a successful external effect.
+            # Keep its committed result and require an explicit reconciliation.
+            conn.execute("UPDATE operations SET state=CASE WHEN state='prepare' THEN 'blocked' "
+                         "ELSE 'needs_reconciliation' END,updated_at=? WHERE session_id=? AND command_id=? "
+                         "AND state IN ('prepare','dispatching','result_committed')",
+                         (datetime.now().isoformat(), session_id, command_id))
             rows = conn.execute("SELECT record_json FROM commands WHERE session_id=? AND command_id=? AND status IN ('running','cancelled')",
                                 (session_id, command_id)).fetchall()
         for (payload,) in rows:
@@ -3956,6 +4272,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         return project_untrusted_output(text, max_chars)["text"]
     
 
+    @_guard_operations
     async def _execute_prepared_command(
         self, session_id: str, command: str, command_id: str,
         job_id: str, execution_mode: str, session,
@@ -3971,6 +4288,8 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         attempt_id = str(uuid.uuid4())
         attempt_metadata = {"command_id": command_id, "attempt_id": attempt_id,
                             "job_id": job_id, "execution_mode": execution_mode, "status": "running"}
+        operation_id = self._prepare_operation(session_id, command_id, attempt_id, execution_mode)
+        attempt_metadata["operation_id"] = operation_id
         self._save_command_result(session_id, command_id, command, "", "", -1,
                                   success=False, metadata=attempt_metadata)
         final_gate_error = self._execution_gate(
@@ -3984,6 +4303,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             session.status = "ready"
             self._save_command_result(session_id, command_id, command, "", final_gate_error, -1,
                                       success=False, metadata={**attempt_metadata, "status": "blocked"})
+            self._checkpoint_operation(operation_id, "blocked")
             return {
                 "command_id": command_id,
                 "attempt_id": attempt_id,
@@ -4000,6 +4320,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
         except ValueError as exc:
             self._save_command_result(session_id, command_id, command, "", str(exc), -1,
                                       success=False, metadata={**attempt_metadata, "status": "blocked"})
+            self._checkpoint_operation(operation_id, "blocked")
             return {**attempt_metadata, "status": "blocked", "command": command,
                     "output": "", "error": str(exc), "return_code": -1, "success": False}
         command_plan = plan_execution(command, execution_mode, config=backend_config,
@@ -4012,6 +4333,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             session.status = "ready"
             self._save_command_result(session_id, command_id, command, "", command_plan.error, -1,
                                       success=False, metadata={**attempt_metadata, "status": "blocked"})
+            self._checkpoint_operation(operation_id, "blocked")
             return {
                 "command_id": command_id,
                 "attempt_id": attempt_id,
@@ -4072,6 +4394,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
             async def run():
                 nonlocal process, startup, readers
+                self._checkpoint_operation(operation_id, "dispatching")
                 startup = asyncio.create_task(asyncio.create_subprocess_exec(
                     *command_plan.argv, stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -4102,7 +4425,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                     except ProcessLookupError:
                         pass
                 try:
-                    if command_plan.container_name:
+                    if command_plan.container_name and startup is not None:
                         removal = await run_subprocess(
                             [backend_config.docker_binary, "rm", "--force", command_plan.container_name],
                             timeout=10, environment=command_plan.environment)
@@ -4176,6 +4499,7 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
 
         # Log command execution
         command_record = {
+            "operation_id": operation_id,
             "command_id": command_id,
             "attempt_id": attempt_id,
             "job_id": job_id,
@@ -4194,6 +4518,12 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             "success": command_success
         }
 
+        # Commit the authoritative result before publishing any derived projection.
+        self._checkpoint_operation(operation_id, "result_committed", command_record)
+        self._save_command_result(
+            session_id, command_id, command, sanitized_output, sanitized_error,
+            return_code, success=command_success, metadata=command_record,
+        )
         session.commands_executed.append(command_record)
         if len(session.commands_executed) > 500:
             session.commands_executed = session.commands_executed[-500:]
@@ -4202,12 +4532,6 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             "attempt_id": attempt_id,
             "success": command_success, "return_code": return_code,
         })
-
-        # Save sanitized output to database
-        self._save_command_result(
-            session_id, command_id, command, sanitized_output, sanitized_error,
-            return_code, success=command_success, metadata=command_record,
-        )
 
         # Auto-extract any credentials found in this command's output.
         self._extract_and_store_credentials(session_id, command, sanitized_output + "\n" + sanitized_error)
@@ -4234,6 +4558,8 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
             exploit_success=_exploit_success,
         )
         self._recompute_coverage_progress(session)
+        self._save_session_status(session_id, session)
+        self._checkpoint_operation(operation_id, "projection_applied")
 
         # Feed this command's result into the hybrid retrieval index so it can
         # be surfaced later even after it falls out of the recent-history window.
@@ -4242,6 +4568,12 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 f"$ {command}\n{self._extract_command_summary(sanitized_output)}"
             )
             self._index_finding(session_id, finding_text, {
+                "source": "command_result", "command_id": command_id,
+                "attempt_id": attempt_id, "operation_id": operation_id,
+                "artifact_refs": [a["id"] for a in artifacts],
+                "source_id": operation_id,
+                "evidence_ref": "evidence:" + artifacts[0]["id"] if artifacts else None,
+                "digest": artifacts[0].get("sha256") if artifacts else None,
                 "command": command[:200],
                 "stage": session.current_stage,
                 "timestamp": datetime.now().isoformat(),
@@ -4284,7 +4616,9 @@ If Target Domain is provided ({session.target_domain}), ALWAYS use the domain na
                 f"_process_command_output: session {session_id} is {session.status} — halting loop."
             )
             return
-        
+        if not self._require_preflight(session_id):
+            return
+
         try:
             # Auto-parse structured tool output BEFORE building AI memory so the
             # newly discovered subdomains / web apps feed into the AI's next turn.
@@ -4427,7 +4761,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
 """
 
             # Get AI decision for next step, passing memory to AI
-            ai_response = await self.ai_connector.ask_ai_async(
+            ai_response = await self._call_model(session_id, "tactical", self.ai_connector.ask_ai_async,
                 self._project_prompt(session, context), session_id,
                 memory=self._project_prompt(session, memory_string))
             if self._stale_execution(session_id, epoch) or session.status == "cancelled":
@@ -5076,6 +5410,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             conn.close()
         except sqlite3.Error as e:
             logger.error(f"Failed to save scan results to database: {e}")
+            raise
 
     def _scan_already_done(self, session_id: str, scan_type_key: str) -> bool:
         """Return True if this exact scan step has already been recorded.
@@ -5103,7 +5438,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         Called at every stage or status transition so that backend restarts
         always resume from the correct point rather than defaulting back to
         the initial 'reconnaissance'/'initialized' values written at INSERT time.
-        Non-fatal — a failure here is logged but never propagates.
+        Configured persistence failures propagate; a checkpoint must not claim
+        its projection was applied when session persistence failed.
         """
         if self._stale_execution(session_id):
             return
@@ -5138,6 +5474,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 })
         except sqlite3.Error as e:
             logger.warning(f"Failed to persist session status for {session_id}: {e}")
+            if getattr(self, "db_path", None):
+                raise
 
     async def _handle_empty_command(self, session_id: str, source: str) -> None:
         """Recover when the AI returns a valid response but an EMPTY command.
@@ -5324,6 +5662,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             conn.close()
         except sqlite3.Error as e:
             logger.error(f"Failed to save command result to database: {e}")
+            raise
     
     def add_evidence(self, session_id: str, evidence_type: str, evidence_data: Dict):
         """Add evidence to session."""
@@ -5353,6 +5692,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             conn.close()
         except sqlite3.Error as e:
             logger.error(f"Failed to save evidence to database: {e}")
+            if getattr(self, "db_path", None):
+                raise
         
         logger.info(f"Evidence added to session {session_id}: {evidence_type}")
 
@@ -5525,6 +5866,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             conn.close()
         except sqlite3.Error as e:
             logger.error(f"Failed to save vulnerability to database: {e}")
+            if getattr(self, "db_path", None):
+                raise
 
     @_serialize_findings
     def get_vulnerabilities(self, session_id: str) -> List[Dict]:
@@ -5550,7 +5893,7 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             raise ValueError("Session not found")
         if not session.authorization_confirmed:
             raise ValueError("Session authorization is not confirmed")
-        allowed = {"kind", "result", "target", "method", "artifact_refs", "command_id", "attempt_id", "reviewer", "note", "acknowledge_review", "evidence"}
+        allowed = {"kind", "result", "target", "method", "artifact_refs", "command_id", "attempt_id", "reviewer", "note", "acknowledge_review", "evidence", "provenance"}
         if not isinstance(verification_data, dict) or set(verification_data) - allowed:
             raise ValueError("Invalid verification fields")
         if "acknowledge_review" in verification_data and verification_data["acknowledge_review"] is not True:
@@ -5599,6 +5942,17 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         if any(ref not in manifests for ref in refs):
             raise ValueError("Artifact references must belong to this session")
         command_id, attempt_id = verification_data.get("command_id"), verification_data.get("attempt_id")
+        provenance = verification_data.get("provenance")
+        if result == "positive":
+            if command_id or attempt_id:
+                if not command_id or not attempt_id:
+                    raise ValueError("Positive runtime review requires command and attempt binding")
+                provenance = {"type": "runtime", "source": "command_result"}
+            elif (not isinstance(provenance, dict) or set(provenance) != {"type", "source"}
+                  or provenance.get("type") != "review_only"
+                  or provenance.get("source") not in {"operator_review", "source_review"}
+                  or not verification_data.get("reviewer", "").strip()):
+                raise ValueError("Positive review requires command/attempt binding or attributed review_only provenance")
         if command_id is not None or attempt_id is not None:
             snapshot = self._read_session_snapshot(session_id)
             commands = session.commands_executed + (snapshot.commands_executed if snapshot else [])
@@ -5618,11 +5972,15 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         now = datetime.now().isoformat()
         evidence = {"id": evidence_id, "target": target, "method": method, "result": result,
                     "artifact_refs": list(refs), "timestamp": now}
+        if provenance is not None:
+            evidence["provenance"] = copy.deepcopy(provenance)
         evidence.update({k: verification_data[k] for k in ("command_id", "attempt_id", "reviewer", "note") if k in verification_data})
         if "evidence" in verification_data:
             evidence["note"] = verification_data["evidence"]
         event = {"id": event_id, "kind": kind, "target": target, "method": method,
                  "result": result, "evidence_refs": [evidence_id], "timestamp": now}
+        if provenance is not None:
+            event["provenance"] = copy.deepcopy(provenance)
         record.setdefault("evidence", []).append(evidence)
         record.setdefault("verification_events", []).append(event)
         assessment = assess_finding(record)
@@ -6075,6 +6433,32 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             "channel": "managed_shell",
         }
 
+    def register_rpc_shell_binding(self, session_id: str, handler_id: str, msf_id: int, target_ip: str) -> None:
+        """Trusted RPC monitor registration, never a request/model-supplied grant.
+
+        Bind only after the server has attributed the RPC session to this
+        engagement. Handler-process session logs have a different ID namespace
+        and cannot authorize global RPC. Reconnects require fresh registration.
+        """
+        session = self.sessions.get(session_id)
+        rpc = getattr(self, "_msf_rpc", None)
+        if (not session or not session.authorization_confirmed or rpc is None
+                or session.status in {"cancelled", "completed", "failed", "error"}
+                or not isinstance(handler_id, str) or not handler_id
+                or type(msf_id) is not int or msf_id <= 0
+                or not isinstance(target_ip, str) or not is_valid_target(target_ip)
+                or not self._host_in_session_scope(session, target_ip)):
+            raise ValueError("Invalid server-owned RPC shell binding")
+        self.__dict__.setdefault("_rpc_shell_bindings", {})[msf_id] = (session_id, handler_id, target_ip, rpc)
+
+    def unregister_rpc_shell_binding(self, session_id: str, handler_id: str, msf_id: int) -> None:
+        """Revoke a monitor-owned binding on closure; do not revoke a reused ID."""
+        bindings = self.__dict__.get("_rpc_shell_bindings", {})
+        binding = bindings.get(msf_id)
+        if binding and binding[:2] == (session_id, handler_id):
+            bindings.pop(msf_id)
+
+    @_guard_operations
     async def run_shell_command(self, session_id: str, handler_id: str,
                                 msf_id: int, command: str,
                                 trigger_analysis: bool = False, command_id: Optional[str] = None) -> str:
@@ -6092,13 +6476,31 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             char in command for char in ("\r", "\n", "\x03")
         ):
             raise ValueError("Invalid shell command")
+        if not isinstance(handler_id, str) or not handler_id or type(msf_id) is not int or msf_id <= 0:
+            raise ValueError("Invalid managed-shell identity")
+        mgr = self._shell_managers.get(session_id)
+        if mgr is not None:
+            handler = mgr.get_handler(handler_id)
+            shell = handler.get_session(msf_id) if handler is not None else None
+            if shell is None or shell.msf_id != msf_id or shell.status != "open":
+                raise ValueError("Shell is not bound to this engagement and handler")
+            target_ip = shell.target_ip
+        else:
+            rpc = getattr(self, "_msf_rpc", None)
+            binding = self.__dict__.get("_rpc_shell_bindings", {}).get(msf_id)
+            if not binding or binding[0] != session_id or binding[1] != handler_id or binding[3] is not rpc:
+                raise ValueError("Shell is not bound to this engagement and handler")
+            target_ip = binding[2]
+        if not isinstance(target_ip, str) or not is_valid_target(target_ip) or not self._host_in_session_scope(session, target_ip):
+            raise ValueError("Bound shell target is outside the engagement scope")
         command_id = command_id or str(uuid.uuid4())
         attempt_id = str(uuid.uuid4())
         epoch = self._session_epoch(session_id)
+        operation_id = self._prepare_operation(session_id, command_id, attempt_id, "managed_shell")
         self._save_command_result(session_id, command_id, command, "", "", -1, success=False,
                                   metadata={"attempt_id": attempt_id, "status": "running",
+                                            "operation_id": operation_id,
                                             "channel": "managed_shell", "handler_id": handler_id, "msf_id": msf_id})
-        mgr = self._shell_managers.get(session_id)
         if not hasattr(self, "_execution_tasks"):
             self._execution_tasks = {}
         owned_task = asyncio.current_task()
@@ -6110,13 +6512,11 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             "handler_id": handler_id, "msf_id": msf_id, "command": command[:300],
         })
         try:
-            if mgr:
+            self._checkpoint_operation(operation_id, "dispatching")
+            if mgr is not None:
                 output = await mgr.run_command(handler_id, msf_id, command)
             else:
                 rpc = getattr(self, "_msf_rpc", None)
-                if rpc is None:
-                    self._finish_running_attempts(session_id, command_id, "blocked", "No shell manager")
-                    return "[No shell manager for this session]"
                 rpc_result = await rpc.run_session_command(msf_id, command)
                 output = str(rpc_result.get("data") or rpc_result.get("result")
                              or rpc_result.get("response") or rpc_result)
@@ -6128,7 +6528,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 self._save_session_status(session_id, session)
             raise
         except Exception as exc:
-            output = f"[Error: Managed-shell command failed: {exc}]"
+            self._finish_running_attempts(session_id, command_id, "failed", str(exc))
+            raise
         finally:
             owned_tasks.discard(owned_task)
             _EXECUTION_EPOCH.reset(token)
@@ -6140,10 +6541,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
         success = not (output or "").lstrip().startswith(
             ("[Error:", "[No output captured")
         )
-        handler = mgr.get_handler(handler_id) if mgr else None
-        shell = handler.get_session(msf_id) if handler else None
-        target_ip = shell.target_ip if shell else session.target_ip
         record = {
+            "operation_id": operation_id,
             "command_id": command_id,
             "attempt_id": attempt_id,
             "command": command,
@@ -6157,13 +6556,13 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             "msf_id": msf_id,
             "target_ip": target_ip,
         }
+        self._checkpoint_operation(operation_id, "result_committed", record)
+        self._save_command_result(session_id, command_id, command, record["output"], record["error"],
+                                  record["return_code"], success=success, metadata=record)
         session.commands_executed.append(record)
         self._touch_activity(session_id)
         if len(session.commands_executed) > 500:
             session.commands_executed = session.commands_executed[-500:]
-        self._save_command_result(session_id, command_id, command, record["output"], record["error"],
-                                  record["return_code"], success=success, metadata=record)
-
         if success:
             self._extract_and_store_credentials(session_id, command, output or "")
             self._update_target_fingerprint_from_output(session, command, output or "")
@@ -6176,6 +6575,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             "command_id": command_id, "handler_id": handler_id, "msf_id": msf_id,
             "success": success,
         })
+        self._save_session_status(session_id, session)
+        self._checkpoint_operation(operation_id, "projection_applied")
         if trigger_analysis and session.status != "cancelled":
             session.status = "ready"
             await self._process_command_output(
@@ -6911,9 +7312,10 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                     auto_approve=False,
                     authorization_confirmed=True   # operator set this up → implicit auth
                 )
-                self._track_task(
-                    session_id, self.start_reconnaissance(session_id), "scheduled_recon"
-                )
+                if self._require_preflight(session_id):
+                    self._track_task(
+                        session_id, self.start_reconnaissance(session_id), "scheduled_recon"
+                    )
                 logger.info(
                     f"Scheduled scan #{scan_id} fired → session {session_id} "
                     f"for {target_ip}"
@@ -7288,6 +7690,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             conn = self._db_connect()
             cursor = conn.cursor()
 
+            cursor.execute("UPDATE operations SET state='needs_reconciliation',updated_at=? "
+                           "WHERE state IN ('prepare','dispatching','result_committed')", (datetime.now().isoformat(),))
             # No asyncio task survives a process restart. Marking these jobs
             # interrupted makes the recovery state explicit and replayable.
             cursor.execute(
@@ -7568,22 +7972,6 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 for pending_row in pending_rows:
                     command_id, command_text, status, risk_level, channel, handler_id, msf_id, timestamp = pending_row
                     normalized_risk = _command_risk_level(command_text, risk_level)
-                    # A command queued by an older policy may now be medium-tier
-                    # (curl/MSF). Do not leave an already-authorized autonomous
-                    # session blocked on a stale approval record after restart.
-                    if (status == "pending" and normalized_risk == "medium"
-                            and (FULL_AUTO_MODE or session.full_auto or bool(session.auto_approve))):
-                        status = "approved"
-                        self._commands_to_auto_resume.append(
-                            (session_id, command_id, command_text)
-                        )
-                        try:
-                            cursor.execute(
-                                "UPDATE commands SET status='approved' WHERE command_id=?",
-                                (command_id,),
-                            )
-                        except sqlite3.Error:
-                            pass
                     self.pending_commands[command_id] = {
                         "session_id": session_id,
                         "command": command_text,
@@ -7614,10 +8002,17 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
                 # initialized → nothing to resume (never got started).
                 waiting_for_approval = any(
                     item.get("session_id") == session_id
-                    and item.get("status") == "pending"
+                    and item.get("status") in {"pending", "approved"}
                     for item in self.pending_commands.values()
                 )
-                if status in ("scanning", "analyzing", "executing", "ready") and not waiting_for_approval:
+                unresolved = cursor.execute("SELECT 1 FROM operations WHERE session_id=? AND state='needs_reconciliation' "
+                                            "UNION ALL SELECT 1 FROM jobs WHERE session_id=? AND status='interrupted' "
+                                            "AND job_type IN ('command','initial_recon') LIMIT 1", (session_id, session_id)).fetchone()
+                if unresolved:
+                    session.status = "paused"
+                    session.pause_reason = "needs_reconciliation"
+                    cursor.execute("UPDATE sessions SET status='paused',pause_reason='needs_reconciliation' WHERE session_id=?", (session_id,))
+                if session.status in ("scanning", "analyzing", "executing", "ready") and not waiting_for_approval and not unresolved:
                     has_scan_data = bool(session.scan_results or session.discovered_hosts)
                     self._sessions_to_auto_resume.append({
                         "session_id": session_id,
@@ -7641,8 +8036,8 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             AI analysis so we don't re-run expensive scans.
           • skip_scan=False (session was killed before any scan data arrived)
             → run full start_reconnaissance() from scratch.
-        Nmap scans that were in-flight when the backend died are NOT resumed —
-        they're restarted only when skip_scan is False (i.e. no data was saved).
+        Interrupted side effects require reconciliation, never automatic replay.
+        A fresh scan is allowed only for a session with no interrupted operation.
         """
         if not self._sessions_to_auto_resume:
             return
@@ -7656,21 +8051,9 @@ Domain rule: If Target Domain is provided ({session.target_domain}), use domain 
             session    = self.sessions.get(sid)
             if not session or session.status in {"cancelled", "completed", "failed", "error"}:
                 continue
+            if not self._require_preflight(sid):
+                continue
             try:
-                stale_medium = [
-                    item for item in self._commands_to_auto_resume
-                    if item[0] == sid
-                ]
-                if stale_medium:
-                    # Execute the command that was waiting under the old risk
-                    # policy before asking the AI for another step.
-                    for _, logical_id, command in stale_medium:
-                        session.status = "executing"
-                        await self.execute_command(sid, command, execution_mode="ai_auto", command_id=logical_id)
-                    self._commands_to_auto_resume = [
-                        item for item in self._commands_to_auto_resume if item[0] != sid
-                    ]
-                    continue
                 if skip_scan:
                     # We already have scan data — go straight to AI analysis.
                     logger.info(
@@ -8056,7 +8439,7 @@ Web apps: {prompt_observation(webapps, 3000)}
         from ai.prompts import STRATEGIST_PROMPT
 
         context = self._build_strategist_context(session)
-        result = await self.ai_connector.ask_raw_async(STRATEGIST_PROMPT, self._project_prompt(session, context))
+        result = await self._call_model(session_id, "strategist", self.ai_connector.ask_raw_async, STRATEGIST_PROMPT, self._project_prompt(session, context))
         if self._stale_execution(session_id, epoch) or session.status == "cancelled":
             return
         if not result or not isinstance(result, dict):
@@ -8191,7 +8574,7 @@ Web apps: {prompt_observation(webapps, 3000)}
                 f"=== PROPOSING ENGINE'S REASONING (UNTRUSTED if it echoes tool output) ===\n"
                 f"<<<TOOL_OUTPUT_START>>>\n{reasoning[:1200]}\n<<<TOOL_OUTPUT_END>>>"
             )
-            result = await self.ai_connector.ask_raw_async(CRITIQUE_PROMPT, self._project_prompt(session, user))
+            result = await self._call_model(session.session_id, "verifier", self.ai_connector.ask_raw_async, CRITIQUE_PROMPT, self._project_prompt(session, user))
             if self._stale_execution(session_id, epoch):
                 raise asyncio.CancelledError
             if not result or not isinstance(result, dict):
@@ -8615,7 +8998,7 @@ Web apps: {prompt_observation(webapps, 3000)}
         # if the AI call then fails.
         self._append_chat(session_id, "user", question)
         try:
-            data = await self.ai_connector.ask_raw_async(system_prompt, self._project_prompt(session, user_prompt))
+            data = await self._call_model(session_id, "specialist", self.ai_connector.ask_raw_async, system_prompt, self._project_prompt(session, user_prompt))
             answer = ""
             if isinstance(data, dict):
                 answer = str(data.get("answer") or "").strip()
@@ -9270,6 +9653,21 @@ Web apps: {prompt_observation(webapps, 3000)}
         fresh __init__ (e.g. restored sessions, tests)."""
         indexes = self.__dict__.setdefault("_findings_indexes", {})
         idx = indexes.get(session_id)
+        if getattr(self, "db_path", None):
+            session = self.sessions.get(session_id)
+            credentials = [c.get("secret", "") for c in session.credentials] if session else []
+            credentials.append(vars(self.ai_connector).get("api_key") or "")
+            revision = hashlib.sha256(json.dumps(credentials).encode()).hexdigest()
+            revisions = self.__dict__.setdefault("_findings_index_revisions", {})
+            if idx is None or revisions.get(session_id) != revision:
+                if isinstance(idx, PersistentFindingsIndex):
+                    idx.close()
+                idx = PersistentFindingsIndex(self.db_path, session_id,
+                    provider=self.ai_connector.provider, ollama_url=self.ai_connector.ollama_url,
+                    credentials=credentials)
+                indexes[session_id] = idx
+                revisions[session_id] = revision
+            return idx
         if idx is None:
             idx = FindingsIndex(connector=self.ai_connector)
             indexes[session_id] = idx
@@ -9717,6 +10115,15 @@ Web apps: {prompt_observation(webapps, 3000)}
             }
         }
         report = copy.deepcopy(report)
+        completeness = self.get_session_completeness(session_id)
+        report["completeness"] = completeness
+        report["session"]["assessment_completeness"] = completeness
+        report["summary"]["assessment_complete"] = completeness["verdict"] == "complete"
+        report["summary"]["assessment_verdict"] = completeness["verdict"]
+        report["summary"]["assessment_partial"] = completeness["verdict"] != "complete"
+        report["summary"]["terminal_assessment_incomplete"] = (
+            session.status in {"completed", "cancelled", "failed", "error"}
+            and completeness["verdict"] != "complete")
         for finding in report["vulnerabilities"]:
             finding["verification"] = assess_finding(finding)
             finding.update({k: finding["verification"][k] for k in
@@ -9854,6 +10261,21 @@ Web apps: {prompt_observation(webapps, 3000)}
                 "message": "Runtime cleanup incomplete; data retained" if failures else "Runtime cleanup complete; data not deleted"}
 
     @_serialize_findings
+    def register_session_purge_hook(self, callback) -> None:
+        """Register an idempotent synchronous purge(session_id) integration hook.
+
+        Called after runtime owners stop, before core records are removed, under
+        the finding/deletion lock. Hooks may run in a worker thread: use the
+        external store's own lock and connection, not an event-loop-owned SQLite
+        connection. A failure prevents deletion success and must be retryable.
+        """
+        if not callable(callback) or asyncio.iscoroutinefunction(callback):
+            raise ValueError("Session purge hooks must be synchronous callables")
+        hooks = self.__dict__.setdefault("_session_purge_hooks", [])
+        if callback not in hooks:
+            hooks.append(callback)
+
+    @_serialize_findings
     def delete_session(self, session_id: str) -> Dict:
         """Delete only after owned runtime cleanup; a synchronous caller may retry."""
         try:
@@ -9885,17 +10307,38 @@ Web apps: {prompt_observation(webapps, 3000)}
                     tunnel.terminate()
                     tunnel.wait(timeout=5)
                 self._callback_tunnels.pop(session_id, None)
+            # Use the connector's exact configured store, including explicit
+            # injections. Do not reconstruct a different ledger from environment.
+            telemetry = vars(self.ai_connector).get("telemetry_store")
+            if telemetry is not None:
+                telemetry.purge_session(session_id)
+            for purge in tuple(self.__dict__.get("_session_purge_hooks", ())):
+                result = purge(session_id)
+                import inspect
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise TypeError("Session purge hooks must complete synchronously")
             self._purge_session_files(session_id)
+            index = self._get_findings_index(session_id)
+            if isinstance(index, PersistentFindingsIndex):
+                index.purge_session()
             with contextlib.closing(self._db_connect()) as conn, conn:
                 for table in ("scan_results", "commands", "evidence", "vulnerabilities", "credentials", "ai_decisions",
                               "shell_sessions_log", "shell_handlers", "chat_messages", "session_events", "jobs",
-                              "artifacts", "asset_edges", "asset_nodes"):
+                              "artifacts", "asset_edges", "asset_nodes", "operations", "completeness_waivers"):
                     conn.execute(f"DELETE FROM {table} WHERE session_id=?", (session_id,))
                 conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
+            if isinstance(index, PersistentFindingsIndex):
+                index.close()
             self.sessions.pop(session_id, None)
             for registry in ("_background_tasks", "_execution_tasks", "_shell_managers", "_brute_workers", "_deletion_cleanups",
-                             "_findings_indexes", "_last_activity", "_watchdog_nudges"):
+                             "_findings_indexes", "_findings_index_revisions", "_last_activity", "_watchdog_nudges"):
                 getattr(self, registry, {}).pop(session_id, None)
+            self.__dict__.get("_uncertain_sessions", set()).discard(session_id)
+            for identity, binding in list(self.__dict__.get("_rpc_shell_bindings", {}).items()):
+                if binding[0] == session_id:
+                    self._rpc_shell_bindings.pop(identity, None)
             if hasattr(self, "_sessions_to_auto_resume"):
                 self._sessions_to_auto_resume = [entry for entry in self._sessions_to_auto_resume if entry["session_id"] != session_id]
             if hasattr(self, "_commands_to_auto_resume"):

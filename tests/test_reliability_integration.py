@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import zipfile
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, MagicMock
 
@@ -518,6 +519,725 @@ def capture_review(orch, session_id=None, data=b"Operator review evidence"):
         return capture.finalize()
 
 
+def review_payload(artifact):
+    return {"result": "positive", "artifact_refs": [artifact["id"]], "reviewer": "test-operator",
+            "provenance": {"type": "review_only", "source": "operator_review"}}
+
+
+def assessment_snapshot(orch, tmp_path, status="blocked", evidence_ref=None):
+    from core.assessment import Assessment, CoverageKey
+    assessment = Assessment.from_openapi({"openapi": "3.0.0", "servers": [{"url": "http://127.0.0.1"}],
+        "paths": {"/": {"get": {}}}}, categories=["headers"])
+    endpoint = assessment.endpoints[0]
+    key = CoverageKey(endpoint.id, "anonymous", "headers")
+    if status == "verified":
+        assessment.begin_attempt(key)
+    assessment.mark(key, status, evidence_ref=evidence_ref)
+    root = tmp_path / "assessments"
+    root.mkdir(exist_ok=True)
+    assessment.save(root / (hashlib.sha256(sid(orch).encode()).hexdigest() + ".json"))
+    return {"endpoint_id": endpoint.id, "role": "anonymous", "category": "headers"}
+
+
+def test_completeness_is_independent_and_waivers_survive_restart(orch, tmp_path):
+    session_id = sid(orch)
+    session = orch.sessions[session_id]
+    session.objective_complete = True
+    session.status = "completed"
+    orch._save_session_status(session_id, session)
+    assert orch.get_session_completeness(session_id)["verdict"] == "unknown"
+    identity = assessment_snapshot(orch, tmp_path)
+    report = orch.get_session_report(session_id)
+    assert report["summary"]["objective_complete"]
+    assert not report["summary"]["assessment_complete"]
+    assert report["summary"]["terminal_assessment_incomplete"]
+    result = orch.record_completeness_waiver(session_id, {
+        **identity, "reviewer": "engagement-owner", "reason": "Explicit scoped exclusion"})
+    assert result["verdict"] == "complete" and result["waived_checks"][0]["timestamp"]
+    orch.sessions.clear()
+    assert orch.get_session_completeness(session_id) == result
+    assert not orch.sessions
+
+
+def test_waiver_rejects_missing_attribution_and_unknown_checks(orch, tmp_path):
+    identity = assessment_snapshot(orch, tmp_path)
+    for data in (identity, {**identity, "reviewer": "", "reason": "excluded"},
+                 {**identity, "category": "other", "reviewer": "operator", "reason": "excluded"}):
+        with pytest.raises(ValueError):
+            orch.record_completeness_waiver(sid(orch), data)
+    assert orch.get_session_completeness(sid(orch))["verdict"] == "incomplete"
+
+
+def test_unreadable_snapshot_is_explicit_unknown_not_clean(orch, tmp_path):
+    assessment_snapshot(orch, tmp_path)
+    path = tmp_path / "assessments" / (hashlib.sha256(sid(orch).encode()).hexdigest() + ".json")
+    path.write_text("not JSON")
+    result = orch.get_session_completeness(sid(orch))
+    assert result["verdict"] == "unknown" and result["blockers"]
+
+
+@pytest.mark.parametrize("entry", ["analyze", "recon", "recovery", "followup"])
+def test_preflight_is_enforced_on_server_entrypoints(orch, entry):
+    session_id = sid(orch)
+    orch.sessions[session_id].authorization_confirmed = False
+    orch._sessions_to_auto_resume = [{"session_id": session_id, "skip_scan": True}]
+    orch.ai_connector.ask_ai_async = AsyncMock()
+    orch.scanner.perform_nmap_scan = AsyncMock()
+    calls = {"analyze": lambda: orch._analyze_with_ai(session_id),
+             "recon": lambda: orch.start_reconnaissance(session_id),
+             "recovery": orch.auto_resume_sessions,
+             "followup": lambda: Orchestrator._process_command_output(orch, session_id, "echo harmless", "preview")}
+    asyncio.run(calls[entry]())
+    orch.ai_connector.ask_ai_async.assert_not_called()
+    orch.scanner.perform_nmap_scan.assert_not_called()
+    assert orch.sessions[session_id].pause_reason == "preflight_blocked"
+
+
+def test_actual_recon_requires_nmap_even_with_configured_database(orch, monkeypatch):
+    from core.scanner import Scanner
+    orch.scanner = Scanner()
+    monkeypatch.setattr("shutil.which", lambda tool: None)
+    orch.scanner.perform_nmap_scan = AsyncMock()
+    asyncio.run(orch.start_reconnaissance(sid(orch)))
+    orch.scanner.perform_nmap_scan.assert_not_called()
+    assert not next(c for c in orch.get_session_preflight(sid(orch))["checks"] if c["name"] == "tool:nmap")["ready"]
+
+
+def test_operation_checkpoints_precede_process_and_retain_bound_result(orch, monkeypatch):
+    orch._execution_gate = MagicMock(return_value=None)
+    spawn = asyncio.create_subprocess_exec
+
+    async def checked_spawn(*args, **kwargs):
+        operations = orch.get_session_operations(sid(orch))
+        assert operations[-1]["state"] == "dispatching"
+        return await spawn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", checked_spawn)
+    result = asyncio.run(orch.execute_command(sid(orch), "echo harmless", command_id="logical"))
+    operation = orch.get_session_operations(sid(orch))[0]
+    assert result["success"] and operation["state"] == "projection_applied"
+    assert operation["command_id"] == "logical" and operation["attempt_id"] == result["attempt_id"]
+    assert operation["result"]["operation_id"] == operation["operation_id"] == result["operation_id"]
+    assert len(operation["config_revision"]) == 64
+
+
+@pytest.mark.parametrize("phase", ["prepare", "dispatching", "result_committed"])
+def test_interrupted_operations_never_auto_reexecute(orch, phase):
+    session_id = sid(orch)
+    operation_id = orch._prepare_operation(session_id, "logical", "attempt", "manual")
+    if phase != "prepare":
+        orch._checkpoint_operation(operation_id, "dispatching")
+    if phase == "result_committed":
+        orch._checkpoint_operation(operation_id, "result_committed", {"output": "retained"})
+    orch.sessions[session_id].status = "executing"
+    orch._save_session_status(session_id, orch.sessions[session_id])
+    orch.sessions.clear()
+    orch._restore_sessions()
+    assert orch.get_session_operations(session_id)[0]["state"] == "needs_reconciliation"
+    assert orch.sessions[session_id].pause_reason == "needs_reconciliation"
+    assert not orch._sessions_to_auto_resume and not orch._commands_to_auto_resume
+
+
+def test_pending_commands_remain_pending_under_full_auto_recovery(orch):
+    session_id = sid(orch)
+    orch.sessions[session_id].full_auto = True
+    logical_id = orch.queue_for_approval(session_id, "curl http://127.0.0.1")
+    orch.sessions[session_id].status = "ready"
+    orch._save_session_status(session_id, orch.sessions[session_id])
+    orch.sessions.clear()
+    orch._restore_sessions()
+    assert orch.pending_commands[logical_id]["status"] == "pending"
+    assert not orch._commands_to_auto_resume and not orch._sessions_to_auto_resume
+
+
+@pytest.mark.parametrize("failure_phase", ["prepare", "dispatching"])
+def test_required_journal_failure_prevents_actual_side_effect(orch, monkeypatch, failure_phase):
+    orch._execution_gate = MagicMock(return_value=None)
+    spawn = AsyncMock(side_effect=AssertionError("Persistence failure must prevent spawn"))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    if failure_phase == "prepare":
+        orch._prepare_operation = MagicMock(side_effect=sqlite3.OperationalError("Journal unavailable"))
+    else:
+        checkpoint = orch._checkpoint_operation
+
+        def failing(operation_id, state, result=None):
+            if state == failure_phase:
+                raise sqlite3.OperationalError("Journal unavailable")
+            return checkpoint(operation_id, state, result)
+
+        orch._checkpoint_operation = failing
+    result = asyncio.run(orch.execute_command(sid(orch), "echo harmless"))
+    assert not result["success"] and "Journal unavailable" in result["error"]
+    spawn.assert_not_called()
+
+
+def test_positive_review_requires_binding_or_explicit_typed_provenance(orch):
+    record = orch.add_vulnerability(sid(orch), finding())
+    artifact = capture_review(orch)
+    payload = {"result": "positive", "artifact_refs": [artifact["id"]]}
+    for extra in ({}, {"reviewer": "operator"}, {"command_id": "logical"},
+                  {"provenance": {"type": "automatic", "source": "source_review"}}):
+        with pytest.raises(ValueError):
+            orch.record_verification(sid(orch), record["finding_id"], {**payload, **extra})
+    updated = orch.record_verification(sid(orch), record["finding_id"], {
+        **payload, "reviewer": "source-auditor", "provenance": {"type": "review_only", "source": "source_review"}})
+    assert updated["verified"]
+    assert updated["verification_events"][-1]["provenance"]["source"] == "source_review"
+    assert not updated["evidence"][-1].get("command_id")
+
+
+def test_result_commit_failure_preserves_uncertain_effect_without_replay(orch, monkeypatch):
+    orch._execution_gate = MagicMock(return_value=None)
+    checkpoint = orch._checkpoint_operation
+    real_spawn = asyncio.create_subprocess_exec
+    spawn_count = []
+
+    async def spawn(*args, **kwargs):
+        spawn_count.append(args)
+        return await real_spawn(*args, **kwargs)
+
+    def fail_commit(operation_id, state, result=None):
+        if state == "result_committed":
+            raise sqlite3.OperationalError("Result commit unavailable")
+        return checkpoint(operation_id, state, result)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    orch._checkpoint_operation = fail_commit
+    result = asyncio.run(orch.execute_command(sid(orch), "echo harmless"))
+    assert not result["success"] and len(spawn_count) == 1
+    assert orch.get_session_operations(sid(orch))[0]["state"] == "needs_reconciliation"
+    orch.sessions[sid(orch)].status = "ready"
+    assert not orch._require_preflight(sid(orch))
+    assert len(spawn_count) == 1
+
+
+def test_operation_configuration_revision_changes_and_duplicate_identity_rejects(orch, monkeypatch):
+    session_id = sid(orch)
+    first = orch._prepare_operation(session_id, "logical", "attempt", "manual")
+    with pytest.raises(sqlite3.IntegrityError):
+        orch._prepare_operation(session_id, "logical", "attempt", "manual")
+    monkeypatch.setenv("KMN_EXECUTION_BACKEND", "docker")
+    second = orch._prepare_operation(session_id, "logical", "attempt", "manual")
+    operations = orch.get_session_operations(session_id)
+    assert first != second and operations[0]["config_revision"] != operations[1]["config_revision"]
+
+
+def test_shell_command_uses_same_durable_dispatch_contract(orch):
+    session_id = sid(orch)
+    manager = MagicMock()
+    manager.get_handler.return_value.get_session.return_value = SimpleNamespace(
+        msf_id=1, status="open", target_ip="127.0.0.1")
+
+    async def run(*args):
+        assert orch.get_session_operations(session_id)[-1]["state"] == "dispatching"
+        return "ordinary output"
+
+    manager.run_command = AsyncMock(side_effect=run)
+    orch._shell_managers[session_id] = manager
+    result = asyncio.run(orch.run_shell_command(session_id, "handler", 1, "id", command_id="logical"))
+    operation = orch.get_session_operations(session_id)[0]
+    assert result == "ordinary output" and operation["state"] == "projection_applied"
+    assert operation["command_id"] == "logical"
+    assert operation["result"]["channel"] == "managed_shell"
+
+
+def test_persistent_memory_retains_provenance_and_is_purged_on_session_deletion(orch, monkeypatch):
+    monkeypatch.setenv("MEMORY_EMBEDDINGS", "0")
+    session_id = sid(orch)
+    orch._index_finding(session_id, "HTTP response revealed a retained server banner", {
+        "source_id": "operation-1", "digest": "digest-1", "evidence_ref": "evidence:artifact-1"})
+    index = orch._findings_indexes.pop(session_id)
+    index.close()
+    results = orch._retrieve_relevant_findings(session_id, "server banner")
+    assert results[0]["provenance"]["source_id"] == "operation-1"
+    assert results[0]["trust"] == "untrusted"
+    assert orch.delete_session(session_id)["status"] == "success"
+    with sqlite3.connect(orch.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM persistent_findings WHERE session_id=?", (session_id,)).fetchone()[0] == 0
+
+
+def test_scheduled_entry_checks_preflight_before_queueing_recon(orch, monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "none")
+    orch.ai_connector.provider = "none"
+    orch.ai_connector.requested_provider = "openai"
+    orch.start_reconnaissance = AsyncMock()
+    orch._track_task = MagicMock()
+    with sqlite3.connect(orch.db_path) as conn:
+        conn.execute("INSERT INTO scheduled_scans (target_ip,schedule_type,schedule_time,status,next_run,created_at) "
+                     "VALUES ('127.0.0.1','once','00:00','active','2000-01-01T00:00:00','2000-01-01T00:00:00')")
+    asyncio.run(orch.run_due_scheduled_scans())
+    orch._track_task.assert_not_called()
+    orch.start_reconnaissance.assert_not_called()
+    assert any(session.pause_reason == "preflight_blocked" for session in orch.sessions.values())
+
+
+def test_background_nmap_scan_commits_result_before_finding_projection(orch):
+    session_id = sid(orch)
+    session = orch.sessions[session_id]
+    session.discovered_hosts = [{"ip": "127.0.0.1", "ports": [{"port": 80, "state": "open"}]}]
+
+    async def scan(*args):
+        assert orch.get_session_operations(session_id)[-1]["state"] == "dispatching"
+        return {"success": True, "vulnerabilities": []}
+
+    orch.scanner.perform_vulnerability_scan_port = AsyncMock(side_effect=scan)
+    asyncio.run(orch._run_vulnerability_analysis(session_id))
+    operation = orch.get_session_operations(session_id)[0]
+    assert operation["state"] == "projection_applied" and operation["result"]["success"]
+
+
+def test_explicitly_unconfigured_database_does_not_use_injected_adapter_journal():
+    instance = make_orch()
+    instance.db_path = ""
+    instance._save_command_result = MagicMock()
+    from tests._helpers import make_session
+    instance.sessions["s1"] = make_session()
+    with pytest.raises(sqlite3.OperationalError, match="Persistence is not configured"):
+        instance._prepare_operation("s1", "logical", "attempt", "manual")
+    assert not hasattr(instance, "_injected_operation_store")
+
+
+def register_rpc_shell(orch, session_id, handler_id="owned-handler", msf_id=7, status="open", *, bind_rpc=True):
+    with sqlite3.connect(orch.db_path) as conn:
+        conn.execute("INSERT INTO shell_sessions_log "
+                     "(shell_id,handler_id,session_id,msf_id,shell_type,target_ip,status) VALUES (?,?,?,?,?,?,?)",
+                     ("shell-registration", handler_id, session_id, msf_id, "shell", "127.0.0.1", status))
+    if bind_rpc:
+        orch.register_rpc_shell_binding(session_id, handler_id, msf_id, "127.0.0.1")
+        if status == "closed":
+            orch.unregister_rpc_shell_binding(session_id, handler_id, msf_id)
+
+
+@pytest.mark.parametrize("binding", ["missing", "foreign", "wrong_handler", "closed", "reused", "local_log", "reconnected"])
+def test_global_rpc_rejects_untrusted_or_stale_numeric_session_identity(orch, binding):
+    session_id = sid(orch)
+    other = orch.create_session("127.0.0.1", authorization_confirmed=True)
+    orch._msf_rpc = SimpleNamespace(run_session_command=AsyncMock(return_value={"data": "unexpected effect"}))
+    if binding == "foreign":
+        register_rpc_shell(orch, other)
+    elif binding == "wrong_handler":
+        register_rpc_shell(orch, session_id, handler_id="different-handler")
+    elif binding == "closed":
+        register_rpc_shell(orch, session_id, status="closed")
+    elif binding == "reused":
+        register_rpc_shell(orch, session_id)
+        register_rpc_shell(orch, other)
+    elif binding == "local_log":
+        register_rpc_shell(orch, session_id, bind_rpc=False)
+    elif binding == "reconnected":
+        register_rpc_shell(orch, session_id)
+        orch._msf_rpc = SimpleNamespace(run_session_command=AsyncMock())
+    with pytest.raises(ValueError, match="bound"):
+        asyncio.run(orch.run_shell_command(session_id, "owned-handler", 7, "whoami"))
+    orch._msf_rpc.run_session_command.assert_not_called()
+    assert not orch.get_session_operations(session_id)
+
+
+def test_global_rpc_accepts_only_exact_server_registered_binding(orch):
+    session_id = sid(orch)
+    orch._msf_rpc = SimpleNamespace(run_session_command=AsyncMock(return_value={"data": "registered output"}))
+    register_rpc_shell(orch, session_id)
+    assert asyncio.run(orch.run_shell_command(session_id, "owned-handler", 7, "whoami")) == "registered output"
+    orch._msf_rpc.run_session_command.assert_awaited_once_with(7, "whoami")
+    assert orch.get_session_operations(session_id)[0]["state"] == "projection_applied"
+
+
+def test_manager_cannot_route_unbound_handler_through_global_rpc(orch):
+    session_id = sid(orch)
+    manager = MagicMock()
+    manager.get_handler.return_value = None
+    orch._shell_managers[session_id] = manager
+    orch._msf_rpc = SimpleNamespace(run_session_command=AsyncMock())
+    register_rpc_shell(orch, session_id)
+    with pytest.raises(ValueError, match="bound"):
+        asyncio.run(orch.run_shell_command(session_id, "owned-handler", 7, "whoami"))
+    manager.run_command.assert_not_called()
+    orch._msf_rpc.run_session_command.assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["result_committed", "command_result", "session_projection", "projection_applied"])
+def test_shell_post_dispatch_failure_is_uncertain_and_blocks_same_process_retry(orch, phase):
+    session_id = sid(orch)
+    orch._msf_rpc = SimpleNamespace(run_session_command=AsyncMock(return_value={"data": "stateful effect happened"}))
+    register_rpc_shell(orch, session_id)
+    checkpoint = orch._checkpoint_operation
+    save_result = orch._save_command_result
+
+    def fail_checkpoint(operation_id, state, result=None):
+        if state == phase:
+            raise sqlite3.OperationalError("Injected checkpoint failure")
+        return checkpoint(operation_id, state, result)
+
+    def fail_result(*args, **kwargs):
+        if kwargs.get("metadata", {}).get("return_code") == 0:
+            raise sqlite3.OperationalError("Injected result persistence failure")
+        return save_result(*args, **kwargs)
+
+    orch._checkpoint_operation = fail_checkpoint
+    if phase == "command_result":
+        orch._save_command_result = fail_result
+    if phase == "session_projection":
+        orch._save_session_status = MagicMock(side_effect=sqlite3.OperationalError("Injected projection failure"))
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(orch.run_shell_command(session_id, "owned-handler", 7, "stateful", command_id="logical"))
+    operation = orch.get_session_operations(session_id)[0]
+    assert operation["state"] == "needs_reconciliation"
+    if phase != "result_committed":
+        assert operation["result"]["output"] == "stateful effect happened"
+    with pytest.raises(RuntimeError, match="reconciliation"):
+        asyncio.run(orch.run_shell_command(session_id, "owned-handler", 7, "stateful", command_id="logical"))
+    assert orch._msf_rpc.run_session_command.await_count == 1
+    assert not orch._active_operations
+
+
+def test_shell_journal_outage_latches_uncertainty_even_when_failure_cannot_be_recorded(orch):
+    session_id = sid(orch)
+    connect = orch._operation_connect
+
+    async def effect(*args):
+        orch._operation_connect = MagicMock(side_effect=sqlite3.OperationalError("Journal offline"))
+        return {"data": "stateful effect happened"}
+
+    orch._msf_rpc = SimpleNamespace(run_session_command=AsyncMock(side_effect=effect))
+    register_rpc_shell(orch, session_id)
+    with pytest.raises(sqlite3.OperationalError, match="Journal offline"):
+        asyncio.run(orch.run_shell_command(session_id, "owned-handler", 7, "stateful"))
+    orch._operation_connect = connect
+    assert orch.get_session_operations(session_id)[0]["state"] == "dispatching"
+    with pytest.raises(RuntimeError, match="reconciliation"):
+        asyncio.run(orch.run_shell_command(session_id, "owned-handler", 7, "stateful"))
+    assert orch._msf_rpc.run_session_command.await_count == 1
+
+
+@pytest.mark.parametrize("state", ["dispatching", "result_committed"])
+def test_orphan_checkpoints_block_new_dispatch_without_restart(orch, state):
+    session_id = sid(orch)
+    operation = orch._prepare_operation(session_id, "original", "attempt", "manual")
+    orch._checkpoint_operation(operation, "dispatching")
+    if state == "result_committed":
+        orch._checkpoint_operation(operation, state, {"output": "effect happened"})
+    with pytest.raises(RuntimeError, match="reconciliation"):
+        orch._prepare_operation(session_id, "new-command", "new-attempt", "manual")
+    orch.ai_connector.provider = "none"
+    orch.ai_connector.requested_provider = "none"
+    assert orch.get_session_preflight(session_id)["ready"]
+    assert not orch._require_preflight(session_id)
+    assert orch.sessions[session_id].pause_reason == "needs_reconciliation"
+
+
+def test_running_logical_shell_command_cannot_be_dispatched_twice(orch):
+    session_id = sid(orch)
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def effect(*args):
+            started.set()
+            await release.wait()
+            return {"data": "single stateful effect"}
+
+        orch._msf_rpc = SimpleNamespace(run_session_command=AsyncMock(side_effect=effect))
+        register_rpc_shell(orch, session_id)
+        task = asyncio.create_task(orch.run_shell_command(session_id, "owned-handler", 7, "stateful", command_id="logical"))
+        await started.wait()
+        try:
+            with pytest.raises(RuntimeError, match="reconciliation"):
+                await orch.run_shell_command(session_id, "owned-handler", 7, "stateful", command_id="logical")
+        finally:
+            release.set()
+            await task
+
+    asyncio.run(scenario())
+    assert orch._msf_rpc.run_session_command.await_count == 1
+    assert orch.get_session_operations(session_id)[0]["state"] == "projection_applied"
+
+
+def test_coverage_reference_resolves_only_to_this_sessions_committed_artifact(orch, tmp_path):
+    session_id = sid(orch)
+    other = orch.create_session("127.0.0.1", authorization_confirmed=True)
+    foreign = capture_review(orch, other)
+    assessment_snapshot(orch, tmp_path, "verified", "evidence:" + foreign["id"])
+    assert orch.get_session_completeness(session_id)["verdict"] == "incomplete"
+    local = capture_review(orch, session_id)
+    assessment_snapshot(orch, tmp_path, "verified", "evidence:" + local["id"])
+    assert orch.get_session_completeness(session_id)["verdict"] == "complete"
+    orch._artifact_store.purge_session(orch._artifact_session_id(session_id))
+    assert orch.get_session_completeness(session_id)["verdict"] == "incomplete"
+
+
+def test_coverage_reference_rejects_invented_or_live_only_evidence(orch, tmp_path):
+    session_id = sid(orch)
+    orch.sessions[session_id].evidence.append({"evidence_id": "invented", "data": {}})
+    assessment_snapshot(orch, tmp_path, "verified", "evidence:invented")
+    assert orch.get_session_completeness(session_id)["verdict"] == "incomplete"
+    orch.add_evidence(session_id, "operator_observation", {"id": "committed-observation", "note": "Retained observation"})
+    assessment_snapshot(orch, tmp_path, "verified", "evidence:committed-observation")
+    assert orch.get_session_completeness(session_id)["verdict"] == "complete"
+
+
+def test_coverage_evidence_record_cannot_hide_a_missing_or_foreign_artifact(orch, tmp_path):
+    session_id = sid(orch)
+    other = orch.create_session("127.0.0.1", authorization_confirmed=True)
+    foreign = capture_review(orch, other)
+    orch.add_evidence(session_id, "operator_observation", {"id": "dangling-proof", "artifact_refs": [foreign["id"]]})
+    assessment_snapshot(orch, tmp_path, "verified", "evidence:dangling-proof")
+    assert orch.get_session_completeness(session_id)["verdict"] == "incomplete"
+    assert "evidence:dangling-proof" not in orch.get_session_committed_evidence_refs(session_id)
+
+
+def test_coverage_integrity_failure_is_unknown_not_complete(orch, tmp_path):
+    from core.artifact_store import ArtifactStoreError
+    artifact = capture_review(orch)
+    assessment_snapshot(orch, tmp_path, "verified", "evidence:" + artifact["id"])
+    orch._artifact_store.read = MagicMock(side_effect=ArtifactStoreError("Integrity check failed"))
+    result = orch.get_session_completeness(sid(orch))
+    assert result["verdict"] == "unknown" and result["blockers"]
+
+
+def test_evidence_filter_runs_after_validation_and_does_not_change_purge_hook_identity(orch, tmp_path):
+    session_id = sid(orch)
+    artifact = capture_review(orch)
+    ref = "evidence:" + artifact["id"]
+    assessment_snapshot(orch, tmp_path, "verified", ref)
+    read = orch._artifact_store.read = MagicMock(wraps=orch._artifact_store.read)
+    validated = orch.get_session_committed_evidence_refs(session_id)
+    read.reset_mock()
+    calls = []
+
+    def revoke(owner, refs):
+        assert owner == session_id and refs == validated
+        read.assert_called_with(artifact["id"])
+        calls.append(list(refs))
+        return []
+
+    purge = MagicMock()
+    orch.register_session_purge_hook(purge)
+    orch.register_evidence_reference_filter(revoke)
+    orch.register_evidence_reference_filter(revoke)
+    assert orch.get_session_committed_evidence_refs(session_id) == []
+    assert calls == [validated]
+    result = orch.get_session_completeness(session_id)
+    assert result["verdict"] == "incomplete" and result["missing_checks"]
+    assert orch._session_purge_hooks == [purge]
+    assert orch._session_purge_hooks[0] is purge
+    purge.assert_not_called()
+    assert orch.delete_session(session_id)["status"] == "success"
+    purge.assert_called_once_with(session_id)
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.OperationalError])
+def test_evidence_filter_errors_propagate_and_cannot_complete_assessment(orch, tmp_path, error_type):
+    session_id = sid(orch)
+    artifact = capture_review(orch)
+    assessment_snapshot(orch, tmp_path, "verified", "evidence:" + artifact["id"])
+    error = error_type("External reference state unavailable")
+    callback = MagicMock(side_effect=error)
+    orch.register_evidence_reference_filter(callback)
+    with pytest.raises(error_type) as caught:
+        orch.get_session_committed_evidence_refs(session_id)
+    assert caught.value is error
+    result = orch.get_session_completeness(session_id)
+    assert result == {"version": 1, "verdict": "unknown", "missing_checks": [],
+                      "blockers": [{"reason": "assessment_state_unavailable"}], "waived_checks": []}
+    assert not orch.get_session_report(session_id)["summary"]["assessment_complete"]
+
+
+@pytest.mark.parametrize("forgery", ["invented", "foreign", "mutated_input"])
+def test_evidence_filter_cannot_introduce_unvalidated_references(orch, tmp_path, forgery):
+    session_id = sid(orch)
+    local = capture_review(orch)
+    local_ref = "evidence:" + local["id"]
+    foreign_session = orch.create_session("127.0.0.1", authorization_confirmed=True)
+    foreign = capture_review(orch, foreign_session)
+    injected_ref = "evidence:" + foreign["id"] if forgery == "foreign" else "evidence:invented"
+    assessment_snapshot(orch, tmp_path, "verified", injected_ref)
+
+    def forge(owner, refs):
+        assert owner == session_id and local_ref in refs and injected_ref not in refs
+        if forgery == "mutated_input":
+            refs.append(injected_ref)
+            return refs
+        return [injected_ref]
+
+    orch.register_evidence_reference_filter(forge)
+    with pytest.raises(ValueError, match="introduce or revive"):
+        orch.get_session_committed_evidence_refs(session_id)
+    assert orch.get_session_completeness(session_id)["verdict"] == "unknown"
+
+
+def test_later_filter_cannot_revive_a_reference_removed_by_an_earlier_filter(orch, tmp_path):
+    session_id = sid(orch)
+    artifact = capture_review(orch)
+    ref = "evidence:" + artifact["id"]
+    assessment_snapshot(orch, tmp_path, "verified", ref)
+    orch.register_evidence_reference_filter(lambda owner, refs: [])
+
+    def revive(owner, refs):
+        assert owner == session_id and refs == []
+        return [ref]
+
+    orch.register_evidence_reference_filter(revive)
+    with pytest.raises(ValueError, match="introduce or revive"):
+        orch.get_session_committed_evidence_refs(session_id)
+    assert orch.get_session_completeness(session_id)["verdict"] == "unknown"
+
+
+def test_filter_rechecks_persisted_revision_and_revocation_after_snapshot_republication(orch, tmp_path):
+    session_id = sid(orch)
+    artifact = capture_review(orch)
+    ref = "evidence:" + artifact["id"]
+    assessment_snapshot(orch, tmp_path, "verified", ref)
+    state_path = tmp_path / "source-state.sqlite"
+    with sqlite3.connect(state_path) as conn:
+        conn.execute("CREATE TABLE source_state (session_id TEXT, reference TEXT, revision INTEGER, current_revision INTEGER, revoked INTEGER)")
+        conn.execute("INSERT INTO source_state VALUES (?,?,1,1,0)", (session_id, ref))
+
+    def filter_sources(owner, refs):
+        with sqlite3.connect(state_path) as conn:
+            invalid = {row[0] for row in conn.execute(
+                "SELECT reference FROM source_state WHERE session_id=? AND (revoked=1 OR revision!=current_revision)", (owner,))}
+        return [candidate for candidate in refs if candidate not in invalid]
+
+    orch.register_evidence_reference_filter(filter_sources)
+    assert orch.get_session_completeness(session_id)["verdict"] == "complete"
+    with sqlite3.connect(state_path) as conn:
+        conn.execute("UPDATE source_state SET current_revision=2")
+    assessment_snapshot(orch, tmp_path, "verified", ref)
+    assert orch.get_session_completeness(session_id)["verdict"] == "incomplete"
+    with sqlite3.connect(state_path) as conn:
+        conn.execute("UPDATE source_state SET revision=2,revoked=1")
+    assessment_snapshot(orch, tmp_path, "verified", ref)
+    orch.sessions.clear()
+    assert orch.get_session_completeness(session_id)["verdict"] == "incomplete"
+    assert ref not in orch.get_session_committed_evidence_refs(session_id)
+
+
+@pytest.mark.parametrize("invalid", [None, "evidence:invented", ("evidence:invented",), [None], [123]])
+def test_evidence_filter_invalid_result_fails_closed(orch, tmp_path, invalid):
+    session_id = sid(orch)
+    artifact = capture_review(orch)
+    assessment_snapshot(orch, tmp_path, "verified", "evidence:" + artifact["id"])
+    orch.register_evidence_reference_filter(lambda owner, refs: invalid)
+    with pytest.raises(ValueError, match="list of strings"):
+        orch.get_session_committed_evidence_refs(session_id)
+    assert orch.get_session_completeness(session_id)["verdict"] == "unknown"
+
+
+def test_evidence_filters_run_on_empty_inventory_without_database_fallback():
+    instance = make_orch()
+    callback = MagicMock(return_value=[])
+    instance.register_evidence_reference_filter(callback)
+    assert instance.get_session_committed_evidence_refs("session") == []
+    callback.assert_called_once_with("session", [])
+    callback.side_effect = RuntimeError("Revocation store unavailable")
+    with pytest.raises(RuntimeError, match="Revocation store unavailable"):
+        instance.get_session_committed_evidence_refs("session")
+
+
+def test_async_evidence_reference_filters_are_rejected(orch):
+    async def callback(owner, refs):
+        return refs
+
+    class AsyncFilter:
+        async def __call__(self, owner, refs):
+            return refs
+
+    for invalid in (None, callback, AsyncFilter()):
+        with pytest.raises(ValueError, match="synchronous"):
+            orch.register_evidence_reference_filter(invalid)
+
+
+def test_sync_filter_returning_coroutine_cannot_bypass_the_contract(orch, tmp_path):
+    artifact = capture_review(orch)
+    assessment_snapshot(orch, tmp_path, "verified", "evidence:" + artifact["id"])
+
+    async def delayed_result():
+        return []
+
+    orch.register_evidence_reference_filter(lambda owner, refs: delayed_result())
+    with pytest.raises(ValueError, match="list of strings"):
+        orch.get_session_committed_evidence_refs(sid(orch))
+    assert orch.get_session_completeness(sid(orch))["verdict"] == "unknown"
+
+
+def test_reference_filter_cannot_replace_failed_artifact_validation(orch, tmp_path):
+    from core.artifact_store import ArtifactStoreError
+    artifact = capture_review(orch)
+    ref = "evidence:" + artifact["id"]
+    assessment_snapshot(orch, tmp_path, "verified", ref)
+    callback = MagicMock(return_value=[ref])
+    orch.register_evidence_reference_filter(callback)
+    orch._artifact_store.read = MagicMock(side_effect=ArtifactStoreError("Integrity check failed"))
+    with pytest.raises(ArtifactStoreError):
+        orch.get_session_committed_evidence_refs(sid(orch))
+    assert orch.get_session_completeness(sid(orch))["verdict"] == "unknown"
+    callback.assert_not_called()
+
+
+def test_deletion_purges_exact_injected_telemetry_store_and_external_hook(orch, tmp_path, monkeypatch):
+    from core.model_telemetry import ModelTelemetryStore
+    session_id = sid(orch)
+    path = tmp_path / "explicit-telemetry.sqlite"
+    store = ModelTelemetryStore(path)
+    store.reserve(session_id=session_id, purpose="tactical", operation_id="model-operation", retry_ordinal=0,
+                  provider="local", model="offline", estimated_input_tokens=1, max_tokens=1)
+    orch.ai_connector.telemetry_store = store
+    monkeypatch.setenv("KMN_MODEL_TELEMETRY_DB", str(tmp_path / "wrong-ledger.sqlite"))
+    calls = []
+
+    def purge_specialist(sid):
+        assert orch._read_session_snapshot(sid) is not None
+        calls.append(sid)
+
+    orch.register_session_purge_hook(purge_specialist)
+    orch.register_session_purge_hook(purge_specialist)
+    assert orch.delete_session(session_id)["status"] == "success"
+    assert store.events(session_id) == [] and calls == [session_id]
+    assert not (tmp_path / "wrong-ledger.sqlite").exists()
+
+
+@pytest.mark.parametrize("store", ["telemetry", "specialist_hook"])
+def test_external_purge_failure_prevents_deletion_success_and_can_retry(orch, store):
+    session_id = sid(orch)
+    artifact = capture_review(orch)
+    purge = MagicMock(side_effect=sqlite3.OperationalError("External store offline"))
+    if store == "telemetry":
+        orch.ai_connector.telemetry_store = SimpleNamespace(purge_session=purge)
+    else:
+        orch.register_session_purge_hook(purge)
+    result = orch.delete_session(session_id)
+    assert result["status"] == "error" and result["cleanup_incomplete"]
+    assert orch._read_session_snapshot(session_id) is not None
+    assert orch._get_artifact_store().read(artifact["id"])
+    purge.side_effect = None
+    assert orch.delete_session(session_id)["status"] == "success"
+
+
+def test_specialist_purge_hook_uses_explicit_external_store_and_retains_other_sessions(orch, tmp_path):
+    from core.specialists import SpecialistService
+    session_id = sid(orch)
+    path = tmp_path / "access-and-specialists.sqlite"
+    service = SpecialistService(orch.ai_connector, path, session_id)
+    service.records()
+    service.close()
+    with sqlite3.connect(path) as conn:
+        for identity, owner in (("owned-handoff", session_id), ("other-handoff", "other-session")):
+            conn.execute("INSERT INTO specialist_handoffs (id,session_id,role,context_hash,status) VALUES (?,?,?,?,?)",
+                         (identity, owner, "web", "opaque-context-hash", "analysis"))
+
+    def purge(owner):
+        instance = SpecialistService(orch.ai_connector, path, owner)
+        try:
+            instance.purge_session()
+        finally:
+            instance.close()
+
+    orch.register_session_purge_hook(purge)
+    assert orch.delete_session(session_id)["status"] == "success"
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT id FROM specialist_handoffs").fetchall() == [("other-handoff",)]
+
+
 def test_operator_review_lifecycle_with_real_artifacts_survives_restart(orch):
     session_id = sid(orch)
     record = orch.add_vulnerability(session_id, finding())
@@ -527,6 +1247,7 @@ def test_operator_review_lifecycle_with_real_artifacts_survives_restart(orch):
         artifact = capture_review(orch, data=kind.encode())
         record = orch.record_verification(session_id, finding_id, {
             "kind": kind, "result": result, "artifact_refs": [artifact["id"]],
+            "provenance": {"type": "review_only", "source": "operator_review"},
             "target": "127.0.0.1:80", "reviewer": "test-operator"})
         assert record["finding_id"] == finding_id
         assert record["evidence"][-1]["target"] == record["target"]
@@ -763,6 +1484,7 @@ def test_authenticated_route_payload_is_normalized_to_explicit_operator_review(o
     record = orch.add_vulnerability(sid(orch), finding())
     artifact = capture_review(orch)
     payload = {"acknowledge_review": True, "result": "positive", "method": "manual protocol evidence review",
+               "reviewer": "test-operator", "provenance": {"type": "review_only", "source": "operator_review"},
                "artifact_refs": [artifact["id"]], "evidence": "Reviewed retained protocol evidence"}
     updated = orch.record_verification(sid(orch), record["finding_id"], payload)
     assert updated["verified"]
@@ -784,7 +1506,7 @@ def test_review_does_not_overwrite_concurrent_finding_update(orch):
 
     store.read = concurrent_update
     with pytest.raises(ValueError, match="changed during review"):
-        orch.record_verification(sid(orch), record["finding_id"], {"result": "positive", "artifact_refs": [artifact["id"]]})
+        orch.record_verification(sid(orch), record["finding_id"], review_payload(artifact))
     snapshot = orch._read_session_snapshot(sid(orch))
     assert snapshot.vulnerabilities[0]["description"] == "Concurrent corroboration"
     assert not snapshot.vulnerabilities[0]["verified"]
@@ -940,7 +1662,7 @@ def test_reobservation_cannot_overwrite_review_waiting_for_finding_writer(orch):
 
     def review():
         review_started.set()
-        result = orch.record_verification(session_id, record["finding_id"], {"result": "positive", "artifact_refs": [artifact["id"]]})
+        result = orch.record_verification(session_id, record["finding_id"], review_payload(artifact))
         review_finished.set()
         return result
 
@@ -986,7 +1708,7 @@ def test_reviews_serialize_reobservations_and_preserve_entire_lifecycle(orch):
         store.read = paused_read
         with ThreadPoolExecutor(max_workers=2) as pool:
             review = pool.submit(orch.record_verification, session_id, record["finding_id"],
-                                 {"kind": kind, "result": result, "artifact_refs": [artifact["id"]]})
+                                 {**review_payload(artifact), "kind": kind, "result": result})
             try:
                 assert reviewing.wait(3)
                 observation = pool.submit(observe)
@@ -1010,7 +1732,7 @@ def test_reobservation_refreshes_review_history_from_durable_state(orch):
     record = orch.add_vulnerability(session_id, finding())
     stale = copy.deepcopy(record)
     artifact = capture_review(orch)
-    reviewed = orch.record_verification(session_id, record["finding_id"], {"result": "positive", "artifact_refs": [artifact["id"]]})
+    reviewed = orch.record_verification(session_id, record["finding_id"], review_payload(artifact))
     record.clear()
     record.update(stale)
     observed = orch.add_vulnerability(session_id, finding(description="Observation from old live state"))

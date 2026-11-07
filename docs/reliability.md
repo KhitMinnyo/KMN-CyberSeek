@@ -30,12 +30,21 @@ closed; it never falls back from Docker to local execution.
 | `KMN_DOCKER_MEMORY_MB` | `512` | Per-container memory cap. |
 | `KMN_DOCKER_CPUS` | `1` | Per-container CPU limit. |
 | `KMN_DOCKER_PIDS_LIMIT` | `64` | Per-container process cap. |
+| `KMN_DOCKER_TOOLS_ATTESTED` | `false` | Operator attestation that the prebuilt image contains required tools. |
 | `KMN_MAX_EXECUTIONS` | `3` | Active subprocess execution slots per event loop. |
 | `KMN_MAX_QUEUED_EXECUTIONS` | `32` | Maximum queued executions; `0` rejects waiting work. |
 | `KMN_EVIDENCE_DIR` | database-sibling `evidence` | Restricted raw evidence store. |
 | `KMN_EVIDENCE_KEY` | empty | Supplied Fernet key; empty means permission protection only. |
 | `KMN_EVIDENCE_MAX_BYTES` | `67108864` | Retained prefix byte cap per subprocess stream. |
 | `KMN_ASSESSMENT_DIR` | database-sibling `assessments` | Inventory/coverage snapshots. |
+| `KMN_AUTH_PRINCIPALS_FILE` | unset | Optional multi-user hashed-token principal configuration. |
+| `KMN_ACCESS_DB` | database-sibling `*.access.sqlite3` | Session ownership, source metadata, and access audit store. |
+| `KMN_MODEL_TELEMETRY_DB` | database-sibling `model_usage.sqlite` | Metadata-only model-call and budget ledger. |
+| `KMN_MODEL_PROFILES_FILE` | unset | Optional trusted per-purpose model settings. |
+| `KMN_MODEL_MAX_CALLS` | unset | Optional persisted per-session model-call cap. |
+| `KMN_MODEL_MAX_TOKENS` | unset | Optional persisted estimated/reserved token cap. |
+| `KMN_MODEL_MAX_COST_USD` | unset | Optional cost cap; requires trusted input/output model rates. |
+| `MEMORY_EMBEDDINGS` | `0` | Opt in to embeddings; lexical session-local retrieval is the default. |
 
 The example environment explicitly selects a 16 MiB evidence cap. The artifact
 library's standalone default is also 16 MiB. Configure a cap deliberately for
@@ -62,7 +71,37 @@ independently replayed an exploit. No scanner source label or model claim is
 automatically converted into a verified vulnerability. Remediation and retest
 require the correct prior lifecycle and fresh evidence where applicable.
 
-All routes below require the existing `X-API-Key` authentication:
+HTTP and WebSocket APIs authenticate each request. With the optional principal
+file configured, use `Authorization: Bearer <token>`. Without it, the legacy
+`API_AUTH_TOKEN` service-admin mode accepts `X-API-Key` and is not multi-user
+access control. A configured but invalid principal file fails closed; it never
+falls back to the legacy token.
+
+Principal file example (store token hashes, never plaintext tokens):
+
+```json
+{
+  "principals": [
+    {
+      "id": "analyst",
+      "role": "operator",
+      "token_sha256": "<64-character lowercase SHA-256 hex>",
+      "sensitive_read": false,
+      "sessions": []
+    }
+  ]
+}
+```
+
+Roles are `viewer`, `operator`, `reviewer`, and `admin`. Sessions are private to
+their owner unless explicitly granted in the principal file. `viewer` reads
+allowlisted, sanitized reports; `operator` starts/manages allowed sessions;
+`reviewer` records review/waiver decisions; `admin` manages all sessions and
+settings. Sensitive artifact access is separate and is not implied by non-viewer
+roles. The principal file is read per request so token revocation takes effect
+for existing HTTP/WebSocket clients.
+
+Relevant authenticated endpoints include:
 
 | Method | Session-Relative Path | Behavior |
 | --- | --- | --- |
@@ -74,6 +113,13 @@ All routes below require the existing `X-API-Key` authentication:
 | POST | `/assessment/import` | Import bounded local OpenAPI 3 JSON. |
 | GET | `/assessment` | Read inventory and role/category coverage. |
 | PATCH | `/assessment/coverage` | Record external check outcomes. |
+| GET | `/completeness` | Read assessment completeness, distinct from objective completion. |
+| GET | `/preflight` | Read the checks evaluated before this session can run. |
+| GET | `/operations` | Read durable operation checkpoint states. |
+| GET | `/telemetry/summary` | Read model usage/budget summary. |
+| GET | `/telemetry/events` | Read metadata-only model call events. |
+| POST | `/sources/import` | Import a bounded source manifest or SARIF metadata document. |
+| POST | `/handoffs` | Request bounded, analysis-only specialist reasoning. |
 
 These paths are relative to `/api/sessions/{session_id}`. Review requests accept
 `acknowledge_review: true`, `kind`, `result`, `method`, `artifact_refs`, and optional
@@ -81,6 +127,23 @@ These paths are relative to `/api/sessions/{session_id}`. Review requests accept
 `inconclusive`; remediation requires `applied`. Artifacts must be committed and
 belong to that session. Caller-supplied targets, verified flags, and arbitrary
 artifact URIs are rejected by the route.
+
+Positive verification is marked `runtime` only when artifacts are bound to a
+durable command ID and attempt ID. Otherwise, the reviewer is server-attributed
+and the result is explicitly `review_only`; exports preserve this distinction
+and never describe either route as independent reproduction.
+
+Completeness requires every declared endpoint/role/category check to have a
+session-owned committed evidence reference or an attributed reviewer waiver.
+Empty inventories are `unknown`; blocked, skipped, and unfinished checks remain
+incomplete. Imported source metadata is untrusted. A changed source revision
+invalidates affected coverage and revokes prior source evidence references for
+completeness while retaining the raw audit record.
+
+`POST /api/preflight` checks authorization confirmation, target/scope, configured
+provider selection, local tool availability, and backend settings. It performs no
+network, provider, Docker, or target availability checks. Readiness must be
+revalidated at execution; preflight is not an authorization grant.
 
 ## Headless Client
 
@@ -121,6 +184,7 @@ evidence-backed verified findings, not potential findings or legacy labels.
 | `6` | Session cancelled. |
 | `7` | Wait deadline exceeded. |
 | `8` | Operator input required. |
+| `9` | Session ended with assessment completeness `unknown` or `incomplete`. |
 
 Explicit output files are private (`0600`) and never overwrite an existing path,
 including symlinks. Use a fresh destination for each export. JSON/SARIF are
@@ -180,6 +244,23 @@ The GitHub workflow runs regression tests on pull requests. It does not launch
 autonomous scans against deployments. Use the CLI against an explicitly authorized
 staging environment in a separately approved job if deployment assessment is
 needed. Never expose API credentials to untrusted pull-request code.
+
+Model telemetry records provider/model, purpose, latency, result status, parse
+status, usage when returned, and explicit estimates. It never stores prompts,
+responses, credentials, request headers, or raw provider errors. Unknown usage
+remains unknown and retains its budget reservation. Dollar limits fail closed
+unless trusted input and output rates are configured. Per-purpose profiles may
+change model and supported generation parameters, but cannot change providers or
+endpoints. Persistent retrieval is session-scoped, redacted, and lexical by
+default; cross-session promotion is not performed.
+
+Source manifests are metadata-only and require source ID, revision, digest,
+declared base URL, operations, and relative code locations. The API does not read
+repository paths or fetch source. A separate library API can create an explicit
+local repository hash inventory without returning source contents. Imported
+SARIF/source findings and specialist handoffs are untrusted hypotheses; neither
+can verify a vulnerability or complete assessment coverage. Handoffs have a
+persisted per-session budget, bounded concurrency, and no tool/execution access.
 
 No live Docker network policy, Kali toolchain, browser installation, cloud model,
 or real-target effectiveness claim follows from passing offline tests. Validate

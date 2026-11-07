@@ -1,45 +1,16 @@
 # KMN-CyberSeek
 
 ![Version](https://img.shields.io/badge/Version-2.6.2-brightgreen)
-![Python](https://img.shields.io/badge/Python-3.8%2B-green)
+![Python](https://img.shields.io/badge/Python-3.10%2B-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-AI-driven autonomous penetration testing framework with policy-constrained full-auto execution and optional human oversight. Executes a full offensive engagement pipeline — OSINT → exploitation — using an LLM (DeepSeek API or local Ollama).
+KMN-CyberSeek is a self-hosted security assessment framework for authorized network and application testing. It combines deterministic playbooks, security tools, optional LLM guidance, operator approval, and evidence-backed reporting.
 
-Benchmark and evaluation results in this repository are self-scored engineering
-measurements. They are not independent third-party validation and do not support
-claims that KMN-CyberSeek outperforms another security agent. See
-`benchmarks/manifest.json` for the comparison policy.
+Use only against systems you own or have explicit written permission to test. Local command execution is **not isolated by default**. A Docker backend alone does not enforce target scope; deployment-level egress controls are required. See [Security and Operations](docs/reliability.md) before running an assessment.
 
-**Repository:** [https://github.com/KhitMinnyo/KMN-CyberSeek](https://github.com/KhitMinnyo/KMN-CyberSeek)
+## Quick Start
 
----
-
-## Recommended OS
-
-**Kali Linux** (all pentest tools pre-installed). Any Debian/Ubuntu-based distro with the standard security toolchain also works. macOS and plain Windows are not recommended.
-
-**RAM:** at least **8GB**, whether Kali is bare-metal or a VM. Below that, the backend/frontend/Metasploit/nmap combination — especially during a long-running autonomous session — can push the system into swap and make the UI (including clicking Approve) feel like it's hanging. If you're running a local Ollama model instead of a cloud API provider, budget several GB more on top of the 8GB baseline for the model itself (a 7B model needs roughly 6-8GB, 14B roughly 12-16GB).
-
----
-
-## Architecture
-
-```
-Streamlit Frontend  (port 8501)
-         │
-FastAPI Backend     (port 6000)
-   Orchestrator │ Scanner │ AI Connector │ SQLite DB
-         │               │               │
-   AI Engine         Nmap/NSE        Shell Exec
-  DeepSeek/Ollama   VulnScripts      (Kali env)
-```
-
----
-
-## Installation
-
-**Prerequisites:** Python 3.8+, Nmap (`sudo apt install nmap`), Ollama, or an API key for DeepSeek, OpenAI/ChatGPT, Anthropic Claude, or OpenRouter.
+**Requirements:** Python 3.10+, Nmap, and either an LLM API key or a local Ollama model. Kali Linux or a Debian-based security-testing environment is recommended.
 
 ```bash
 git clone https://github.com/KhitMinnyo/KMN-CyberSeek.git
@@ -47,234 +18,43 @@ cd KMN-CyberSeek
 ./start.sh
 ```
 
-`start.sh` creates the venv, installs dependencies, resolves port conflicts, and launches both services.
+Open `http://localhost:8501`, configure an AI provider in **Settings**, then create a session for an authorized target. Review and approve proposed actions unless you have deliberately configured an isolated lab for automated execution.
 
----
+The backend listens on port `6000` by default. `start.sh` creates the Python environment, installs dependencies, and starts the backend and dashboard.
 
-## Quick Start
+## What It Does
 
-1. Run `./start.sh`
-2. Open `http://localhost:8501`
-3. **Settings → AI Configuration** — connect Ollama or DeepSeek API key
-4. **New Session** — enter target IP / domain and confirm authorization
-5. Watch the session timeline advance through engagement phases
-6. Review **AI Decisions** — approve or let auto-approve handle it
-7. Monitor **Scan Results**, **Vulnerabilities**, **Credentials** as findings accumulate
+- Discovers hosts and services with Nmap and supported local security tools.
+- Tracks session jobs, events, findings, and evidence in SQLite.
+- Separates observed findings from operator-reviewed verification and retest results.
+- Reports assessment completeness separately from objective achievement.
+- Provides dashboard and headless CLI workflows, JSON/SARIF exports, and optional API inventory.
 
----
+Verification is not automatic for every scanner result. Reports distinguish operator review from command/attempt-bound evidence; neither is a substitute for professional validation.
 
 ## Configuration
 
-### AI — Ollama (local or remote)
+Copy `.env.example` to `.env` only if you need to change defaults. Configure an AI provider, target scope, authentication, and storage through environment variables. Keep API keys, access tokens, encryption keys, and engagement data out of Git.
 
-```env
-AI_PROVIDER=local
-OLLAMA_URL=http://192.168.1.50:11434
-OLLAMA_MODEL=qwen2.5:14b
-OLLAMA_CONTEXT_WINDOW=32768
-```
+The backend binds to localhost by default. The legacy `API_AUTH_TOKEN` mode is a single service-admin identity. Multi-user deployments can configure hashed bearer-token principals with `KMN_AUTH_PRINCIPALS_FILE`.
 
-Remote Ollama host: `OLLAMA_HOST=0.0.0.0 ollama serve`
+## Documentation
 
-### AI — DeepSeek API
-
-```env
-AI_PROVIDER=api
-DEEPSEEK_API_KEY=sk-...
-DEEPSEEK_MODEL=deepseek-chat
-```
-
-### AI — OpenAI / ChatGPT API
-
-```env
-AI_PROVIDER=openai
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o-mini
-```
-
-### AI — Anthropic Claude API
-
-```env
-AI_PROVIDER=anthropic
-ANTHROPIC_API_KEY=sk-ant-...
-ANTHROPIC_MODEL=claude-3-5-sonnet-latest
-```
-
-### AI — OpenRouter
-
-```env
-AI_PROVIDER=openrouter
-OPENROUTER_API_KEY=sk-or-...
-OPENROUTER_MODEL=openai/gpt-4o-mini
-```
-
-Set `AI_PROVIDER=none` to run without an LLM. In that mode deterministic scan,
-playbook, policy, verification, and reporting paths remain available; LLM-only
-creative exploit selection is explicitly reported as unavailable rather than
-silently guessed.
-
-### Ports
-
-```env
-BACKEND_PORT=6000
-FRONTEND_PORT=8501
-```
-
-### Security
-
-```env
-API_AUTH_TOKEN=          # auto-generated on first run
-BACKEND_HOST=127.0.0.1
-REQUIRE_APPROVAL_HIGH_RISK=true
-APPROVAL_TIMEOUT_MINUTES=15
-SCOPE_ALLOWLIST=10.0.0.0/8,lab.local
-```
-
-### Full Auto Mode
-
-```env
-FULL_AUTO_MODE=false   # true = no approval prompts — isolated labs only
-# Automated execution policy and the binary allowlist remain active in full-auto mode.
-```
-
-### Advanced tuning (optional)
-
-All have sensible defaults; set only if needed.
-
-# AI reply budget + determinism (DeepSeek API / Ollama)
-AI_MAX_TOKENS=4096        # cap on a single AI reply; too small truncates the JSON
-TACTICAL_TEMPERATURE=0.2  # low = fewer hallucinated flags/CVEs for command choice
-
-# Reverse-shell callback routing — a shell only works if the TARGET can reach your
-# listener. On a LAN lab the local IP works; a real internet target behind NAT needs
-# a reachable callback (public IP, ngrok tunnel, or a reverse-SSH endpoint).
-CALLBACK_MODE=auto        # auto | local | public | ngrok | manual
-EXPLOIT_LHOST=            # explicit callback host (VPS public IP / tunnel endpoint)
-EXPLOIT_LPORT=4444        # callback + local listener port
-EXPLOIT_PAYLOAD=          # default: guessed from target OS
-NGROK_AUTHTOKEN=          # required for CALLBACK_MODE=ngrok
-
-# CVE enrichment + exploitability ranking.
-NVD_API_KEY=             # https://nvd.nist.gov/developers/request-an-api-key
-NVD_MIN_INTERVAL=6.5     # seconds between NVD calls when no key is set
-MSF_CVE_RESOLVE=true     # resolve CVE -> Metasploit module via local msfconsole
-MSF_CVE_RESOLVE_LIMIT=3  # how many top-priority CVEs to resolve per pass
-
-# Optional session-aware Metasploit RPC transport. Leave empty to use the
-# managed msfconsole transport. Requires msgrpc and the msgpack dependency.
-MSFRPC_URL=
-MSFRPC_USER=msf
-MSFRPC_PASSWORD=
-MSFRPC_TOKEN=
-
-# Scan / command timeouts (seconds)
-SCAN_TIMEOUT=300
-# Use Nmap OS fingerprinting when the backend has raw-packet privileges; the
-# framework falls back to service/banner evidence for unprivileged runs.
-NMAP_OS_DETECTION=true
-VULN_SCAN_TIMEOUT=120
-VULN_SCAN_CONCURRENCY=4  # bounded parallel per-port NSE scans
-COMMAND_TIMEOUT=600
-# Autonomous execution is argv-first. Enable these only inside an isolated lab
-# if a workflow genuinely requires shell composition or an interpreter.
-AUTONOMOUS_SHELL_COMPOSITION=false
-AUTONOMOUS_RUNTIME_COMMANDS=false
-
-# Agentic-loop safety
-MAX_AUTO_PIVOTS=12       # auto-pivots before pausing for manual review
-MAX_EMPTY_RETRIES=3      # retries when the model returns no command
-WATCHDOG_STALL_SECONDS=  # default: COMMAND_TIMEOUT + 180 (stuck-session revival)
-
-# OSINT stage hold (public domain/host targets) — stops OSINT being skipped after
-# one turn. Advances once enough OSINT tools have run, or the turn cap is hit.
-OSINT_MIN_ACTIONS=3      # distinct OSINT tools before leaving the OSINT stage
-OSINT_MAX_TURNS=6        # hard cap so a low-OSINT target still advances
-
-# Coverage engine — methodology-driven per-service playbooks, known-exploit hints,
-# coverage-derived progress. ON by default; toggle live in Settings → Engine Features
-# (no .env editing needed). Target-agnostic.
-COVERAGE_ENGINE=true
-
-# Decoupled brute-force worker — background credential brute-force on discovered
-# auth services (SSH/FTP/RDP/MySQL/SMB/WinRM). Explicit opt-in; toggle in Settings.
-BRUTEFORCE_ENABLED=false   # explicit opt-in; may trigger account lockouts
-BRUTEFORCE_TIER=default            # default | rockyou | full
-BRUTEFORCE_MAX_SECONDS_PER_SERVICE=600
-BRUTEFORCE_CONCURRENCY=2
-```
-
-> **Tip:** Coverage Engine, Brute-force, and Full-Auto mode can be toggled at
-> runtime from **Settings → Engine Features** — changes apply immediately and are
-> saved to `.env` automatically, so end users never need to edit files.
-
----
-
-## Further Reading
-
-- [Evidence, Headless Workflows, and Deployment Boundaries](docs/reliability.md)
-- [Sandbox and Scope Enforcement](docs/sandbox.md)
-- [API Inventory and Bounded Assessment Jobs](docs/assessment.md)
-- [Optional Scoped Browser Observations](docs/browser.md)
-- [Features & Architecture Detail](features.md)
+- [Security, evidence, preflight, and operations](docs/reliability.md)
+- [Execution sandbox and scope controls](docs/sandbox.md)
+- [OpenAPI inventory and assessment coverage](docs/assessment.md)
+- [Optional browser observations](docs/browser.md)
+- [Features and architecture](features.md)
 - [Changelog](change_log.md)
 
-## Evidence-Backed Workflows
+## CLI
 
-Findings now carry stable IDs, lifecycle events, and evidence/artifact references.
-Scanner labels, model confidence, and successful command exits do not by themselves
-verify a vulnerability. An authenticated operator can review session-owned raw
-artifacts and record verification, remediation, and retest outcomes. This is an
-operator-reviewed workflow, not automatic proof that every scanner result is real.
+`cli.py` is an HTTP client for session status, evidence, inventory, verification, reports, and automation. Configure `KMN_API_URL` and `API_AUTH_TOKEN`, then run `python cli.py --help` for commands. Explicit authorization is required to start a session; full automation is never implied by headless mode.
 
-```bash
-# Configure KMN_API_URL and API_AUTH_TOKEN in the calling environment first.
-python cli.py start 192.0.2.1 --authorization-confirmed
-python cli.py status SESSION_ID
-python cli.py report SESSION_ID --format sarif --output report.sarif --fail-on high
-python cli.py inventory import SESSION_ID openapi.json --inventory-base-url https://api.example.test
-```
+## Evaluation
 
-The headless client preserves approval controls. JSON/SARIF exports omit raw
-commands, credentials, and evidence bodies. Legacy reports and archives remain
-sensitive. Explicit CLI output files use mode `0600` and never overwrite existing
-files. Reports remain available for completed sessions after a backend restart.
-
-Local execution remains **unisolated** by default. The optional Docker backend
-requires a preprovisioned image and externally enforced network policy, with no
-silent host fallback. Shared process-local execution limits bound running and
-queued commands. OpenAPI import inventories declared operations without sending
-requests; the optional browser adapter performs restricted observations, not
-automatic authorization or business-logic testing. See the linked guides before
-enabling these paths.
-
-## Session Retention
-
-Sessions persist their lifecycle events, background jobs, scan state, findings,
-and asset relationships in SQLite. The dashboard can export a portable session
-archive containing the report, event timeline, job records, and manifest:
-
-```text
-GET /api/sessions/{session_id}/archive
-GET /api/sessions/{session_id}/events
-GET /api/sessions/{session_id}/jobs
-POST /api/sessions/{session_id}/cancel
-```
-
-Independent NSE and ExploitDB lookups use bounded concurrency. State-dependent
-exploitation and post-exploitation actions remain ordered. Public targets do not
-receive a private workstation callback address unless a reachable callback mode
-or explicit public endpoint is configured.
-
----
-
-## Disclaimer
-
-**For authorised security testing and educational purposes only.**
-
-Only use against systems you own or have explicit written permission to test. The developers assume no liability for misuse or damage. `FULL_AUTO_MODE=true` executes destructive commands without confirmation — isolated lab environments only.
-
----
+Repository benchmark results are self-scored engineering measurements, not independent validation or evidence of superiority over another tool. See [Benchmark Methodology](benchmarks/README.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

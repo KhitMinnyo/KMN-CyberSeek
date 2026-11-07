@@ -28,7 +28,8 @@ OUTPUT_COMMANDS = [
 @pytest.fixture
 def server():
     calls = []
-    state = {"snapshot": build_report_snapshot({"session": {"status": "completed"}})}
+    state = {"snapshot": build_report_snapshot({"session": {"status": "completed"},
+                                                "completeness": {"verdict": "complete"}})}
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -45,7 +46,8 @@ def server():
         def handle_request(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             calls.append((self.command, self.path, self.headers.get("X-API-Key"), json.loads(body) if body else None))
-            if self.headers.get("X-API-Key") != "test-token":
+            if (self.headers.get("Authorization") != "Bearer test-token"
+                    or self.headers.get("X-API-Key") != "test-token"):
                 self.send_response(401)
                 self.end_headers()
                 self.wfile.write(b'{"detail":"private-error-secret"}')
@@ -103,11 +105,81 @@ def test_start_requires_explicit_authorization_and_safe_defaults(server):
     ("events", "GET", "/api/sessions/s1/events"),
     ("jobs", "GET", "/api/sessions/s1/jobs"),
     ("cancel", "POST", "/api/sessions/s1/cancel"),
+    ("completeness", "GET", "/api/sessions/s1/completeness"),
+    ("operations", "GET", "/api/sessions/s1/operations"),
+    ("usage", "GET", "/api/sessions/s1/telemetry/summary"),
+    ("sources", "GET", "/api/sessions/s1/sources"),
+    ("handoffs", "GET", "/api/sessions/s1/handoffs"),
 ])
 def test_lifecycle_api_contracts(server, command, method, path):
     options, calls, _ = server
     assert cli.main(options + [command, "s1"]) == 0
     assert calls[-1][:2] == (method, path)
+
+
+def test_preflight_requires_target_authorization_and_supports_session_read(server):
+    options, calls, _ = server
+    with pytest.raises(SystemExit) as exc:
+        cli.main(options + ["preflight", "192.0.2.1"])
+    assert exc.value.code == 2 and calls == []
+    assert cli.main(options + ["preflight", "192.0.2.1", "--authorization-confirmed",
+                               "--scope-allowlist", "192.0.2.0/24"]) == 0
+    assert calls[-1][:2] == ("POST", "/api/preflight")
+    assert calls[-1][3] == {"target": "192.0.2.1", "authorization_confirmed": True,
+                            "scope_allowlist": "192.0.2.0/24"}
+    assert cli.main(options + ["preflight", "--session-id", "a/b?c"]) == 0
+    assert calls[-1][:2] == ("GET", "/api/sessions/a%2Fb%3Fc/preflight")
+    assert calls[-1][3] is None
+
+
+@pytest.mark.parametrize("args", [[], [""], ["192.0.2.1", "--session-id", "s1", "--authorization-confirmed"],
+    ["--session-id", "s1", "--scope-allowlist", "192.0.2.0/24"],
+    ["--session-id", "s1", "--authorization-confirmed"]])
+def test_preflight_rejects_ambiguous_or_missing_configuration(server, args):
+    options, calls, _ = server
+    with pytest.raises(SystemExit) as exc:
+        cli.main(options + ["preflight"] + args)
+    assert exc.value.code == 2 and calls == []
+
+
+@pytest.mark.parametrize("command", ["status", "wait"])
+def test_closed_partial_assessments_never_succeed_or_keep_polling(server, command):
+    options, calls, state = server
+    for status in ("completed", "archived", "closed", "incomplete", "partial", "interrupted", "timed_out"):
+        for completeness in ({"verdict": "incomplete"}, {"verdict": "unknown"}, {}, None):
+            state["snapshot"] = build_report_snapshot({"session": {"status": status},
+                                                        "completeness": completeness})
+            before = len(calls)
+            assert cli.main(options + [command, "s1"]) == 9
+            assert len(calls) == before + 1
+    state["snapshot"].pop("completeness")
+    assert cli.main(options + [command, "s1"]) == 9
+
+
+@pytest.mark.parametrize("format", ["json", "sarif"])
+def test_report_partial_verdict_and_explicit_ci_gate(server, tmp_path, format):
+    options, calls, state = server
+    for verdict in ("incomplete", "unknown"):
+        state["snapshot"] = build_report_snapshot({"session": {"status": "completed"},
+                                                   "completeness": {"verdict": verdict}})
+        output = tmp_path / f"{verdict}.{format}"
+        args = options + ["report", "s1", "--format", format, "--output", str(output)]
+        assert cli.main(args) == 0
+        report = json.loads(output.read_text())
+        completeness = report["completeness"] if format == "json" else report["runs"][0]["properties"]["completeness"]
+        assert completeness["verdict"] == verdict
+        if format == "sarif":
+            assert report["runs"][0]["invocations"][0]["executionSuccessful"] is False
+        for threshold in ("none", "high"):
+            output.unlink()
+            assert cli.main(args + ["--fail-on", threshold]) == 9
+            assert output.is_file()
+        state["snapshot"]["findings"] = [{"verification": "verified", "severity": "critical", "id": "f1",
+                                          "name": "Reviewed finding"}]
+        output.unlink()
+        assert cli.main(args + ["--fail-on", "high"]) == 3
+        assert cli.main(options + ["wait", "s1", "--fail-on", "high"]) == 3
+        assert calls[-1][1] == "/api/sessions/s1/report.json"
 
 
 @pytest.mark.parametrize("status,pending,code", [
@@ -134,6 +206,7 @@ def test_report_sarif_and_threshold_use_verified_findings_only(server, tmp_path)
     options, calls, state = server
     state["snapshot"] = build_report_snapshot({
         "session": {"status": "completed"},
+        "completeness": {"verdict": "complete"},
         "vulnerabilities": [{"name": "Guess", "status": "potential", "risk_level": "critical"}],
     })
     output = tmp_path / "result.sarif"
@@ -161,8 +234,8 @@ def test_api_auth_errors_do_not_print_secret_response(server, capsys):
     assert cli.main(options + ["status", "s1"]) == 1
     output = capsys.readouterr()
     assert "HTTP 401" in output.err
-    assert "private-error-secret" not in output.err
-    assert "invalid-token" not in output.err
+    assert "private-error-secret" not in output.err + output.out
+    assert "invalid-token" not in output.err + output.out
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
@@ -186,7 +259,8 @@ def test_network_timeout_and_redirects_are_safe(monkeypatch, capsys):
 
 
 def test_wait_polls_until_complete_and_caps_request_deadline(monkeypatch, capsys):
-    snapshots = iter([{"session": {"status": "scanning"}}, {"session": {"status": "completed"}}])
+    snapshots = iter([{"session": {"status": "scanning"}},
+                      {"session": {"status": "completed"}, "completeness": {"verdict": "complete"}}])
     timeouts = []
     def call(self, path, **kwargs):
         timeouts.append(kwargs["timeout"])
@@ -249,6 +323,43 @@ def test_inventory_invalid_or_remote_input_never_sent(server, tmp_path, data):
     assert calls == []
 
 
+@pytest.mark.parametrize("kind", ["manifest", "sarif"])
+def test_source_import_sends_only_local_metadata(server, tmp_path, kind):
+    options, calls, _ = server
+    document = ({"version": 1, "source_id": "repo", "revision": "abc123", "digest": "a" * 64,
+                 "base_url": "https://example.com", "operations": []} if kind == "manifest" else
+                {"version": "2.1.0", "runs": []})
+    source = tmp_path / "metadata.json"
+    source.write_text(json.dumps(document))
+    args = options + ["source-import", "a/b?c", str(source), "--kind", kind]
+    payload = {"kind": kind, "document": document}
+    if kind == "sarif":
+        args += ["--source-id", "repo", "--revision", "abc123", "--digest", "a" * 64]
+        payload.update(source_id="repo", revision="abc123", digest="a" * 64)
+    assert cli.main(args) == 0
+    assert calls[-1][:2] == ("POST", "/api/sessions/a%2Fb%3Fc/sources/import")
+    assert calls[-1][3] == payload
+    assert str(source) not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("data", [b" " * (cli.MAX_INVENTORY_BYTES + 1), b"not JSON", b"[]"])
+def test_invalid_source_metadata_is_not_sent(server, tmp_path, data):
+    options, calls, _ = server
+    source = tmp_path / "metadata.json"
+    source.write_bytes(data)
+    assert cli.main(options + ["source-import", "s1", str(source)]) == 1
+    assert calls == []
+
+
+@pytest.mark.parametrize("args", [["--kind", "sarif"], ["--revision", "abc123"],
+    ["--kind", "sarif", "--source-id", "repo", "--revision", "abc123"]])
+def test_source_import_requires_complete_sarif_attribution(server, args):
+    options, calls, _ = server
+    with pytest.raises(SystemExit) as exc:
+        cli.main(options + ["source-import", "s1", "unused.json"] + args)
+    assert exc.value.code == 2 and calls == []
+
+
 def test_verify_requires_review_ack_and_explicit_result(server):
     options, calls, _ = server
     args = ["verify", "s1", "42", "--result", "positive", "--method", "manual check", "--artifact-id", "artifact1"]
@@ -259,6 +370,26 @@ def test_verify_requires_review_ack_and_explicit_result(server):
     assert calls[-1] == ("POST", "/api/sessions/s1/vulnerabilities/42/verification", "test-token", {
         "kind": "verification", "acknowledge_review": True, "result": "positive", "method": "manual check",
         "artifact_refs": ["artifact1"], "evidence": "Reviewed explicit positive response"})
+
+
+def test_verify_passes_explicit_runtime_pair_without_claiming_verification(server):
+    options, calls, _ = server
+    args = options + ["verify", "s1", "42", "--acknowledge-review", "--result", "positive",
+                      "--method", "operator review", "--artifact-id", "a1"]
+    assert cli.main(args + ["--command-id", "c1", "--attempt-id", "attempt1"]) == 0
+    assert calls[-1][3] == {"kind": "verification", "acknowledge_review": True, "result": "positive",
+                            "method": "operator review", "artifact_refs": ["a1"],
+                            "command_id": "c1", "attempt_id": "attempt1"}
+
+
+@pytest.mark.parametrize("pair", [["--command-id", "c1"], ["--attempt-id", "attempt1"],
+    ["--command-id", "", "--attempt-id", ""]])
+def test_verify_runtime_pair_is_required_before_http(server, pair):
+    options, calls, _ = server
+    with pytest.raises(SystemExit) as exc:
+        cli.main(options + ["verify", "s1", "42", "--acknowledge-review", "--result", "positive",
+                            "--method", "operator review", "--artifact-id", "a1"] + pair)
+    assert exc.value.code == 2 and calls == []
 
 
 @pytest.mark.parametrize("result", ["negative", "inconclusive"])
@@ -424,7 +555,7 @@ def test_backend_url_default_environment_and_explicit_override(monkeypatch, envi
 
     def call(self, path, **kwargs):
         calls.append((self.base_url, path))
-        return {"session": {"status": "completed"}}
+        return {"session": {"status": "completed"}, "completeness": {"verdict": "complete"}}
 
     monkeypatch.setattr(cli.Client, "call", call)
     args = ["--api-key", "test-token"]

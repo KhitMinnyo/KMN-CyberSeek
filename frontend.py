@@ -15,7 +15,9 @@ import html
 import json
 import logging
 import os
+import re
 import time
+from urllib.parse import quote, urlsplit
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -48,10 +50,179 @@ def _load_api_token() -> str:
     return os.getenv("API_AUTH_TOKEN", "")
 
 
-# Shared session so every backend request automatically carries the API key.
-# The backend rejects any /api/* request without a matching X-API-Key header.
-api_session = requests.Session()
-api_session.headers.update({"X-API-Key": _load_api_token()})
+class DashboardSession(requests.Session):
+    """Browser-local principal override, including legacy dashboard requests."""
+
+    def request(self, method, url, **kwargs):
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers = {k: v for k, v in headers.items() if k.lower() not in {"x-api-key", "authorization"}}
+        entered_token = st.session_state.get("principal_token", "")
+        if entered_token:
+            headers["Authorization"] = "Bearer " + entered_token.strip()
+        else:
+            headers["X-API-Key"] = _load_api_token()
+        kwargs["headers"] = headers
+        kwargs.setdefault("timeout", 15)
+        # This is a UI guard only. The server must independently enforce roles.
+        if not ui_allows(method, urlsplit(url).path):
+            response = requests.Response()
+            response.status_code = 403
+        else:
+            try:
+                response = super().request(method, url, **kwargs)
+            except requests.RequestException:
+                raise requests.RequestException("Backend request failed; check connectivity and access.") from None
+        if response.status_code >= 400:
+            # Never echo server bodies, request headers, or exception URLs into UI/logs.
+            response._content = json.dumps({"detail": f"Backend request unavailable (HTTP {response.status_code}).",
+                                            "message": f"Backend request unavailable (HTTP {response.status_code})."}).encode()
+            response.encoding = "utf-8"
+        return response
+
+
+api_session = DashboardSession()
+
+
+def can_operate():
+    identity = st.session_state.get("dashboard_identity", {})
+    role = identity.get("role", "")
+    return role in {"admin", "operator"}
+
+
+def can_review():
+    return st.session_state.get("dashboard_identity", {}).get("role") in {"admin", "reviewer"}
+
+
+def can_read_sensitive():
+    identity = st.session_state.get("dashboard_identity", {})
+    return identity.get("role") == "admin" or (
+        identity.get("role") in {"operator", "reviewer"} and identity.get("sensitive_read") is True)
+
+
+def ui_allows(method, path):
+    """Mirror route capabilities, not session grants; the server enforces both."""
+    method = method.upper()
+    role = st.session_state.get("dashboard_identity", {}).get("role")
+    if role == "admin":
+        return True
+    read = method in {"GET", "HEAD"}
+    if read and path in {"/", "/health", "/api/identity", "/api/docs", "/api/redoc", "/openapi.json", "/api/openapi.json",
+                         "/api/sessions", "/api/sessions/history", "/api/stats", "/api/vulnerabilities"}:
+        return True
+    if role not in {"viewer", "operator", "reviewer"}:
+        return False
+    match = re.fullmatch(r"/api/sessions/([^/]+)(?:/(.*))?", path)
+    suffix = (match.group(2) or "") if match else None
+    if match and match.group(1) != "history":
+        if read:
+            return suffix in {"", "report.json", "report.sarif", "vulnerabilities", "telemetry/summary", "completeness", "preflight"} or can_read_sensitive()
+        if suffix.endswith("/verification") or suffix == "waivers" or (suffix == "assessment/coverage" and role == "reviewer"):
+            return role == "reviewer"
+        if role == "operator" and (
+                suffix in {"full_auto", "complete", "cancel", "start", "analyze", "resume", "steer", "restart", "rescan"}
+                or (can_read_sensitive() and suffix in {"assessment/import", "assessment/coverage", "sources/import", "handoffs"})
+                or (can_read_sensitive() and suffix.startswith(("shells/", "pivot/")))):
+            return True
+        return suffix == "ask" and can_read_sensitive() and role in {"operator", "reviewer"}
+    return (method == "POST" and role == "operator" and path in {"/api/start", "/api/preflight", "/api/execute"}) or (
+        method == "POST" and role == "reviewer" and path == "/api/approve")
+
+
+def dashboard_api(method, path, payload=None, params=None, raw=False):
+    """Small offline-testable contract boundary; no sensitive error details."""
+    try:
+        response = api_session.request(method, f"{API_BASE}{path}", json=payload,
+                                       params=params, timeout=60 if method.upper() == "POST" and path.endswith("/handoffs") else 30)
+        if not 200 <= response.status_code < 300:
+            return {"error": f"Unavailable (HTTP {response.status_code})."}
+        return {"content": response.content} if raw else response.json()
+    except Exception:
+        return {"error": "Backend request failed; check connectivity and access."}
+
+
+def session_path(session_id):
+    return f"/sessions/{quote(str(session_id), safe='')}"
+
+
+def render_checks(result):
+    """A missing readiness contract must never become an implicit approval."""
+    if not isinstance(result, dict) or result.get("error"):
+        st.warning("Preflight unavailable. Session start is blocked.")
+        return False
+    checks = result.get("checks", [])
+    if isinstance(checks, dict):
+        checks = [{"name": name, **(value if isinstance(value, dict) else {"status": value})}
+                  for name, value in checks.items()]
+    if not isinstance(checks, list) or any(not isinstance(check, dict) for check in checks):
+        st.warning("Preflight contract is incomplete. Session start is blocked.")
+        return False
+    for check in checks:
+        status = check.get("status", "unknown")
+        label = f"{check.get('name', check.get('id', 'Check'))}: {status}"
+        if status in {"fail", "failed", "blocked"}:
+            st.error(label)
+        elif status in {"warn", "warning"}:
+            st.warning(label)
+        else:
+            st.info(label)
+    ready = result.get("ready") is True and bool(checks) and all(
+        check.get("status") in {"ready", "pass", "passed", "warn", "warning"} for check in checks)
+    if not ready:
+        st.warning("Preflight is incomplete or failed. Session start is blocked.")
+    return ready
+
+
+def render_report_status(snapshot):
+    summary = snapshot.get("summary", {})
+    session = snapshot.get("session", {})
+    completeness = snapshot.get("completeness", session.get("assessment_completeness", summary.get("completeness", {})))
+    st.markdown("#### Server Report Status")
+    st.write({"completeness": completeness.get("verdict", "unknown") if isinstance(completeness, dict) else "unknown",
+              "objective_complete": summary.get("objective_complete", session.get("objective_complete", "unknown")),
+              "closure": snapshot.get("closure", session.get("closure", session.get("status", "unknown")))})
+    missing = completeness.get("missing_checks", []) if isinstance(completeness, dict) else []
+    missing = snapshot.get("missing_checks", summary.get("missing_checks", missing))
+    if missing:
+        st.write({"missing_checks": [{k: check[k] for k in ("endpoint_id", "role", "category", "status") if k in check}
+                                      for check in missing if isinstance(check, dict)]})
+    if not isinstance(completeness, dict) or completeness.get("verdict") != "complete":
+        st.warning("Partial/incomplete report: completeness is not confirmed by the server. Closure and objective completion do not imply full coverage.")
+    if isinstance(completeness, dict) and completeness.get("blockers"):
+        st.write({"blockers": [{k: check[k] for k in ("endpoint_id", "role", "category", "status", "reason") if k in check}
+                               for check in completeness["blockers"] if isinstance(check, dict)]})
+
+
+def show_safe_report(session_id):
+    if st.button("Prepare Safe JSON Report", key=f"safe_report_{session_id}"):
+        result = dashboard_api("GET", session_path(session_id) + "/report.json")
+        key = f"safe_snapshot_{session_id}"
+        st.session_state.pop(key, None)
+        if result.get("error"):
+            st.error(result["error"])
+        else:
+            st.session_state[key] = json.dumps(result, indent=2)
+    data = st.session_state.get(f"safe_snapshot_{session_id}")
+    if data:
+        st.download_button("Download Safe JSON", data, file_name="safe-report.json",
+                           mime="application/json", key=f"safe_download_{session_id}")
+
+
+def sensitive_export_ack(session_id, scope="overview"):
+    st.warning("Legacy exports may contain credentials, raw commands, AI decisions, and other sensitive data. Do not share them as safe reports.")
+    acknowledged = st.checkbox("I acknowledge sensitive legacy exports", value=False,
+                               key=f"legacy_ack_{scope}_{session_id}")
+    if not acknowledged or not can_read_sensitive():
+        prefixes = (("_report_md_", "_report_docx_", "_session_archive_") if scope == "overview"
+                    else ("_export_json_", "_export_pdf_", "_export_html_"))
+        for prefix in prefixes:
+            st.session_state.pop(prefix + session_id, None)
+    return acknowledged and can_read_sensitive()
+
+
+def principal_changed():
+    token = st.session_state.get("principal_token", "")
+    st.session_state.clear()
+    st.session_state["principal_token"] = token
 
 # Session selectbox callback functions
 def sync_sidebar():
@@ -229,6 +400,7 @@ def get_session_details(session_id: str):
                 "vulnerabilities": session_report.get("vulnerabilities", []),
                 "credentials": session_report.get("credentials", []),
                 "summary": summary,
+                "completeness": session_report.get("completeness", session_data.get("assessment_completeness", {})),
                 "discovered_hosts_count": summary.get("total_hosts", len(session_report.get("discovered_hosts", []))),
                 "discovered_services_count": summary.get("total_services", len(session_report.get("discovered_services", []))),
                 "commands_executed_count": summary.get("total_commands", len(session_report.get("commands_executed", []))),
@@ -610,6 +782,15 @@ def main():
         st.markdown("## 🛡️ KMN-CyberSeek")
         st.caption(f"v{APP_VERSION} — AI-Driven Red Team Operator")
         st.markdown("---")
+
+        st.text_input("Principal API token (this browser only)", type="password",
+                      key="principal_token", on_change=principal_changed,
+                      help="Blank uses the shared service-admin token in legacy mode only. An entered token uses Bearer authentication, with no admin fallback. Never written to a file.")
+        identity = dashboard_api("GET", "/identity")
+        st.session_state["dashboard_identity"] = identity if not identity.get("error") else {}
+        st.caption("Role: " + str(st.session_state["dashboard_identity"].get("role", "unknown")))
+        st.caption("Identity mode: " + str(st.session_state["dashboard_identity"].get("identity_mode", "unavailable")))
+        st.caption("UI controls are advisory; authorization must be enforced by the server.")
         
         # Backend status
         backend_healthy = check_backend_health()
@@ -711,7 +892,10 @@ def main():
         elif selected == "Active Sessions":
             show_active_sessions()
         elif selected == "Command Console":
-            show_command_console()
+            if can_operate() and can_read_sensitive():
+                show_command_console()
+            else:
+                st.info("Command Console requires an operator with sensitive-read permission.")
         elif selected == "Threat Intel":
             show_threat_intel()
         elif selected == "Schedules":
@@ -721,7 +905,10 @@ def main():
         elif selected == "Docs":
             show_docs()
         elif selected == "Settings":
-            show_settings()
+            if st.session_state.get("dashboard_identity", {}).get("role") == "admin":
+                show_settings()
+            else:
+                st.info("Settings require an administrator role.")
 
 
 def show_dashboard():
@@ -879,7 +1066,7 @@ def show_new_session():
             with col1:
                 auto_approval = st.checkbox(
                     "Auto-run routine LOW/MEDIUM commands",
-                    value=True,
+                    value=False,
                     help="Automatically execute routine reconnaissance and enumeration commands. HIGH-risk actions still wait for approval."
                 )
 
@@ -927,7 +1114,7 @@ def show_new_session():
             submitted = st.form_submit_button(
                 "🚀 Start New Session",
                 use_container_width=True,
-                type="primary"
+                type="primary", disabled=not can_operate()
             )
         
         if submitted:
@@ -936,6 +1123,13 @@ def show_new_session():
                 return
             if not authorization_confirmed:
                 st.error("You must confirm authorization to test this target before starting a session.")
+                return
+
+            preflight = dashboard_api("POST", "/preflight", {
+                "target": target_ip,
+                "authorization_confirmed": authorization_confirmed,
+            })
+            if not render_checks(preflight):
                 return
 
             # Show loading spinner
@@ -1052,6 +1246,13 @@ def display_session_details(session_details: Dict):
             st.caption("🟢 live" if _auto_on else "⏸ manual")
 
     st.markdown("---")
+    safe_report = dashboard_api("GET", session_path(session_details["session_id"]) + "/report.json")
+    render_report_status(safe_report)
+    if not can_read_sensitive():
+        show_safe_report(session_details["session_id"])
+        show_finding_lifecycle(session_details["session_id"], safe_report)
+        st.info("This identity has safe-report access only. Sensitive session panels are unavailable.")
+        return
     
     # Session tabs — show pending command count on Commands tab so operator
     # knows when manual approval is needed without opening the tab first.
@@ -1061,9 +1262,9 @@ def display_session_details(session_details: Dict):
     _shell_count = len(get_shell_sessions(session_details.get("session_id", "")))
     _shell_label = f"🐚 Shells ({_shell_count})" if _shell_count else "🐚 Shells"
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
         ["📊 Overview", "🔍 Scan Results", "🛡️ Vulnerabilities", "🤖 AI Decisions",
-         cmd_tab_label, "📁 Evidence", "🔑 Credentials", _shell_label]
+         cmd_tab_label, "📁 Evidence", "🔑 Credentials", _shell_label, "API Coverage", "Operations", "Sources / Handoffs"]
     )
 
     with tab1:
@@ -1073,7 +1274,7 @@ def display_session_details(session_details: Dict):
         show_scan_results(session_details)
 
     with tab3:
-        show_vulnerabilities(session_details)
+        show_finding_lifecycle(session_details["session_id"], safe_report)
 
     with tab4:
         show_ai_decisions(session_details)
@@ -1088,7 +1289,19 @@ def display_session_details(session_details: Dict):
         show_credentials(session_details)
 
     with tab8:
-        show_shells(session_details)
+        if can_operate():
+            show_shells(session_details)
+        else:
+            st.info("Shell execution requires an operator role.")
+
+    with tab9:
+        show_assessment(session_details["session_id"])
+
+    with tab10:
+        show_operations(session_details["session_id"])
+
+    with tab11:
+        show_sources_and_handoffs(session_details["session_id"], safe_report)
 
     # Floating 💬 AI chat bubble — visible from any tab of this session.
     render_floating_chat(session_details)
@@ -1142,7 +1355,7 @@ def _render_steer_ask_widgets(session_id: str, session_details: Dict):
     is_active = status in ("scanning", "analyzing", "executing", "ready")
 
     # ── Steer — ONLY for a live/active session (keeps the chat clean) ──
-    if is_active:
+    if is_active and can_operate():
         active_instr = session_details.get("operator_instructions", [])
         if active_instr:
             st.caption("AI is following: " + " · ".join(f"`{i}`" for i in active_instr[-4:]))
@@ -1276,12 +1489,12 @@ def show_session_overview(session_details: Dict):
             _ac, _dc = st.columns([1, 1])
             with _ac:
                 if st.button(f"✅ Approve", key=f"ov_approve_{_pc['command_id']}",
-                             use_container_width=True, type="primary"):
+                             use_container_width=True, type="primary", disabled=not can_review()):
                     approve_command(session_id, _pc["command_id"])
                     st.rerun()
             with _dc:
                 if st.button(f"❌ Deny", key=f"ov_deny_{_pc['command_id']}",
-                             use_container_width=True):
+                             use_container_width=True, disabled=not can_review()):
                     deny_command(session_id, _pc["command_id"])
                     st.rerun()
         st.markdown("")
@@ -1461,7 +1674,7 @@ def show_session_overview(session_details: Dict):
     with fa_col2:
         _fa_label = "Turn Off" if _full_auto_on else "Turn On"
         if st.button(f"⚡ {_fa_label}", key=f"toggle_full_auto_{session_id}",
-                     use_container_width=True):
+                     use_container_width=True, disabled=not can_operate()):
             if set_session_full_auto(session_id, not _full_auto_on):
                 time.sleep(0.3)
                 st.rerun()
@@ -1481,7 +1694,7 @@ def show_session_overview(session_details: Dict):
             st.button("🚀 Start",
                       help="Run initial nmap scan and begin AI analysis",
                       type="primary" if not in_progress else "secondary",
-                      disabled=in_progress,
+                       disabled=in_progress or not can_operate(),
                       use_container_width=True,
                       on_click=lambda: api_session.post(f"{API_BASE}/sessions/{session_id}/start") or time.sleep(0.3))
         else:
@@ -1489,7 +1702,7 @@ def show_session_overview(session_details: Dict):
             if st.button("▶️ Resume",
                          help="Continue AI analysis from current scan data (no re-scan). Disabled while session is already running.",
                          type="primary" if not in_progress else "secondary",
-                         disabled=in_progress,
+                          disabled=in_progress or not can_operate(),
                          use_container_width=True):
                 api_session.post(f"{API_BASE}/sessions/{session_id}/resume")
                 time.sleep(0.5)
@@ -1500,16 +1713,16 @@ def show_session_overview(session_details: Dict):
         if st.button("🔄 Reset AI",
                      help="Keep scan data — clear AI decisions/commands and re-analyze. "
                           "Safe to use while session is running (stops the current loop).",
-                     type="primary" if _reset_primary else "secondary",
-                     use_container_width=True):
+                      type="primary" if _reset_primary else "secondary",
+                      use_container_width=True, disabled=not can_operate()):
             api_session.post(f"{API_BASE}/sessions/{session_id}/restart")
             time.sleep(0.5)
             st.rerun()
 
     with btn_col3:
         if st.button("🗑️ Delete",
-                     help="Permanently delete this session and all its data",
-                     use_container_width=True):
+                      help="Permanently delete this session and all its data",
+                      use_container_width=True, disabled=not ui_allows("DELETE", "/api" + session_path(session_id))):
             response = api_session.delete(f"{API_BASE}/sessions/{session_id}")
             if response.status_code == 200:
                 st.session_state.selected_session = None
@@ -1530,7 +1743,7 @@ def show_session_overview(session_details: Dict):
                      help="Immediately halt this session — cancels any pending/queued command "
                           "and the running AI loop right now. Unlike a Steer instruction, this "
                           "does not wait for the AI to agree to stop.",
-                     use_container_width=True):
+                      use_container_width=True, disabled=not can_operate()):
             result = cancel_session(session_id)
             if result.get("status") == "error":
                 st.error(f"Failed to stop session: {result.get('message', 'unknown error')}")
@@ -1543,8 +1756,8 @@ def show_session_overview(session_details: Dict):
     if has_data:
         if st.button("🔁 Full Rescan",
                      help="Days have passed and port state may have changed? "
-                          "Clears ALL data (scan + AI) and re-runs nmap from scratch.",
-                     use_container_width=True):
+                           "Clears ALL data (scan + AI) and re-runs nmap from scratch.",
+                      use_container_width=True, disabled=not can_operate()):
             api_session.post(f"{API_BASE}/sessions/{session_id}/rescan")
             time.sleep(0.5)
             st.rerun()
@@ -1555,11 +1768,13 @@ def show_session_overview(session_details: Dict):
     # the next rerun and the download never fired ("can't export"). Fix: fetch on
     # click, stash the bytes in session_state, and render a persistent download
     # button from that state so it stays available across reruns.
+    show_safe_report(session_id)
+    legacy_ack = sensitive_export_ack(session_id)
     rep_col1, rep_col2 = st.columns(2)
     _md_key = f"_report_md_{session_id}"
     _docx_key = f"_report_docx_{session_id}"
     with rep_col1:
-        if st.button("📝 Generate Markdown Report", use_container_width=True):
+        if st.button("📝 Generate Markdown Report", use_container_width=True, disabled=not legacy_ack) and legacy_ack:
             with st.spinner("Generating report…"):
                 try:
                     resp = api_session.get(f"{API_BASE}/sessions/{session_id}/report/md", timeout=120)
@@ -1571,7 +1786,7 @@ def show_session_overview(session_details: Dict):
                 except Exception as e:
                     st.session_state.pop(_md_key, None)
                     st.error(f"Could not reach backend: {e}")
-        if st.session_state.get(_md_key):
+        if legacy_ack and st.session_state.get(_md_key):
             st.download_button(
                 label="💾 Save Markdown (.md)",
                 data=st.session_state[_md_key],
@@ -1581,7 +1796,7 @@ def show_session_overview(session_details: Dict):
                 key=f"dl_md_{session_id}",
             )
     with rep_col2:
-        if st.button("📄 Generate DOCX Report", use_container_width=True):
+        if st.button("📄 Generate DOCX Report", use_container_width=True, disabled=not legacy_ack) and legacy_ack:
             with st.spinner("Generating report…"):
                 try:
                     resp = api_session.get(f"{API_BASE}/sessions/{session_id}/report", timeout=120)
@@ -1593,7 +1808,7 @@ def show_session_overview(session_details: Dict):
                 except Exception as e:
                     st.session_state.pop(_docx_key, None)
                     st.error(f"Could not reach backend: {e}")
-        if st.session_state.get(_docx_key):
+        if legacy_ack and st.session_state.get(_docx_key):
             st.download_button(
                 label="💾 Save DOCX",
                 data=st.session_state[_docx_key],
@@ -1605,7 +1820,7 @@ def show_session_overview(session_details: Dict):
 
     # Portable retention bundle: session snapshot + durable event/job timeline.
     _archive_key = f"_session_archive_{session_id}"
-    if st.button("📦 Generate Session Archive", use_container_width=True):
+    if st.button("📦 Generate Session Archive", use_container_width=True, disabled=not legacy_ack) and legacy_ack:
         with st.spinner("Building session archive…"):
             try:
                 resp = api_session.get(
@@ -1619,7 +1834,7 @@ def show_session_overview(session_details: Dict):
             except Exception as e:
                 st.session_state.pop(_archive_key, None)
                 st.error(f"Could not reach backend: {e}")
-    if st.session_state.get(_archive_key):
+    if legacy_ack and st.session_state.get(_archive_key):
         st.download_button(
             label="💾 Save Session Archive (.zip)",
             data=st.session_state[_archive_key],
@@ -2009,7 +2224,7 @@ def show_commands(session_details: Dict):
         with col2:
             approve_col, deny_col = st.columns(2)
             with approve_col:
-                if st.button("✅", key=f"approve_{cmd['command_id']}", help="Approve command"):
+                if st.button("✅", key=f"approve_{cmd['command_id']}", help="Approve command", disabled=not can_review()):
                     result = approve_command(session_details["session_id"], cmd["command_id"])
                     if result:
                         st.success(f"Command {cmd['command_id']} approved.")
@@ -2017,7 +2232,7 @@ def show_commands(session_details: Dict):
                     else:
                         st.error("Failed to approve command.")
             with deny_col:
-                if st.button("❌", key=f"deny_{cmd['command_id']}", help="Deny command"):
+                if st.button("❌", key=f"deny_{cmd['command_id']}", help="Deny command", disabled=not can_review()):
                     result = deny_command(session_details["session_id"], cmd["command_id"])
                     if result:
                         st.warning(f"Command {cmd['command_id']} denied.")
@@ -2120,10 +2335,10 @@ def show_commands(session_details: Dict):
     col1, col2, col3 = st.columns([1, 1, 2])
     
     with col1:
-        auto_approve = st.checkbox("Auto-approve", value=True)
+        auto_approve = st.checkbox("Auto-approve", value=False)
 
     with col2:
-        if st.button("▶️ Execute", use_container_width=True) and manual_command:
+        if st.button("▶️ Execute", use_container_width=True, disabled=not (can_operate() and can_read_sensitive())) and manual_command:
             result = execute_command(session_details["session_id"], manual_command, auto_approve)
             if not result:
                 st.error("Failed to submit command.")
@@ -2138,66 +2353,314 @@ def show_commands(session_details: Dict):
 
 
 def show_evidence(session_details: Dict):
-    """Show collected evidence."""
-    st.info("Evidence collection is automatic. All successful command outputs are stored as evidence.")
-    
-    # Get real evidence from backend
-    evidence_list = session_details.get('evidence', [])
-    commands_executed = session_details.get('commands_executed', [])
-    
-    # Filter successful commands to only show "interesting" artifacts
-    noise_commands = ['curl -i', 'curl -s', 'whatweb', 'ping', 'whoami', 'id', 'pwd']
-    interesting_artifacts = []
-    
-    for cmd in commands_executed:
-        if not cmd.get('success', False):
-            continue
-            
-        cmd_text = cmd.get('command', '').lower()
-        output_len = len(cmd.get('output', ''))
-        
-        # Check if it's a basic noise command
-        is_noise = any(noise in cmd_text for noise in noise_commands)
-        
-        # Include it if it's NOT noise, OR if it produced a significantly large output (potential finding)
-        if not is_noise or output_len > 500:
-            interesting_artifacts.append(cmd)
-            
-    # Check if we have any evidence or successful commands
-    if not evidence_list and not interesting_artifacts:
-        st.info("No evidence or significant artifacts collected yet.")
+    """Manifest-only preview; raw bytes are fetched only after a separate click."""
+    sid = session_details["session_id"]
+    path = session_path(sid)
+    result = dashboard_api("GET", path + "/artifacts")
+    if result.get("error"):
+        st.warning("Artifact manifests unavailable. No raw evidence was requested.")
+    manifests = result.get("artifacts", [])
+    fields = ("id", "attempt_id", "stream", "outcome", "sha256", "sha256_scope",
+              "size_bytes", "stored_bytes", "truncated", "encrypted", "protection")
+    st.caption("Safe preview shows manifest metadata only, not evidence bodies or command output.")
+    if manifests:
+        st.dataframe([{k: m[k] for k in fields if k in m} for m in manifests], hide_index=True)
+        if any(m.get("truncated") for m in manifests):
+            st.warning("Evidence is partial: at least one artifact was truncated.")
+        ids = [m["id"] for m in manifests]
+        artifact_id = st.selectbox("Artifact to download", ids, key=f"artifact_select_{sid}")
+        ack = st.checkbox("I acknowledge raw evidence may contain credentials and sensitive data",
+                          value=False, key=f"raw_ack_{sid}")
+        raw_key = f"raw_artifact_{sid}"
+        cached = st.session_state.get(raw_key, {})
+        if not ack or cached.get("id") != artifact_id or not can_read_sensitive():
+            st.session_state.pop(raw_key, None)
+        if st.button("Prepare Sensitive Evidence Download", key=f"raw_prepare_{sid}",
+                     disabled=not (ack and can_read_sensitive())) and ack and can_read_sensitive():
+            st.session_state.pop(raw_key, None)
+            raw = dashboard_api("GET", path + f"/artifacts/{quote(artifact_id, safe='')}/content",
+                                params={"acknowledge_sensitive": "true"}, raw=True)
+            if raw.get("error"):
+                st.error(raw["error"])
+            else:
+                st.session_state[raw_key] = {"id": artifact_id, "content": raw["content"]}
+        if ack and can_read_sensitive() and raw_key in st.session_state:
+            st.download_button("Download Sensitive Evidence", st.session_state[raw_key]["content"],
+                               file_name="sensitive-evidence.bin", mime="application/octet-stream",
+                               key=f"raw_download_{sid}")
+    else:
+        st.session_state.pop(f"raw_artifact_{sid}", None)
+        st.info("No committed evidence manifests available.")
+    show_legacy_evidence_exports(session_details)
+
+
+def submit_finding_review(session_id, finding_id, manifests, kind, result, method, refs, acknowledged,
+                          command_id="", attempt_id=""):
+    """Only actionable server UUIDs and this session's committed artifacts."""
+    if (not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", finding_id)
+            or acknowledged is not True or not method.strip() or len(method) > 200
+            or any(ord(c) < 32 or ord(c) == 127 for c in method)
+            or not 1 <= len(refs) <= 32 or len(refs) != len(set(refs))
+            or not set(refs).issubset({m.get("id") for m in manifests})
+            or kind not in {"verification", "remediation", "retest"}
+            or result not in ({"applied"} if kind == "remediation" else {"positive", "negative", "inconclusive"})):
+        return {"error": "Review requires an actionable finding UUID, a method, committed artifacts, and explicit acknowledgement."}
+    command_id, attempt_id = command_id.strip(), attempt_id.strip()
+    if bool(command_id) != bool(attempt_id) or (command_id and any(
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", value) for value in (command_id, attempt_id))):
+        return {"error": "Runtime evidence binding requires both command ID and attempt ID (at most 200 characters each)."}
+    payload = {
+        "kind": kind, "result": result, "method": method.strip(),
+        "artifact_refs": refs, "acknowledge_review": True,
+    }
+    if command_id:
+        payload.update(command_id=command_id, attempt_id=attempt_id)
+    return dashboard_api("POST", session_path(session_id) + f"/vulnerabilities/{finding_id}/verification", payload)
+
+
+def show_finding_lifecycle(session_id, snapshot):
+    st.caption("Server-sanitized findings. Source labels, severity and successful commands are not verification.")
+    if snapshot.get("error"):
+        st.warning("Safe findings unavailable.")
         return
-    
-    # Display evidence
-    if evidence_list:
-        st.markdown(f"### 📁 Collected Evidence ({len(evidence_list)} items)")
-        for i, evidence in enumerate(evidence_list):
-            with st.expander(f"Evidence #{i+1} - {evidence.get('type', 'Unknown')}"):
-                st.markdown(f"**Type:** {evidence.get('type', 'N/A')}")
-                st.markdown(f"**Description:** {evidence.get('description', 'No description')}")
-                st.markdown(f"**Timestamp:** {evidence.get('timestamp', 'Unknown')}")
-                st.markdown("**Content:**")
-                st.code(evidence.get('content', 'No content available'), language="text")
+    findings = snapshot.get("findings", [])
+    if not findings:
+        st.info("No findings in this snapshot. This does not establish complete coverage.")
+        return
+    fields = ("id", "name", "severity", "verification", "lifecycle", "remediation_verified", "source_status", "host", "port", "service", "evidence_refs", "provenance")
+    st.dataframe([{k: f[k] for k in fields if k in f} for f in findings], hide_index=True)
+    if not can_review() or not can_read_sensitive():
+        st.caption("Lifecycle review requires a reviewer role and access to committed artifact metadata. Operators cannot approve their own execution through this form.")
+        return
+    actionable = [f["id"] for f in findings if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", f.get("id", ""))]
+    if not actionable:
+        st.warning("Legacy findings have no actionable UUID. Review is unavailable until IDs are persisted by the server.")
+        return
+    manifests = dashboard_api("GET", session_path(session_id) + "/artifacts").get("artifacts", [])
+    finding_id = st.selectbox("Finding UUID", actionable, key=f"review_finding_{session_id}")
+    # Outside the form so result choices update immediately when the lifecycle kind changes.
+    kind = st.selectbox("Lifecycle action", ["verification", "remediation", "retest"], key=f"review_kind_{session_id}")
+    with st.form(f"finding_review_{session_id}_{finding_id}_{kind}"):
+        result = st.selectbox("Review result", ["applied"] if kind == "remediation" else ["inconclusive", "positive", "negative"])
+        method = st.text_input("Actual review method (required)", max_chars=200)
+        refs = st.multiselect("Committed artifact references (required)", [m["id"] for m in manifests])
+        st.caption("Without both runtime IDs this is review-only, not runtime-bound verification. The server validates command, attempt, target, and artifacts when both are supplied.")
+        command_id = st.text_input("Runtime command ID (optional pair)", max_chars=200)
+        attempt_id = st.text_input("Runtime attempt ID (optional pair)", max_chars=200)
+        acknowledged = st.checkbox("I reviewed these actual artifacts and acknowledge this operator assessment", value=False)
+        submitted = st.form_submit_button("Record Lifecycle Review", disabled=not can_review() or not manifests)
+        if submitted and can_review():
+            response = submit_finding_review(session_id, finding_id, manifests, kind, result, method, refs, acknowledged,
+                                             command_id, attempt_id)
+            if response.get("error"):
+                st.error(response["error"])
+            else:
+                st.session_state.pop(f"safe_snapshot_{session_id}", None)
+                st.success("Review recorded. Refresh to see the server's updated verification state.")
+
+
+def show_assessment(session_id):
+    path = session_path(session_id) + "/assessment"
+    st.caption("Declared endpoint x role x category coverage. Import does not execute requests or establish verification. Use credential references only, never credential literals.")
+    with st.expander("Import OpenAPI JSON"):
+        with st.form(f"assessment_import_{session_id}"):
+            upload = st.file_uploader("OpenAPI 3.x JSON (maximum 2 MiB)", type=["json"], key=f"openapi_{session_id}")
+            base_url = st.text_input("Explicit base URL (no credentials)")
+            roles = st.text_area("Roles JSON (env:, vault:, or keyring: references only)", value='{"anonymous": null}')
+            categories = st.text_input("Categories (comma separated)", value="observation")
+            if st.form_submit_button("Import Declared Inventory", disabled=not (can_operate() and can_read_sensitive())) and can_operate() and can_read_sensitive():
+                try:
+                    document = read_local_json(upload)
+                    role_map = json.loads(roles)
+                    if not isinstance(document, dict) or not isinstance(role_map, dict):
+                        raise ValueError
+                    response = dashboard_api("POST", path + "/import", {
+                        "document": document, "base_url": base_url, "roles": role_map,
+                        "categories": [c.strip() for c in categories.split(",") if c.strip()],
+                    })
+                    if response.get("error"):
+                        st.error(response["error"])
+                    else:
+                        st.success("Inventory imported without executing tests.")
+                except (ValueError, TypeError, UnicodeError, RecursionError):
+                    st.error("Select bounded OpenAPI JSON and a roles object. Input contents are not displayed.")
+    assessment = dashboard_api("GET", path)
+    if assessment.get("error"):
+        st.info("Assessment inventory unavailable or not imported.")
+        return
+    snapshot = assessment.get("snapshot", {})
+    endpoints = snapshot.get("endpoints", [])
+    coverage = snapshot.get("coverage", [])
+    # Do not render imported documents, role credential refs, or arbitrary metadata.
+    st.dataframe([{k: e[k] for k in ("id", "method", "path") if k in e} for e in endpoints], hide_index=True)
+    st.dataframe([{k: c[k] for k in ("endpoint_id", "role", "category", "status", "attempts", "evidence_ref") if k in c}
+                  for c in coverage], hide_index=True)
+    if not coverage:
+        st.warning("Coverage matrix is empty/incomplete.")
+        return
+    if any(c.get("status") != "verified" for c in coverage):
+        st.warning("Coverage is partial. Attempts, blocked and skipped cells are not verified tests.")
+    with st.form(f"coverage_update_{session_id}"):
+        index = st.selectbox("Coverage cell", list(range(len(coverage))), format_func=lambda i:
+                             " / ".join(str(coverage[i].get(k, "")) for k in ("endpoint_id", "role", "category")))
+        statuses = ["attempted", "inconclusive", "blocked", "skipped"]
+        if can_review():
+            statuses.append("verified")
+        status = st.selectbox("New coverage status", statuses)
+        evidence_ref = st.text_input("Evidence reference (evidence:..., required for verified)")
+        allowed = ui_allows("PATCH", "/api" + path + "/coverage")
+        if st.form_submit_button("Record Attempt / Status", disabled=not allowed) and allowed:
+            if (status == "attempted" and evidence_ref.strip()) or (status == "verified" and not evidence_ref.strip()):
+                st.error("Attempts cannot attach evidence; verified status requires an evidence reference.")
+            else:
+                payload = {k: coverage[index][k] for k in ("endpoint_id", "role", "category")}
+                payload["status"] = status
+                if evidence_ref.strip():
+                    payload["evidence_ref"] = evidence_ref.strip()
+                response = dashboard_api("PATCH", path + "/coverage", payload)
+                if response.get("error"):
+                    st.error(response["error"])
+                else:
+                    st.success("Coverage updated. Refresh to see the durable server state.")
+
+
+def show_operations(session_id):
+    path = session_path(session_id)
+    for title, suffix, section, fields in (
+        ("Model Usage Summary", "/telemetry/summary", "summary", ("events", "calls", "blocked", "errors", "pending", "unknown_usage_calls", "unknown_cost_calls", "total_tokens", "cost_usd", "budget_tokens", "budget_cost_usd")),
+        ("Model Usage Events", "/telemetry/events", "events", ("id", "purpose", "operation_id", "retry_ordinal", "provider", "model", "status", "latency_ms", "input_tokens", "output_tokens", "total_tokens", "cost_usd", "estimated_input_tokens", "estimated_output_tokens", "estimated_cost_usd", "reserved_tokens", "reserved_cost_usd", "parse_result")),
+        ("Session Preflight", "/preflight", "checks", ("name", "id", "status")),
+        ("Operations / Checkpoints", "/operations", "operations", ("id", "operation_id", "attempt_id", "status", "state", "checkpoint", "config_revision", "created_at", "updated_at", "artifact_refs", "command_id")),
+    ):
+        st.markdown(f"#### {title}")
+        if not ui_allows("GET", "/api" + path + suffix):
+            st.caption("This identity cannot read these operational records.")
+            continue
+        result = dashboard_api("GET", path + suffix)
+        if result.get("error"):
+            st.info(f"{title} unavailable. No operational state inferred.")
+            continue
+        if section == "summary":
+            summary = result.get("summary", {})
+            st.write({k: summary[k] for k in fields if k in summary})
+            st.caption("Actual usage and cost may be unknown. Estimates and budget reservations are separate, not actuals.")
+            continue
+        if section == "checks":
+            render_checks(result)
+            continue
+        rows = result.get(section, [])
+        if isinstance(rows, dict):
+            rows = [rows]
+        st.dataframe([{k: row[k] for k in fields if k in row} for row in rows if isinstance(row, dict)], hide_index=True)
+        if section == "operations" and any(row.get("state") == "needs_reconciliation" for row in rows if isinstance(row, dict)):
+            st.warning("Operations need reconciliation. Do not assume commands can be safely replayed.")
+        if not rows:
+            st.caption("No records supplied by the server.")
+
+
+def read_local_json(upload):
+    """Bounded local upload only; never accept a server path or fetch a URL."""
+    if upload is None or upload.size > 2 * 1024 * 1024:
+        raise ValueError("Expected a local JSON upload of at most 2 MiB.")
+    data = upload.getvalue()
+    if len(data) > 2 * 1024 * 1024:
+        raise ValueError("JSON exceeds upload limit.")
+
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate JSON fields are not supported.")
+            result[key] = value
+        return result
+
+    document = json.loads(data, object_pairs_hook=unique_fields)
+    if not isinstance(document, dict):
+        raise ValueError("Expected a JSON object.")
+    json.dumps(document, allow_nan=False)
+    return document
+
+
+def import_source_upload(session_id, kind, upload, source_id="", revision="", digest=""):
+    try:
+        payload = {"kind": kind, "document": read_local_json(upload)}
+        if kind == "sarif":
+            payload.update(source_id=source_id.strip(), revision=revision.strip(), digest=digest.strip())
+        elif kind != "manifest":
+            raise ValueError
+        if len(json.dumps(payload).encode("utf-8")) > 2 * 1024 * 1024:
+            raise ValueError
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        return {"error": "Select a bounded, strict local JSON object. Source contents and server paths are not accepted."}
+    return dashboard_api("POST", session_path(session_id) + "/sources/import", payload)
+
+
+def show_sources_and_handoffs(session_id, snapshot):
+    if not can_read_sensitive():
+        st.info("Source metadata and handoffs require sensitive-read permission.")
+        return
+    path = session_path(session_id)
+    st.caption("Source metadata is untrusted inventory, not runtime evidence or verified coverage. Upload local JSON only; no repository/server path is read.")
+    kind = st.selectbox("Source import kind", ["manifest", "sarif"], key=f"source_kind_{session_id}")
+    with st.form(f"source_import_{session_id}_{kind}"):
+        upload = st.file_uploader("Source manifest / SARIF JSON (maximum 2 MiB)", type=["json"], key=f"source_upload_{session_id}_{kind}")
+        source_id = revision = digest = ""
+        if kind == "sarif":
+            source_id = st.text_input("SARIF source ID", max_chars=80)
+            revision = st.text_input("SARIF revision", max_chars=160)
+            digest = st.text_input("SARIF SHA256 digest", max_chars=71)
+        else:
+            st.caption("Manifest v1 requires source_id, revision, digest, base_url, and operations with relative file/line locations. Do not include source contents.")
+        if st.form_submit_button("Import Source Metadata", disabled=not can_operate()) and can_operate():
+            result = import_source_upload(session_id, kind, upload, source_id, revision, digest)
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                st.success("Source metadata imported. No execution or verification was performed.")
+    source_response = dashboard_api("GET", path + "/sources")
+    sources = source_response.get("sources", [])
+    if source_response.get("error"):
+        st.warning("Source inventory unavailable.")
+    st.dataframe([{k: source[k] for k in ("source_id", "kind", "revision", "digest", "trust", "coverage") if k in source}
+                  for source in sources], hide_index=True)
+    references = sorted({"source:" + source["source_id"] for source in sources} | {
+        "finding:" + finding["id"] for finding in snapshot.get("findings", []) if re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", finding.get("id", ""))})
+    st.markdown("#### Analysis-Only Handoff")
+    st.warning("Specialists produce hypotheses, not findings or proof. A handoff uses the model budget but cannot execute commands or mark coverage verified.")
+    result_key = f"handoff_result_{session_id}"
+    with st.form(f"handoff_{session_id}"):
+        role = st.selectbox("Specialist role", ["authorization", "api", "source", "evidence"])
+        question = st.text_area("Specialist question (no credentials)", max_chars=4096)
+        refs = st.multiselect("Session-owned context references (maximum 16)", references)
+        if st.form_submit_button("Run Analysis-Only Handoff", disabled=not can_operate()) and can_operate():
+            payload = {"role": role, "question": question.strip(), "references": [{"ref": ref, "summary": ""} for ref in refs]}
+            st.session_state.pop(result_key, None)
+            if not question.strip() or len(refs) > 16 or len(json.dumps(payload).encode("utf-8")) > 16384:
+                st.error("A bounded question and at most 16 session-owned references are required.")
+            else:
+                response = dashboard_api("POST", path + "/handoffs", payload)
+                if response.get("error"):
+                    st.error(response["error"])
+                else:
+                    st.session_state[result_key] = response.get("result", {})
+    if result_key in st.session_state:
+        result = st.session_state[result_key]
+        st.caption("Untrusted, server-redacted specialist analysis. Not runtime evidence; never treated as verification.")
+        st.write({k: result[k] for k in ("handoff_id", "role", "status", "uncertainty", "hypotheses", "missing_evidence", "citations") if k in result})
+    handoffs = dashboard_api("GET", path + "/handoffs")
+    if handoffs.get("error"):
+        st.info("Handoff audit history unavailable.")
     else:
-        st.info("No evidence items collected yet.")
-    
-    # Display successful command outputs as artifacts
-    if interesting_artifacts:
-        st.markdown("---")
-        st.markdown(f"### 📋 Significant Command Artifacts ({len(interesting_artifacts)} items)")
-        for cmd in interesting_artifacts:
-            with st.expander(f"✅ {cmd.get('command', 'Unknown command')[:50]}..."):
-                st.markdown(f"**Command:** `{cmd.get('command', 'Unknown')}`")
-                st.markdown(f"**Timestamp:** {cmd.get('timestamp', 'Unknown')}")
-                st.markdown(f"**Return Code:** {cmd.get('return_code', 'N/A')}")
-                st.markdown("**Output:**")
-                st.code(cmd.get('output', 'No output captured.'), language="text")
-                if cmd.get('error'):
-                    st.markdown("**Error:**")
-                    st.code(cmd['error'], language="text")
-    else:
-        st.info("No significant command artifacts available.")
-    
+        st.dataframe([{k: record[k] for k in ("id", "role", "status", "citations", "uncertainty", "hypothesis_count", "missing_evidence_count") if k in record}
+                      for record in handoffs.get("handoffs", [])], hide_index=True)
+
+
+def show_legacy_evidence_exports(session_details: Dict):
+    """Retained sensitive formats are opt-in, never the default sharing path."""
+    if not sensitive_export_ack(session_details.get("session_id", ""), scope="evidence"):
+        return
     st.markdown("---")
     st.markdown("### 📤 Evidence Export")
 
@@ -2314,7 +2777,7 @@ def show_evidence(session_details: Dict):
             cred_rows = "".join(_cred_row(c) for c in creds)
             cmd_rows  = "".join(_cmd_row(c)  for c in cmds[-30:])
 
-            html = f"""<!DOCTYPE html>
+            html_report = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <title>KMN-CyberSeek Report — {_he(session_details.get('target_ip'))}</title>
 <style>
@@ -2346,7 +2809,7 @@ def show_evidence(session_details: Dict):
 <table><tr><th>OK</th><th>Command</th><th>Timestamp</th></tr>{cmd_rows or "<tr><td colspan='3'>None</td></tr>"}</table>
 <footer>Generated by KMN-CyberSeek &mdash; FOR AUTHORISED USE ONLY</footer>
 </body></html>"""
-            st.session_state[_html_key] = html
+            st.session_state[_html_key] = html_report
         if st.session_state.get(_html_key):
             st.download_button(
                 label="💾 Save HTML",
@@ -2405,7 +2868,7 @@ def show_command_console():
             )
 
         with col2:
-            auto_approve = st.checkbox("Auto-approve", value=True,
+            auto_approve = st.checkbox("Auto-approve", value=False,
                                        help="Execute immediately. Uncheck to queue for manual approval.")
 
         # Execute button

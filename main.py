@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -37,6 +38,7 @@ from core.validators import is_valid_target, is_cidr
 from core.report_export import build_report_snapshot, export_sarif
 from core.assessment import Assessment, AssessmentError, CoverageKey, MAX_BYTES
 from core.artifact_store import ArtifactStore, ArtifactStoreError
+from core.access_control import AccessControl, AccessStore, AccessError
 
 # Single source of truth for the version (see _version.py / bump_version.py).
 try:
@@ -99,7 +101,7 @@ logging.getLogger("uvicorn.access").addFilter(_AccessLogNoiseFilter())
 # a shared secret, even on a "trusted" local network. Auto-generate and persist
 # a token on first run so the operator doesn't have to set one up manually.
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN")
-if not API_AUTH_TOKEN:
+if not API_AUTH_TOKEN and "KMN_AUTH_PRINCIPALS_FILE" not in os.environ:
     API_AUTH_TOKEN = secrets.token_urlsafe(32)
     _env_path = os.path.join(os.getcwd(), ".env")
     if not os.path.exists(_env_path):
@@ -109,8 +111,6 @@ if not API_AUTH_TOKEN:
         "No API_AUTH_TOKEN found - generated a new one and saved it to .env. "
         "The Streamlit frontend reads it from the same .env file automatically."
     )
-
-_OPEN_PATHS = {"/", "/health", "/api/docs", "/api/redoc", "/api/openapi.json"}
 
 app = FastAPI(
     title="KMN-CyberSeek API",
@@ -133,17 +133,47 @@ app.add_middleware(
 
 @app.middleware("http")
 async def enforce_api_key(request: Request, call_next):
-    """Require X-API-Key on every /api/* route. CORS alone does NOT stop
-    direct (non-browser) requests, so this is the real access control."""
-    path = request.url.path
-    if path in _OPEN_PATHS or not path.startswith("/api/"):
-        return await call_next(request)
-
-    supplied = request.headers.get("x-api-key", "")
-    if not supplied or not secrets.compare_digest(supplied, API_AUTH_TOKEN):
-        return JSONResponse(status_code=401, content={"detail": "Missing or invalid X-API-Key header"})
-
-    return await call_next(request)
+    """Authenticate every HTTP route and authorize all supplied session references."""
+    try:
+        principal = access_control.authenticate(request.headers)
+        request.state.principal = principal
+        path = request.url.path.rstrip("/") or "/"
+        references = []
+        match = re.match(r"^/api/sessions/([^/]+)", path)
+        if match and match.group(1) != "history":
+            references.append(match.group(1))
+        for key, value in request.query_params.multi_items():
+            references.extend(access_control.session_references({key: value}))
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            limit = 16384 if path.endswith(("/verification", "/waivers", "/handoffs", "/preflight")) else MAX_BYTES
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > limit:
+                    raise AccessError(413, "JSON exceeds size limit")
+                body.extend(chunk)
+            request._body = bytes(body)
+            if body:
+                try:
+                    payload = json.loads(body)
+                except (ValueError, UnicodeError, RecursionError):
+                    raise AccessError(400, "Expected JSON request") from None
+                references.extend(access_control.session_references(payload))
+        if match and any(sid != match.group(1) for sid in references):
+            raise AccessError(403, "Conflicting session references")
+        if path in {"/api/execute", "/api/approve"} and not references:
+            raise AccessError(400, "Session reference required")
+        access_control.authorize(principal, request.method, path, references)
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            access_control.store.audit(principal, request.method + " " + path,
+                                       references[0] if references else None, "authorized")
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Identity-Mode"] = principal.mode
+        return response
+    except AccessError as exc:
+        return JSONResponse(status_code=exc.status, content={"detail": exc.detail})
+    except (OSError, sqlite3.Error):
+        return JSONResponse(status_code=503, content={"detail": "Access storage unavailable"})
 
 # Global instances
 ai_provider = os.getenv("AI_PROVIDER")
@@ -151,16 +181,28 @@ ai_provider = os.getenv("AI_PROVIDER")
 ai_connector = KMN_AI_Connector(provider=ai_provider)
 scanner = Scanner()
 orchestrator = Orchestrator(ai_connector, scanner)
+access_control = AccessControl(API_AUTH_TOKEN, AccessStore(
+    os.getenv("KMN_ACCESS_DB") or str(Path(orchestrator.db_path).with_suffix(".access.sqlite3"))))
 
 # WebSocket connections
-active_connections: List[WebSocket] = []
+active_connections: Dict[WebSocket, object] = {}
 
 async def broadcast_message(message_type: str, data: Dict):
-    """Broadcast message to all active WebSocket connections."""
+    """Raw events require sensitive-read and an explicit accessible session."""
     message = {"type": message_type, "data": data, "timestamp": datetime.now().isoformat()}
-    for connection in active_connections:
+    for connection, principal in list(active_connections.items()):
         try:
+            # Reauthenticate to honor operator revocation on an existing socket.
+            principal = access_control.authenticate(connection.headers, connection.query_params)
+            references = access_control.session_references(data)
+            if not principal.admin and (not principal.sensitive or not references):
+                continue
+            if any(not access_control.can_access(principal, sid) for sid in references):
+                continue
             await connection.send_json(message)
+        except AccessError:
+            active_connections.pop(connection, None)
+            await connection.close(code=1008)
         except Exception as e:
             logger.error(f"Failed to send message to WebSocket: {e}")
 
@@ -364,8 +406,231 @@ async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
+
+@app.get("/api/identity")
+async def get_identity(request: Request):
+    """Describe the authenticated identity, including explicit legacy-admin mode."""
+    return request.state.principal.identity()
+
+
+@app.post("/api/preflight")
+async def evaluate_configuration_preflight(request: Request):
+    """Configuration-only readiness; never start a scan or probe a provider."""
+    from core.preflight import evaluate_preflight
+    payload = await _bounded_json_body(request, limit=16384)
+    if (set(payload) - {"target", "authorization_confirmed", "scope_allowlist"}
+            or not isinstance(payload.get("target"), str)
+            or type(payload.get("authorization_confirmed")) is not bool
+            or ("scope_allowlist" in payload and not isinstance(payload["scope_allowlist"], str))):
+        raise HTTPException(400, "Invalid preflight configuration")
+    return await asyncio.to_thread(evaluate_preflight, payload["target"], payload["authorization_confirmed"],
+                                   payload.get("scope_allowlist"), ai_connector, scanner)
+
+
+def _require_session_report(session_id):
+    try:
+        return orchestrator.get_session_report(session_id)
+    except ValueError:
+        raise HTTPException(404, "Session not found") from None
+
+
+@app.get("/api/sessions/{session_id}/completeness")
+async def get_session_completeness(session_id: str, request: Request):
+    report = _require_session_report(session_id)
+    result = await asyncio.to_thread(orchestrator.get_session_completeness, session_id)
+    if request.state.principal.sensitive:
+        return result
+    return {**build_report_snapshot({**report, "completeness": result})["completeness"],
+            **{key + "_count": len(result[key]) for key in ("missing_checks", "blockers", "waived_checks")}}
+
+
+@app.get("/api/sessions/{session_id}/preflight")
+async def get_session_preflight(session_id: str, request: Request):
+    _require_session_report(session_id)
+    result = await asyncio.to_thread(orchestrator.get_session_preflight, session_id)
+    if request.state.principal.sensitive:
+        return result
+    return {"version": 1, "ready": result["ready"],
+            "checks": [{key: check[key] for key in ("name", "ready", "required", "status")} for check in result["checks"]]}
+
+
+@app.get("/api/sessions/{session_id}/operations")
+async def get_session_operations(session_id: str):
+    _require_session_report(session_id)
+    operations = await asyncio.to_thread(orchestrator.get_session_operations, session_id)
+    return {"session_id": session_id, "operations": operations, "count": len(operations)}
+
+
+@app.post("/api/sessions/{session_id}/waivers")
+async def record_session_waiver(session_id: str, request: Request):
+    _require_session_report(session_id)
+    payload = await _bounded_json_body(request, limit=16384)
+    if set(payload) != {"endpoint_id", "role", "category", "reason"}:
+        raise HTTPException(400, "Expected an explicit completeness waiver; reviewer is server attributed")
+    payload["reviewer"] = request.state.principal.id
+    try:
+        result = await asyncio.to_thread(orchestrator.record_completeness_waiver, session_id, payload)
+    except ValueError:
+        raise HTTPException(400, "Invalid completeness waiver") from None
+    return result if request.state.principal.sensitive else {"session_id": session_id, "status": "recorded"}
+
+
+@app.get("/api/sessions/{session_id}/telemetry/summary")
+async def get_session_model_summary(session_id: str):
+    _require_session_report(session_id)
+    store = orchestrator.ai_connector.telemetry_store
+    return {"session_id": session_id, "summary": await asyncio.to_thread(store.summary, session_id)}
+
+
+@app.get("/api/sessions/{session_id}/telemetry/events")
+async def get_session_model_events(session_id: str, limit: int = 100):
+    _require_session_report(session_id)
+    if not 1 <= limit <= 10000:
+        raise HTTPException(400, "Limit must be between 1 and 10000")
+    store = orchestrator.ai_connector.telemetry_store
+    events = await asyncio.to_thread(store.events, session_id, limit)
+    return {"session_id": session_id, "events": events, "count": len(events)}
+
+
+@app.get("/api/sessions/{session_id}/sources")
+async def get_session_sources(session_id: str):
+    _require_session_report(session_id)
+    sources = await asyncio.to_thread(access_control.store.sources, session_id)
+    return {"session_id": session_id, "sources": sources, "count": len(sources)}
+
+
+@app.post("/api/sessions/{session_id}/sources/import")
+async def import_session_source(session_id: str, request: Request):
+    """Local JSON metadata only. No repository paths, source reads, or fetching."""
+    async def import_source():
+        payload = await _bounded_json_body(request)
+        # A cancelled to_thread worker must finish before deletion can purge stores.
+        worker = asyncio.create_task(asyncio.to_thread(_import_source_snapshot, session_id, payload, epoch))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if worker.done() and not worker.cancelled():
+                worker.exception()
+            raise
+
+    _require_session_report(session_id)
+    epoch = orchestrator._session_epoch(session_id)
+    return await _run_session_work(session_id, import_source(), "source_import", epoch)
+
+
+def _import_source_snapshot(session_id, payload, epoch):
+    from core.source_inventory import check_source_revision, import_source_manifest, import_sarif
+    with _assessment_lock:
+        if orchestrator._stale_execution(session_id, epoch):
+            raise HTTPException(409, "Session work invalidated")
+        report = _require_session_report(session_id)
+        try:
+            if set(payload) == {"kind", "document"} and payload["kind"] == "manifest":
+                document = import_source_manifest(payload["document"], allowlist=report["session"]["scope_allowlist"])
+            elif set(payload) == {"kind", "document", "source_id", "revision", "digest"} and payload["kind"] == "sarif":
+                document = import_sarif(payload["document"], source_id=payload["source_id"],
+                                        revision=payload["revision"], digest=payload["digest"])
+            else:
+                raise AssessmentError("Invalid source metadata")
+            previous = next((source for source in access_control.store.sources(session_id)
+                             if source["source_id"] == document["source_id"] and source["kind"] == document["kind"]), None)
+            disposition = check_source_revision(
+                {key: value for key, value in previous.items() if key != "revision_disposition"} if previous else document,
+                document)
+        except (AssessmentError, ValueError, TypeError, KeyError):
+            raise HTTPException(400, "Invalid source metadata") from None
+        if disposition["changed"]:
+            try:
+                # No durable source-to-cell mapping exists for SARIF. Conservatively
+                # invalidate all verified cells when operation IDs cannot bound it.
+                _assessment_snapshot(session_id, invalidate_endpoint_ids=disposition["invalidated_endpoint_ids"] or None,
+                                     superseded_source=previous)
+            except HTTPException as exc:
+                if exc.status_code != 404 or exc.detail != "Assessment inventory not found":
+                    raise
+                _revoke_source_evidence(session_id, previous)
+        if orchestrator._stale_execution(session_id, epoch):
+            raise HTTPException(409, "Session work invalidated")
+        document["revision_disposition"] = disposition
+        access_control.store.put_source(session_id, document)
+        return {"session_id": session_id, "source": document}
+
+
+async def _run_session_work(session_id, coroutine, label, epoch):
+    try:
+        task = orchestrator._track_task(session_id, coroutine, label)
+        return await task
+    except asyncio.CancelledError:
+        if orchestrator._stale_execution(session_id, epoch):
+            raise HTTPException(409, "Session work invalidated") from None
+        raise
+
+
+_specialist_slots = asyncio.Semaphore(1)
+
+
+@app.get("/api/sessions/{session_id}/handoffs")
+async def get_session_handoffs(session_id: str):
+    from core.specialists import SpecialistService
+    report = _require_session_report(session_id)
+    service = SpecialistService(ai_connector, access_control.store.path, session_id, credentials=report.get("credentials"))
+    try:
+        records = service.records()
+        return {"session_id": session_id, "handoffs": records, "count": len(records)}
+    finally:
+        service.close()
+
+
+@app.post("/api/sessions/{session_id}/handoffs")
+async def run_session_handoff(session_id: str, request: Request):
+    _require_session_report(session_id)
+    epoch = orchestrator._session_epoch(session_id)
+    return await _run_session_work(session_id, _session_handoff(session_id, request, epoch), "specialist_handoff", epoch)
+
+
+async def _session_handoff(session_id, request, epoch):
+    from core.specialists import ContextReference, SpecialistRequest, SpecialistService
+    from core.model_telemetry import model_call_context
+    report = _require_session_report(session_id)
+    payload = await _bounded_json_body(request, limit=16384)
+    if (set(payload) - {"role", "question", "references"}
+            or not {"role", "question"} <= payload.keys()
+            or not isinstance(payload.get("references", []), list)):
+        raise HTTPException(400, "Invalid specialist request")
+    allowed = {"source:" + source["source_id"] for source in access_control.store.sources(session_id)}
+    allowed.update("finding:" + str(finding["finding_id"]) for finding in report.get("vulnerabilities", []) if "finding_id" in finding)
+    allowed.update("evidence:" + str(evidence["evidence_id"]) for evidence in report.get("evidence", []) if "evidence_id" in evidence)
+    references = []
+    for reference in payload.get("references", []):
+        if (not isinstance(reference, dict) or set(reference) != {"ref", "summary"}
+                or not isinstance(reference["ref"], str) or reference["ref"] not in allowed):
+            raise HTTPException(400, "Specialist references must belong to this session")
+        references.append(ContextReference(reference["ref"], reference["summary"]))
+    async with _specialist_slots:
+        if orchestrator._stale_execution(session_id, epoch):
+            raise HTTPException(409, "Session work invalidated")
+        report = _require_session_report(session_id)
+        service = SpecialistService(ai_connector, access_control.store.path, session_id, credentials=report.get("credentials"))
+        try:
+            with model_call_context(session_id, "specialist"):
+                result = await service.run(SpecialistRequest(payload["role"], payload["question"], tuple(references)))
+            if orchestrator._stale_execution(session_id, epoch):
+                raise HTTPException(409, "Session work invalidated")
+            return {"session_id": session_id, "result": result.to_dict()}
+        except ValueError:
+            raise HTTPException(400, "Invalid or exhausted specialist request") from None
+        finally:
+            service.close()
+
 @app.post("/api/start")
-async def start_session(target_request: TargetRequest):
+async def start_session(target_request: TargetRequest, request: Request):
     """Start a new penetration testing session."""
     try:
         logger.info(f"Starting new session for target: {target_request.ip}")
@@ -382,6 +647,8 @@ async def start_session(target_request: TargetRequest):
             full_auto=target_request.full_auto,
         )
 
+        # Persist ownership before any background work can start.
+        access_control.store.own(session_id, request.state.principal)
         # Start initial reconnaissance
         asyncio.create_task(orchestrator.start_reconnaissance(session_id))
 
@@ -400,14 +667,18 @@ async def start_session(target_request: TargetRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/sessions")
-async def list_sessions():
+async def list_sessions(request: Request):
     """List all active sessions."""
     sessions = orchestrator.get_sessions()
+    principal = request.state.principal
+    if not principal.admin:
+        sessions = [build_report_snapshot(orchestrator.get_session_report(row["session_id"]))["session"]
+                    for row in sessions if access_control.can_access(principal, row["session_id"])]
     return {"sessions": sessions, "count": len(sessions)}
 
 
 @app.get("/api/sessions/history")
-async def list_session_history():
+async def list_session_history(request: Request):
     """List ALL sessions from the database including completed and failed ones.
     Unlike GET /api/sessions (active-only, in-memory), this queries the DB
     directly so historical sessions survive backend restarts. Returns lightweight
@@ -416,17 +687,21 @@ async def list_session_history():
     IMPORTANT: this route MUST be registered before /api/sessions/{session_id}
     so FastAPI does not treat 'history' as a session_id."""
     history = orchestrator.get_session_history()
+    principal = request.state.principal
+    if not principal.admin:
+        history = [build_report_snapshot(orchestrator.get_session_report(row["session_id"]))["session"]
+                   for row in history if access_control.can_access(principal, row["session_id"])]
     return {"sessions": history, "count": len(history)}
 
 
 @app.get("/api/sessions/{session_id}")
-async def get_session(session_id: str):
+async def get_session(session_id: str, request: Request):
     """Get details of a specific session."""
     try:
         session_report = orchestrator.get_session_report(session_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Session not found")
-    return session_report
+    return session_report if request.state.principal.sensitive else build_report_snapshot(session_report)
 
 
 @app.post("/api/sessions/{session_id}/full_auto")
@@ -537,19 +812,95 @@ _assessment_lock = threading.RLock()
 _assessment_cache = {}
 
 
+def _session_evidence_bindings(session_id):
+    connection = sqlite3.connect(orchestrator.db_path)
+    try:
+        rows = connection.execute("SELECT id,evidence_type,evidence_data FROM evidence WHERE session_id=?", (session_id,)).fetchall()
+    finally:
+        connection.close()
+    bindings = []
+    for identity, kind, encoded in rows:
+        try:
+            data = json.loads(encoded)
+        except (ValueError, TypeError):
+            raise RuntimeError("Durable evidence metadata unavailable") from None
+        references, provenance = {"evidence:" + str(identity)}, []
+        if isinstance(data, dict):
+            references.update("evidence:" + data[key] for key in ("id", "evidence_id") if isinstance(data.get(key), str) and data[key])
+            linked = data.get("artifact_refs", [])
+            if not isinstance(linked, list) or any(not isinstance(ref, str) for ref in linked):
+                raise RuntimeError("Invalid durable evidence aliases")
+            references.update("evidence:" + ref for ref in linked)
+            for declared in (data, data.get("provenance")):
+                if isinstance(declared, dict) and ("source_id" in declared or (kind == "source_review" and any(key in declared for key in ("revision", "digest")))):
+                    provenance.append({key: declared[key] for key in ("source_id", "revision", "digest") if key in declared})
+        bindings.append((references, provenance))
+    return bindings
+
+
+def _expand_evidence_refs(references, bindings):
+    references = set(references)
+    while True:
+        expanded = references | {ref for aliases, _ in bindings if aliases & references for ref in aliases}
+        if expanded == references:
+            return references
+        references = expanded
+
+
+def _revoke_source_evidence(session_id, source, references=()):
+    bindings = _session_evidence_bindings(session_id)
+    references = set(references)
+    for aliases, provenance in bindings:
+        if any(declared.get("source_id") == source["source_id"]
+               and all(key not in declared or declared[key] == source[key] for key in ("revision", "digest"))
+               for declared in provenance):
+            references.update(aliases)
+    access_control.store.revoke_evidence_refs(session_id, source, _expand_evidence_refs(references, bindings))
+
+
+def _filter_session_evidence_refs(session_id, references):
+    revoked, sources = access_control.store.evidence_reference_state(session_id)
+    bindings = _session_evidence_bindings(session_id)
+    for aliases, provenance in bindings:
+        if any(not any(declared.get("source_id") == source["source_id"]
+                       and all(key not in declared or declared[key] == source[key] for key in ("revision", "digest"))
+                       for source in sources) for declared in provenance):
+            revoked.update(aliases)
+    revoked = _expand_evidence_refs(revoked, bindings)
+    return [reference for reference in references if reference not in revoked]
+
+
+with access_control.store.connect():
+    pass
+orchestrator.register_evidence_reference_filter(_filter_session_evidence_refs)
+
+
+def _purge_session_access(session_id):
+    """Runtime invokes this only after all session-owned work has stopped."""
+    from core.specialists import SpecialistService
+    service = SpecialistService(ai_connector, access_control.store.path, session_id)
+    try:
+        service.purge_session()
+    finally:
+        service.close()
+    access_control.store.forget(session_id)
+    name = hashlib.sha256(session_id.encode()).hexdigest() + ".json"
+    for path in list(_assessment_cache):
+        if path.name == name:
+            _assessment_cache.pop(path)
+
+
+orchestrator.register_session_purge_hook(_purge_session_access)
+
+
 def _delete_sessions(session_id=None):
     """Serialize deletion and snapshot admission without blocking the event loop."""
     with _assessment_lock:
         result = (orchestrator.delete_all_sessions() if session_id is None
                   else orchestrator.delete_session(session_id))
-        if result["status"] == "success":
-            if session_id is None:
-                _assessment_cache.clear()
-            else:
-                name = hashlib.sha256(session_id.encode()).hexdigest() + ".json"
-                for path in list(_assessment_cache):
-                    if path.name == name:
-                        _assessment_cache.pop(path)
+        if result["status"] == "success" and session_id is None:
+            access_control.store.forget()
+            _assessment_cache.clear()
         return result
 
 
@@ -569,12 +920,12 @@ async def _bounded_json_body(request: Request, limit=MAX_BYTES):
         raise HTTPException(status_code=400, detail="Expected bounded JSON object") from None
 
 
-def _assessment_snapshot(session_id, payload=None, *, update=False):
+def _assessment_snapshot(session_id, payload=None, *, update=False, invalidate_endpoint_ids=(), superseded_source=None):
     with _assessment_lock:
         # Check admission under the deletion lock so a queued import cannot
         # recreate a snapshot after its active or historical session was deleted.
         try:
-            orchestrator.get_session_report(session_id)
+            report = orchestrator.get_session_report(session_id)
         except ValueError:
             raise HTTPException(status_code=404, detail="Session not found") from None
         root = Path(os.getenv("KMN_ASSESSMENT_DIR") or Path(orchestrator.db_path).parent / "assessments").absolute()
@@ -599,11 +950,24 @@ def _assessment_snapshot(session_id, payload=None, *, update=False):
                     raise HTTPException(status_code=409, detail="Assessment inventory already exists")
                 assessment = Assessment.from_openapi(
                     payload["document"], base_url=payload["base_url"],
+                    allowlist=report["session"]["scope_allowlist"],
                     roles=payload.get("roles"), categories=payload.get("categories", ["observation"]))
             else:
                 assessment = _assessment_cache.get(path)
                 if assessment is None:
-                    assessment = Assessment.load(path)
+                    assessment = Assessment.load(path, allowlist=report["session"]["scope_allowlist"])
+                else:
+                    # Revalidate cached inventory too, without resetting live attempts.
+                    Assessment.from_json(assessment.to_json(), allowlist=report["session"]["scope_allowlist"])
+            invalidating = invalidate_endpoint_ids is None or bool(invalidate_endpoint_ids)
+            if invalidating:
+                snapshot = json.loads(assessment.to_json())
+                affected = [row for row in snapshot["coverage"] if invalidate_endpoint_ids is None or row["endpoint_id"] in invalidate_endpoint_ids]
+                _revoke_source_evidence(session_id, superseded_source,
+                                        [row["evidence_ref"] for row in affected if row["evidence_ref"] is not None])
+                for row in affected:
+                    row.update(status="pending", attempts=0, evidence_ref=None)
+                assessment = Assessment.from_json(snapshot, allowlist=report["session"]["scope_allowlist"])
             if update:
                 if (set(payload) - {"endpoint_id", "role", "category", "status", "evidence_ref"}
                         or not all(isinstance(payload.get(k), str)
@@ -615,8 +979,12 @@ def _assessment_snapshot(session_id, payload=None, *, update=False):
                         raise AssessmentError("An attempt cannot attach evidence")
                     assessment.begin_attempt(key)
                 else:
+                    if payload["status"] == "verified":
+                        reference = payload.get("evidence_ref")
+                        if not isinstance(reference, str) or reference not in orchestrator.get_session_committed_evidence_refs(session_id):
+                            raise AssessmentError("Evidence must be committed to this session")
                     assessment.mark(key, payload["status"], evidence_ref=payload.get("evidence_ref"))
-            if payload is not None:
+            if payload is not None or invalidating:
                 try:
                     assessment.save(path)
                 except (AssessmentError, OSError):
@@ -630,7 +998,7 @@ def _assessment_snapshot(session_id, payload=None, *, update=False):
             raise HTTPException(status_code=404, detail="Assessment inventory not found") from None
         except (AssessmentError, KeyError, TypeError):
             raise HTTPException(status_code=400, detail="Invalid assessment inventory or coverage state") from None
-        except OSError:
+        except (OSError, sqlite3.Error, RuntimeError):
             raise HTTPException(status_code=503, detail="Assessment storage unavailable") from None
 
 
@@ -649,9 +1017,12 @@ async def get_session_assessment(session_id: str):
 
 @app.patch("/api/sessions/{session_id}/assessment/coverage")
 async def update_session_coverage(session_id: str, request: Request):
-    """Record external attempts/conclusions; verified requires an evidence reference."""
+    """Reviewer-only verification requires a durable evidence:<id> from this session."""
     payload = await _bounded_json_body(request)
-    return await asyncio.to_thread(_assessment_snapshot, session_id, payload, update=True)
+    if payload.get("status") == "verified" and request.state.principal.role not in {"reviewer", "admin"}:
+        raise HTTPException(403, "Verified coverage requires reviewer permission")
+    response = await asyncio.to_thread(_assessment_snapshot, session_id, payload, update=True)
+    return response if request.state.principal.sensitive else {"session_id": session_id, "status": "recorded"}
 
 
 def _session_artifacts(session_id):
@@ -702,13 +1073,16 @@ async def record_finding_verification(session_id: str, finding_id: str, request:
     method (1-200 characters), artifact_refs (1-32 distinct committed artifact IDs).
     Optional kind defaults to verification; remediation requires applied, and
     retest accepts positive/negative/inconclusive.
+    Optional command_id and attempt_id must be supplied together and resolve to
+    a persisted command attempt containing the declared session artifacts.
+    Reviewer identity and provenance are always supplied by the server.
     Optional evidence is operator prose, at most 4096 characters. The orchestrator
     resolves the finding target and creates evidence/events from actual artifacts.
     """
     payload = await _bounded_json_body(request, limit=16384)
     refs = payload.get("artifact_refs")
     kind = payload.get("kind", "verification")
-    if (set(payload) - {"kind", "acknowledge_review", "result", "method", "artifact_refs", "evidence"}
+    if (set(payload) - {"kind", "acknowledge_review", "result", "method", "artifact_refs", "evidence", "command_id", "attempt_id"}
             or payload.get("acknowledge_review") is not True
             or not isinstance(kind, str) or kind not in {"verification", "remediation", "retest"}
             or not isinstance(payload.get("result"), str)
@@ -723,9 +1097,22 @@ async def record_finding_verification(session_id: str, finding_id: str, request:
             or ("evidence" in payload and (not isinstance(payload["evidence"], str) or len(payload["evidence"]) > 4096))
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", finding_id)):
         raise HTTPException(status_code=400, detail="Invalid operator verification review")
+    runtime = "command_id" in payload or "attempt_id" in payload
+    if runtime and any(not isinstance(payload.get(key), str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", payload[key])
+                       for key in ("command_id", "attempt_id")):
+        raise HTTPException(400, "Runtime verification requires command_id and attempt_id")
     _, manifests = await asyncio.to_thread(_session_artifacts, session_id)
     if not set(refs).issubset({manifest["id"] for manifest in manifests}):
         raise HTTPException(status_code=400, detail="Review requires this session's committed artifacts")
+    if runtime:
+        with sqlite3.connect(orchestrator.db_path) as connection:
+            rows = connection.execute("SELECT record_json FROM commands WHERE session_id=? AND command_id=? AND attempt_id=?",
+                                      (session_id, payload["command_id"], payload["attempt_id"])).fetchall()
+        linked = {artifact["id"] for row in rows for artifact in json.loads(row[0]).get("artifacts", [])}
+        if not rows or not set(refs) <= linked:
+            raise HTTPException(400, "Artifacts must belong to the durable command attempt")
+    payload["reviewer"] = request.state.principal.id
+    payload["provenance"] = {"type": "runtime", "source": "command_result"} if runtime else {"type": "review_only", "source": "operator_review"}
     try:
         result = await asyncio.to_thread(orchestrator.record_verification, session_id, finding_id, payload)
     except KeyError:
@@ -734,6 +1121,8 @@ async def record_finding_verification(session_id: str, finding_id: str, request:
         raise HTTPException(status_code=400, detail="Invalid operator verification review") from None
     except (ArtifactStoreError, OSError):
         raise HTTPException(status_code=503, detail="Verification storage unavailable") from None
+    if not request.state.principal.sensitive:
+        result = {"session_id": session_id, "finding_id": finding_id, "status": "recorded"}
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
@@ -959,13 +1348,36 @@ async def update_schedule_status(scan_id: int, status: str):
 
 
 @app.get("/api/stats")
-async def get_aggregate_stats():
+async def get_aggregate_stats(request: Request):
     """Aggregate statistics for the dashboard charts.
     Queries the DB directly so it captures all sessions, not just in-memory active ones.
     Returns vuln distribution, sessions-per-day (last 14 days), status breakdown,
     and top targeted hosts."""
-    import sqlite3 as _sqlite3
     from datetime import datetime as _dt, timedelta as _td
+    if not request.state.principal.admin:
+        sessions = [row for row in orchestrator.get_session_history()
+                    if access_control.can_access(request.state.principal, row["session_id"])]
+        statuses, risks, days, targets = {}, {}, {}, {}
+        cutoff = (_dt.now() - _td(days=14)).date().isoformat()
+        for row in sessions:
+            snapshot = build_report_snapshot(orchestrator.get_session_report(row["session_id"]))
+            status = snapshot["session"].get("status", "unknown")
+            statuses[status] = statuses.get(status, 0) + 1
+            created = snapshot["session"].get("created_at")
+            if isinstance(created, str) and re.match(r"^\d{4}-\d{2}-\d{2}", created) and created[:10] >= cutoff:
+                days[created[:10]] = days.get(created[:10], 0) + 1
+            target = snapshot["session"].get("target_ip")
+            if target:
+                targets[target] = targets.get(target, 0) + 1
+            for finding in snapshot["findings"]:
+                risk = finding["severity"]
+                risks[risk] = risks.get(risk, 0) + 1
+        return {"vuln_distribution": risks, "status_distribution": statuses,
+                "sessions_total": len(sessions),
+                "sessions_per_day": [{"day": day, "count": count} for day, count in sorted(days.items())],
+                "top_targets": [{"target_ip": target, "count": count}
+                                for target, count in sorted(targets.items(), key=lambda item: (-item[1], item[0]))[:5]]}
+    import sqlite3 as _sqlite3
 
     db_path = orchestrator.db_path
 
@@ -1051,13 +1463,15 @@ async def cancel_session(session_id: str):
 
 
 @app.get("/api/sessions/{session_id}/vulnerabilities")
-async def get_vulnerabilities(session_id: str):
+async def get_vulnerabilities(session_id: str, request: Request):
     """Get all recorded vulnerability findings for a session (structured, from
     the vulnerabilities table - see core/orchestrator.py add_vulnerability())."""
     if not orchestrator.get_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
 
     vulnerabilities = orchestrator.get_vulnerabilities(session_id)
+    if not request.state.principal.sensitive:
+        vulnerabilities = build_report_snapshot(orchestrator.get_session_report(session_id))["findings"]
     return {
         "session_id": session_id,
         "vulnerabilities": vulnerabilities,
@@ -1278,6 +1692,7 @@ async def list_threat_intel(topic: Optional[str] = None):
 
 @app.get("/api/vulnerabilities")
 async def list_all_vulnerabilities(
+    request: Request,
     source_tool: Optional[str] = None,
     service: Optional[str] = None,
     risk_level: Optional[str] = None,
@@ -1289,6 +1704,21 @@ async def list_all_vulnerabilities(
       service      – e.g. 'http', 'ssh'  (substring, case-insensitive)
       risk_level   – 'high' | 'medium' | 'low' | 'unknown'
     """
+    if not request.state.principal.admin:
+        findings = []
+        for row in orchestrator.get_session_history():
+            sid = row["session_id"]
+            if not access_control.can_access(request.state.principal, sid):
+                continue
+            for finding in build_report_snapshot(orchestrator.get_session_report(sid))["findings"]:
+                if source_tool and finding.get("source_tool") != source_tool:
+                    continue
+                if service and service.lower() not in str(finding.get("service", "")).lower():
+                    continue
+                if risk_level and finding["severity"] != risk_level:
+                    continue
+                findings.append({**finding, "session_id": sid})
+        return {"vulnerabilities": findings, "count": len(findings)}
     import sqlite3 as _sqlite3
     import json as _json
 
@@ -1732,7 +2162,7 @@ async def update_advanced_settings(settings: AdvancedSettings):
 
 
 @app.post("/api/execute")
-async def execute_command(command_request: CommandRequest):
+async def execute_command(command_request: CommandRequest, request: Request):
     """Execute a command in a session."""
     try:
         # API requests are never allowed to self-grant an approval. The
@@ -1784,15 +2214,15 @@ async def execute_command(command_request: CommandRequest):
             })
             return {
                 "status": "executed",
-                "result": result,
+                "result": result if request.state.principal.sensitive else {"status": "executed"},
                 "message": "Command executed successfully"
             }
     except Exception as e:
         logger.error(f"Command execution failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Command execution failed") from None
 
 @app.post("/api/approve")
-async def approve_command(approval_request: ApprovalRequest):
+async def approve_command(approval_request: ApprovalRequest, request: Request):
     """Approve or deny a pending command."""
     try:
         if approval_request.approve:
@@ -1807,7 +2237,7 @@ async def approve_command(approval_request: ApprovalRequest):
             })
             return {
                 "status": "approved",
-                "result": result,
+                "result": result if request.state.principal.sensitive else {"status": "approved"},
                 "message": "Command approved and executed"
             }
         else:
@@ -1825,37 +2255,58 @@ async def approve_command(approval_request: ApprovalRequest):
             }
     except Exception as e:
         logger.error(f"Approval failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Command approval failed") from None
 
 # WebSocket endpoint for real-time updates
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time communication."""
-    # HTTP middleware doesn't run for WS upgrades, so check the token explicitly.
-    token = websocket.query_params.get("token", "")
-    if not token or not secrets.compare_digest(token, API_AUTH_TOKEN):
-        await websocket.close(code=1008)  # policy violation
+    try:
+        principal = access_control.authenticate(websocket.headers, websocket.query_params)
+        references = []
+        for key, value in websocket.query_params.multi_items():
+            references.extend(access_control.session_references({key: value}))
+        for sid in references:
+            access_control.authorize(principal, "GET", f"/api/sessions/{sid}", [sid])
+    except (AccessError, OSError, sqlite3.Error):
+        await websocket.close(code=1008)
         return
 
     await websocket.accept()
-    active_connections.append(websocket)
+    active_connections[websocket] = principal
     
     try:
         while True:
-            # Keep connection alive
-            data = await websocket.receive_text()
-            # Echo received data (could be used for commands)
-            await websocket.send_json({
-                "type": "echo",
-                "data": data,
-                "timestamp": datetime.now().isoformat()
-            })
+            data = await websocket.receive_json()
+            try:
+                principal = access_control.authenticate(websocket.headers, websocket.query_params)
+                if not isinstance(data, dict):
+                    raise AccessError(400, "Expected message object")
+                references = access_control.session_references(data)
+                action = data.get("action", data.get("type"))
+                if action == "ping":
+                    access_control.authorize(principal, "GET", "/api/identity", references)
+                    await websocket.send_json({"type": "pong"})
+                elif action in {"get_session", "subscribe"} and isinstance(data.get("session_id"), str):
+                    sid = data["session_id"]
+                    if any(ref != sid for ref in references):
+                        raise AccessError(403, "Conflicting session references")
+                    access_control.authorize(principal, "GET", f"/api/sessions/{sid}", references)
+                    report = orchestrator.get_session_report(sid)
+                    await websocket.send_json({"type": "session", "data": report if principal.sensitive else build_report_snapshot(report)})
+                else:
+                    # No hidden execution/approval channel. Use the authorized HTTP API.
+                    raise AccessError(403, "Unsupported WebSocket action; use HTTP API")
+            except AccessError as exc:
+                await websocket.send_json({"type": "error", "status": exc.status, "detail": exc.detail})
+            except ValueError:
+                await websocket.send_json({"type": "error", "status": 404, "detail": "Session not found"})
     except WebSocketDisconnect:
-        active_connections.remove(websocket)
+        active_connections.pop(websocket, None)
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         if websocket in active_connections:
-            active_connections.remove(websocket)
+            active_connections.pop(websocket, None)
 
 def start_operation():
     """Start the FastAPI server."""

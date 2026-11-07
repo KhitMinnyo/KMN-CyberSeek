@@ -63,6 +63,31 @@ def build_report_snapshot(report):
         "session_id", "target_ip", "target_domain", "created_at", "status",
         "current_stage", "objective_complete", "objective_progress",
     ))
+    raw_completeness = report.get("completeness") or {}
+    verdict = raw_completeness.get("verdict", "unknown")
+    if verdict not in {"unknown", "incomplete", "complete"}:
+        verdict = "unknown"
+
+    def coverage_rows(rows):
+        safe = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            item = select(row, ("endpoint_id", "role", "category", "status"))
+            if "status" in item and item["status"] not in {
+                "pending", "attempted", "verified", "blocked", "skipped", "inconclusive",
+            }:
+                item["status"] = "unknown"
+            safe.append(item)
+        return safe
+
+    completeness = {
+        "version": 1, "verdict": verdict,
+        "missing_checks": coverage_rows(raw_completeness.get("missing_checks")),
+        "blockers": coverage_rows(raw_completeness.get("blockers")),
+        # Attribution and waiver prose stay in the restricted audit trail.
+        "waived_checks": coverage_rows(raw_completeness.get("waived_checks")),
+    }
     findings = []
     commands = report.get("commands_executed") or []
     for index, finding in enumerate(report.get("vulnerabilities") or []):
@@ -71,7 +96,8 @@ def build_report_snapshot(report):
             "cvss_score", "confidence",
         ))
         status = str(finding.get("status") or "unknown").lower()
-        verified = assess_finding(finding)["verified"]
+        assessment = assess_finding(finding)
+        verified = assessment["verified"]
         if status in {"suppressed", "false_positive"} or finding.get("suppressed"):
             verified = False
         severity = str(finding.get("risk_level") or "unknown").lower()
@@ -88,7 +114,33 @@ def build_report_snapshot(report):
         # raw IDs or URIs (which may themselves carry credentials).
         for section in ("evidence", "artifacts"):
             refs.extend(f"#/vulnerabilities/{index}/{section}/{i}"
-                        for i, _ in enumerate(finding.get(section) or []))
+                         for i, _ in enumerate(finding.get(section) or []))
+        provenance = {"type": "unspecified", "source": "unspecified", "runtime_bound": False,
+                      "independent_reproduction": False}
+        events = finding.get("verification_events") or []
+        history = assessment["history"]
+        if (events and history and isinstance(events[-1], dict)
+                and history[-1].get("artifact_refs")):
+            event = events[-1]
+            declared = event.get("provenance") or {}
+            if isinstance(declared, dict):
+                if declared.get("type") in {"runtime", "review_only"}:
+                    provenance["type"] = declared["type"]
+                if declared.get("source") in {"command_result", "operator_review", "source_review"}:
+                    provenance["source"] = declared["source"]
+            evidence_ids = set(history[-1]["evidence_refs"])
+            evidence_rows = [e for e in finding.get("evidence", [])
+                             if isinstance(e, dict) and e.get("id") in evidence_ids]
+            provenance["runtime_bound"] = bool(evidence_rows) and all(
+                e.get("command_id") and e.get("attempt_id") and any(
+                    command.get("command_id") == e["command_id"]
+                    and command.get("attempt_id") == e["attempt_id"]
+                    and set(e.get("artifact_refs") or []) <= {
+                        a.get("id") for a in command.get("artifacts", []) if isinstance(a, dict)
+                    }
+                    for command in commands
+                ) for e in evidence_rows
+            )
         item.update({
             # Only canonical persisted UUIDs can cross the sharing boundary as
             # actionable IDs; arbitrary legacy identifiers can contain secrets.
@@ -97,6 +149,9 @@ def build_report_snapshot(report):
                    else f"finding-{index + 1}"),
             "severity": severity if severity in SEVERITIES else "unknown",
             "verification": "verified" if verified else "unverified",
+            "lifecycle": assessment["lifecycle"],
+            "remediation_verified": assessment["remediation_verified"],
+            "provenance": provenance,
             "source_status": status if status in {"confirmed", "verified", "potential", "unverified", "suppressed", "false_positive"} else "unknown",
             "cve_ids": [c.upper() for c in (finding.get("cve_ids") or [])
                         if isinstance(c, str) and re.fullmatch(r"CVE-\d{4}-\d{4,}", c, re.I)],
@@ -106,11 +161,15 @@ def build_report_snapshot(report):
     return {
         "schema_version": SCHEMA_VERSION,
         "session": session,
+        "completeness": completeness,
         "summary": {
             **select(report.get("summary", {}), ("pending_approval_count", "objective_complete", "objective_progress")),
             "total_findings": len(findings),
             "verified_findings": sum(f["verification"] == "verified" for f in findings),
             "unverified_findings": sum(f["verification"] == "unverified" for f in findings),
+            "assessment_verdict": verdict,
+            "assessment_complete": verdict == "complete",
+            "assessment_partial": verdict != "complete",
         },
         "findings": findings,
         "evidence": [{"ref": f"#/evidence/{i}"} for i, _ in enumerate(report.get("evidence") or [])],
@@ -144,7 +203,7 @@ def export_sarif(snapshot):
             "kind": "fail" if verified else "review",
             "message": {"text": f"[{finding['verification']}] {finding.get('name') or 'Unnamed finding'}"},
             "properties": {key: finding[key] for key in (
-                "verification", "severity", "evidence_refs", "cve_ids", "source_status",
+                "verification", "severity", "evidence_refs", "cve_ids", "source_status", "provenance",
                 "host", "port", "service", "source_tool",
             ) if key in finding},
         })
@@ -152,6 +211,8 @@ def export_sarif(snapshot):
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
         "runs": [{"tool": {"driver": {"name": "KMN-CyberSeek", "rules": rules}},
-                  "results": results,
-                  "properties": {"report_schema_version": SCHEMA_VERSION, "session": snapshot["session"]}}],
+                   "results": results,
+                   "invocations": [{"executionSuccessful": snapshot.get("completeness", {}).get("verdict") == "complete"}],
+                   "properties": {"report_schema_version": SCHEMA_VERSION, "session": snapshot["session"],
+                                  "completeness": snapshot.get("completeness", {"verdict": "unknown"})}}],
     }
