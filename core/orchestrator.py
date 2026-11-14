@@ -294,19 +294,32 @@ def _route_msf_to_managed_handler(command: str, session: "Session") -> str:
 
     A one-shot ``msfconsole -x`` otherwise creates its own payload handler. That
     handler is destroyed with the console and its sessions never reach the
-    Shells tab. ``DisablePayloadHandler true`` makes the exploit's payload call
-    back to the already-running managed multi/handler instead.
+    Shells tab. The exploit must also use the exact payload and callback endpoint
+    configured on the persistent handler; otherwise its callback never matches
+    the listener. ``DisablePayloadHandler true`` makes that payload call back to
+    the already-running managed multi/handler instead.
     """
-    if not _is_msf_command(command) or not session.exploit_lhost:
+    if not _is_msf_command(command) or not (
+        session.exploit_lhost and session.exploit_lport and session.exploit_payload
+    ):
         return command
     lower = command.lower()
-    if "multi/handler" in lower or "disablepayloadhandler" in lower:
+    if "multi/handler" in lower:
         return command
     if not re.search(r"\b(?:exploit|run)(?:\s+-[a-z0-9-]+)*\b", command, re.IGNORECASE):
         return command
+    disable_handler = (
+        "" if "disablepayloadhandler" in lower
+        else "set DisablePayloadHandler true; "
+    )
     return re.sub(
         r"(;\s*)(exploit|run)(?=\s|$)",
-        r"\1set DisablePayloadHandler true; \2",
+        lambda match: (
+            f"{match.group(1)}set PAYLOAD {session.exploit_payload}; "
+            f"set LHOST {session.exploit_lhost}; "
+            f"set LPORT {session.exploit_lport}; "
+            f"{disable_handler}{match.group(2)}"
+        ),
         command,
         count=1,
         flags=re.IGNORECASE,
